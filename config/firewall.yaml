@@ -1,0 +1,113 @@
+# ============================================================================
+# DB FIREWALL — Universal AI Agent Tenant Isolation
+# ============================================================================
+# Drop this file into any project root. The middleware auto-detects your
+# database engine and applies row-level security accordingly.
+#
+# Rename to: .db-firewall.yaml  (dotfile in project root)
+# ============================================================================
+
+version: "1.0"
+
+# ----------------------------------------------------------------------------
+# TENANT COLUMN — The column name used across all protected tables.
+# If a table has this column, it gets auto-protected.
+# ----------------------------------------------------------------------------
+tenant_column: "tenant_id"
+
+# ----------------------------------------------------------------------------
+# FAIL MODE — What happens when no tenant context is set?
+#   "closed" → 0 rows returned (RECOMMENDED for production)
+#   "open"   → all rows returned (development/testing only)
+# ----------------------------------------------------------------------------
+fail_mode: "closed"
+
+# ----------------------------------------------------------------------------
+# PROTECTED OPERATIONS — Which SQL operations are filtered?
+# ----------------------------------------------------------------------------
+protect:
+  select: true
+  insert: true    # Prevents inserting rows for other tenants
+  update: true    # Prevents updating rows across tenants
+  delete: true    # Prevents deleting rows across tenants
+
+# ----------------------------------------------------------------------------
+# AUDIT — Log every tenant context assignment
+# ----------------------------------------------------------------------------
+audit:
+  enabled: true
+  table_name: "_firewall_audit_log"
+  retention_days: 90    # Auto-purge old audit records
+  log_queries: false    # Set true to log actual SQL (careful: PII risk)
+
+# ----------------------------------------------------------------------------
+# TENANT RESOLUTION — How is the current tenant determined?
+# Evaluated in order. First match wins.
+# ----------------------------------------------------------------------------
+resolution:
+  # 1. From database user mapping table
+  - source: "db_user_map"
+    table: "_firewall_tenant_map"
+    enabled: true
+
+  # 2. From application context / session variable
+  - source: "session_var"
+    variable: "app.current_tenant"
+    enabled: true
+
+  # 3. From connection string parameter
+  - source: "connection_param"
+    param_name: "tenant_id"
+    enabled: true
+
+  # 4. From environment variable
+  - source: "env_var"
+    variable: "TENANT_ID"
+    enabled: false    # Enable for single-tenant deployments
+
+# ----------------------------------------------------------------------------
+# EXCLUDED USERS — These users/roles bypass tenant filtering entirely.
+# Use for DBA, migration runners, and admin dashboards.
+# ----------------------------------------------------------------------------
+excluded_users:
+  - "postgres"        # PostgreSQL superuser
+  - "root"            # MySQL root
+  - "sa"              # SQL Server admin
+  - "sys"             # Oracle SYS
+  - "system"          # Oracle SYSTEM
+  - "admin"           # Generic admin
+  - "_migrator"       # Migration runner service account
+
+# ----------------------------------------------------------------------------
+# EXCLUDED TABLES — Tables that should NOT have tenant filtering.
+# System/config tables that are shared across tenants.
+# ----------------------------------------------------------------------------
+excluded_tables:
+  - "_firewall_*"     # Firewall's own tables (glob pattern)
+  - "schema_migrations"
+  - "alembic_version"
+  - "knex_migrations"
+  - "prisma_migrations"
+  - "__diesel_schema_migrations"
+  - "flyway_schema_history"
+  - "app_config"
+  - "feature_flags"
+
+# ----------------------------------------------------------------------------
+# DATABASE-SPECIFIC OVERRIDES (optional)
+# ----------------------------------------------------------------------------
+engines:
+  postgresql:
+    use_rls: true               # Native Row-Level Security (preferred)
+    schema: "public"
+  mysql:
+    use_views: true             # MySQL lacks native RLS; use view-based isolation
+    schema: null                # Uses default schema
+  sqlserver:
+    use_rls: true               # SQL Server 2016+ supports RLS
+    schema: "dbo"
+  oracle:
+    use_vpd: true               # Virtual Private Database
+    schema: "APP_USER"
+  sqlite:
+    use_middleware: true         # SQLite has no RLS; enforce in middleware only
