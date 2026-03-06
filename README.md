@@ -49,7 +49,7 @@ cursor.execute("SELECT * FROM orders")  # Returns ONLY Tenant A's orders
 
 ## How It Works
 
-```
+```bash
 ┌─────────────┐     ┌──────────────┐     ┌──────────────────────┐
 │  AI Agent    │────▶│  DB Firewall │────▶│     Database          │
 │  (MCP/Lang-  │     │  Middleware   │     │                      │
@@ -65,6 +65,7 @@ cursor.execute("SELECT * FROM orders")  # Returns ONLY Tenant A's orders
 ```
 
 **Two layers of defense:**
+
 1. **Middleware** — Rewrites SQL before it reaches the database (works with ALL engines)
 2. **Database-native** — RLS (Postgres, SQL Server) or VPD (Oracle) as a second enforcement layer
 
@@ -75,7 +76,7 @@ Even if the middleware is bypassed, the database-native layer still blocks cross
 ## Supported Databases
 
 | Database | Native Security | Middleware | Migration Script |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **PostgreSQL** 9.5+ | ✅ Row-Level Security | ✅ | `001_postgresql.sql` |
 | **MySQL** 5.7+ / MariaDB | ❌ (Views + Triggers) | ✅ | `002_mysql.sql` |
 | **SQL Server** 2016+ | ✅ Security Policies | ✅ | `003_sqlserver.sql` |
@@ -85,7 +86,7 @@ Even if the middleware is bypassed, the database-native layer still blocks cross
 ## Supported Frameworks
 
 | Framework | Integration |
-|---|---|
+| --- | --- |
 | **Raw DB-API** | `protect(connection)` |
 | **SQLAlchemy** | `sqlalchemy_event_hooks(engine)` |
 | **Django** | Middleware class |
@@ -101,6 +102,7 @@ Even if the middleware is bypassed, the database-native layer still blocks cross
 Wrap any MCP database server to auto-inject tenant isolation:
 
 **Before (UNSAFE):**
+
 ```json
 {
   "sql_mcp": {
@@ -111,6 +113,7 @@ Wrap any MCP database server to auto-inject tenant isolation:
 ```
 
 **After (PROTECTED):**
+
 ```json
 {
   "sql_mcp": {
@@ -182,7 +185,7 @@ excluded_tables:
 ## Security Principles
 
 | Principle | Implementation |
-|---|---|
+| --- | --- |
 | **Fail closed** | No tenant context = 0 rows returned. Never defaults to "show all". |
 | **Defense in depth** | Middleware + database-native RLS/VPD. Two independent layers. |
 | **Full DML protection** | SELECT, INSERT, UPDATE, AND DELETE are all filtered. |
@@ -194,7 +197,7 @@ excluded_tables:
 
 ## Project Structure
 
-```
+```bash
 db-firewall/
 ├── config/
 │   └── firewall.yaml            # Default configuration + documentation
