@@ -511,12 +511,32 @@ def _set_context_postgres(connection, tenant_id: str):
     cursor.close()
 
 
+def _pg_transaction_idle(connection) -> Optional[bool]:
+    """True when no transaction is open (psycopg2 and psycopg3 both expose
+    libpq's PQTRANS_IDLE == 0 as connection.info.transaction_status).
+    None when the driver does not tell."""
+    status = getattr(getattr(connection, "info", None), "transaction_status", None)
+    if status is None:
+        return None
+    return int(status) == 0
+
+
 def _clear_context_postgres(connection):
     # Belt for session-scoped values (e.g. set by _firewall_set_tenant() SQL).
     # Transaction-local values are already dropped by commit/rollback.
+    #
+    # GUC changes are transactional: a clear issued inside a transaction the
+    # caller later rolls back (or a pool rolls back on return) is undone and
+    # the old session value comes back for the next borrower. When no
+    # transaction is open the clear opens one of its own, so commit it here.
+    # When the caller's transaction is open we must not decide its fate; the
+    # pool reset hook (pool_checkin) rolls back first and then clears.
+    was_idle = _pg_transaction_idle(connection)
     cursor = connection.cursor()
     cursor.execute("SELECT set_config('app.current_tenant', '', false)")
     cursor.close()
+    if was_idle and not _is_autocommit(connection) and hasattr(connection, "commit"):
+        connection.commit()
 
 
 def _set_context_mysql(connection, tenant_id: str):
@@ -599,6 +619,12 @@ def pool_checkin(connection, engine: Optional[str] = None) -> None:
         psycopg_pool.ConnectionPool(dsn, reset=pool_checkin)
         sqlalchemy: event.listen(engine.pool, "checkin",
                                  lambda dbapi_conn, rec: pool_checkin(dbapi_conn))
+
+    This hook is REQUIRED for PostgreSQL pools where a SESSION-scoped value
+    may exist (_firewall_set_tenant() SQL, auto-resolve, legacy code):
+    ProtectedConnection.release() clears it transactionally, and a pool that
+    rolls back on return undoes that clear. Here we roll back first, then
+    clear and commit, so the clear survives whatever the borrower left open.
     """
     if engine is None:
         engine = detect_engine(connection)
@@ -606,9 +632,13 @@ def pool_checkin(connection, engine: Optional[str] = None) -> None:
     if not clearer:
         return  # engine without DB-side context: nothing to clear (benign)
     try:
+        # Discard whatever transaction the borrower left open (pools do this
+        # before calling us anyway) so the clear below is not rolled back later.
+        if not _is_autocommit(connection) and hasattr(connection, "rollback"):
+            connection.rollback()
         clearer(connection)
         # The clear statement opens an implicit transaction in non-autocommit
-        # mode; the pool already rolled back/committed user work before us.
+        # mode; commit it so it sticks (no-op when the clearer already did).
         if not _is_autocommit(connection) and hasattr(connection, "commit"):
             connection.commit()
     except Exception as e:
@@ -728,7 +758,13 @@ class ProtectedConnection:
 
     def release(self):
         """Drop tenant context (DB-side + thread-local) without closing the
-        underlying connection. Call before handing it back to a pool."""
+        underlying connection. Call before handing it back to a pool.
+
+        PostgreSQL: the transaction-local tenant dies with the transaction
+        regardless. A SESSION-scoped value is cleared transactionally here and
+        committed only when no transaction is open; if you release() inside an
+        open transaction that is then rolled back, the pool's ``reset`` hook
+        must be ``pool_checkin`` (which rolls back, clears and commits)."""
         clear_db_context(self._connection, self._engine)
         TenantContext.clear()
 
@@ -880,16 +916,27 @@ def sqlalchemy_event_hooks(engine_instance):
     """
     from sqlalchemy import event
 
-    # Per-checkout, not per-connect: a pooled connection serves many tenants.
-    # Postgres uses a transaction-local GUC, so it dies with the transaction.
-    @event.listens_for(engine_instance, "checkout")
-    def on_checkout(dbapi_connection, connection_record, connection_proxy):
+    def _apply_tenant(dbapi_connection):
         tenant = TenantContext.get()
         if tenant:
             db_engine = detect_engine(dbapi_connection)
             setter = _CONTEXT_SETTERS.get(db_engine)
             if setter:
                 setter(dbapi_connection, tenant)
+
+    # Per-checkout, not per-connect: a pooled connection serves many tenants.
+    # Postgres uses a transaction-local GUC, so it dies with the transaction.
+    @event.listens_for(engine_instance, "checkout")
+    def on_checkout(dbapi_connection, connection_record, connection_proxy):
+        _apply_tenant(dbapi_connection)
+
+    # ...and therefore it must be re-applied for every transaction a long-lived
+    # Connection/Session opens after its first commit()/rollback(). SQLAlchemy
+    # fires "begin" when it starts each new transaction. Setting the GUC twice
+    # in one transaction (checkout, then begin) is harmless: same value.
+    @event.listens_for(engine_instance, "begin")
+    def on_begin(conn):
+        _apply_tenant(conn.connection.dbapi_connection)
 
     @event.listens_for(engine_instance, "checkin")
     def on_checkin(dbapi_connection, connection_record):

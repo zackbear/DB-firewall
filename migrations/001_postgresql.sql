@@ -144,6 +144,7 @@ DO $$
 DECLARE
     r RECORD;
     policy_name TEXT;
+    legacy_name TEXT;
 BEGIN
     FOR r IN
         SELECT c.table_schema, c.table_name
@@ -161,7 +162,11 @@ BEGIN
                 '__diesel_schema_migrations', 'flyway_schema_history'
             )
     LOOP
-        policy_name := 'firewall_rls_' || r.table_name;
+        -- Policy names are capped at 63 bytes. 'firewall_rls_' || table || '_sel'
+        -- overflows for table names > 46 chars and the truncated names collide
+        -- (CREATE POLICY ... already exists). A hash stem is short and unique.
+        policy_name := 'fw_' || left(md5(r.table_schema || '.' || r.table_name), 12);
+        legacy_name := 'firewall_rls_' || r.table_name;
 
         -- Enable RLS on the table
         EXECUTE format('ALTER TABLE %I.%I ENABLE ROW LEVEL SECURITY', r.table_schema, r.table_name);
@@ -169,7 +174,17 @@ BEGIN
         -- Force RLS even for table owners
         EXECUTE format('ALTER TABLE %I.%I FORCE ROW LEVEL SECURITY', r.table_schema, r.table_name);
 
-        -- Drop existing policies if re-running (idempotent)
+        -- Drop existing policies if re-running (idempotent). Permissive
+        -- policies OR together, so every earlier generation must go: the
+        -- legacy single policy and the legacy per-command policies hardcoded
+        -- a postgres/admin/_migrator bypass that would otherwise survive an
+        -- upgrade. The legacy names are passed through %I, which truncates
+        -- like CREATE POLICY did, so over-long legacy names still match.
+        EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', legacy_name, r.table_schema, r.table_name);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', legacy_name || '_sel', r.table_schema, r.table_name);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', legacy_name || '_ins', r.table_schema, r.table_name);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', legacy_name || '_upd', r.table_schema, r.table_name);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', legacy_name || '_del', r.table_schema, r.table_name);
         EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', policy_name || '_sel', r.table_schema, r.table_name);
         EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', policy_name || '_ins', r.table_schema, r.table_name);
         EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', policy_name || '_upd', r.table_schema, r.table_name);

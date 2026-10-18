@@ -18,6 +18,7 @@ Usage:
 import sys
 import os
 import json
+import re
 import argparse
 from typing import List, Dict, Tuple, Optional
 
@@ -70,7 +71,8 @@ def scan_tables(connection, engine: str, config: dict) -> Dict[str, dict]:
                    EXISTS (
                        SELECT 1 FROM pg_policies p
                        WHERE p.tablename = c.table_name
-                         AND p.policyname LIKE 'firewall_rls_%'
+                         AND (p.policyname LIKE 'firewall_rls_%'       -- legacy names
+                              OR p.policyname = 'fw_' || left(md5(c.table_schema || '.' || c.table_name), 12) || '_sel')
                    ) as has_policy,
                    (SELECT relrowsecurity FROM pg_class
                     WHERE relname = c.table_name) as rls_enabled
@@ -213,16 +215,23 @@ def print_report(results: Dict[str, dict], engine: str):
     print(f"\n{'='*60}\n")
 
 
-_OPEN_RULES = ("allow read, write: if true", "allow read: if true", "allow write: if true",
-               "allow read,write: if true", "allow write, read: if true")
+_FS_OPS = r"(?:read|write|get|list|create|update|delete)"
+# `allow <op>[, <op>...] : if true` with any whitespace (including newlines)
+# around the commas, the colon and inside the condition.
+_OPEN_RULE_RE = re.compile(
+    r"\ballow\s+" + _FS_OPS + r"(?:\s*,\s*" + _FS_OPS + r")*\s*:\s*if\s+true\b")
 
 
 def check_firestore_rules(path: str) -> List[str]:
-    """Return offending lines in a firestore.rules file that grant open access."""
+    """Return offending rules in a firestore.rules file that grant open access.
+
+    Matches on the whitespace-normalized file, so `allow read, write : if true;`
+    and a condition split across lines are caught, not only the literal
+    `allow read, write: if true` spelling.
+    """
     with open(path, encoding="utf-8") as fh:
-        text = fh.read()
-    return [line.strip() for line in text.splitlines()
-            if any(rule in " ".join(line.split()) for rule in _OPEN_RULES)]
+        normalized = " ".join(fh.read().split())
+    return [m.group(0) for m in _OPEN_RULE_RE.finditer(normalized)]
 
 
 if __name__ == "__main__":

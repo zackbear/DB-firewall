@@ -278,3 +278,53 @@ class TestRulesGenerator:
         assert "allow read, write: if false;" in r
         with pytest.raises(ValueError):
             generate_rules(mode="field")  # collections required
+
+
+# ------------------------------------------------- scanner --firestore-rules
+class TestOpenRulesScanner:
+    """hooks/scanner.py check_firestore_rules: open 'if true' grants must be found
+    regardless of spacing or line breaks, and the generated rules must stay clean."""
+
+    @pytest.fixture
+    def check(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "hooks"))
+        from scanner import check_firestore_rules
+        return check_firestore_rules
+
+    def _write(self, tmp_path, body):
+        p = tmp_path / "firestore.rules"
+        p.write_text("rules_version = '2';\nservice cloud.firestore {\n  match /databases/{db}/documents {\n"
+                     f"    match /x/{{doc}} {{\n      {body}\n    }}\n  }}\n}}\n", encoding="utf-8")
+        return str(p)
+
+    @pytest.mark.parametrize("body", [
+        "allow read, write: if true;",
+        "allow read, write : if true;",          # space before the colon
+        "allow read,write:if true;",             # no spaces at all
+        "allow write, read: if true;",
+        "allow get, list: if true;",             # granular ops
+        "allow create, update, delete: if true;",
+        "allow read, write:\n        if true;",  # condition on the next line
+        "allow read,\n        write: if\n        true;",  # split everywhere
+        "allow read: if true;",
+    ])
+    def test_open_rule_detected(self, check, tmp_path, body):
+        found = check(self._write(tmp_path, body))
+        assert len(found) == 1, found
+        assert found[0].startswith("allow ") and found[0].endswith("if true")
+
+    @pytest.mark.parametrize("body", [
+        "allow read, write: if false;",
+        "allow read: if request.auth != null;",
+        "// allow read, write: if truely_not_a_rule;",
+        "allow read: if trueish;",
+    ])
+    def test_closed_rule_not_flagged(self, check, tmp_path, body):
+        assert check(self._write(tmp_path, body)) == []
+
+    def test_generated_rules_pass_scanner(self, check, tmp_path):
+        p = tmp_path / "gen.rules"
+        p.write_text(generate_rules(collections=["orders"], mode="field"), encoding="utf-8")
+        assert check(str(p)) == []
+        p.write_text(generate_rules(tenant_claim="org"), encoding="utf-8")
+        assert check(str(p)) == []
