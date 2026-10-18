@@ -29,6 +29,7 @@ import logging
 import hashlib
 import threading
 import functools
+import weakref
 from pathlib import Path
 from typing import Optional, Dict, List, Any, Union
 from datetime import datetime, timezone
@@ -40,6 +41,11 @@ try:
 except ImportError:
     HAS_YAML = False
 
+try:                                    # package import (middleware.db_firewall)
+    from . import sql_rewriter as _sqlr
+except ImportError:                     # flat import (sys.path += middleware/)
+    import sql_rewriter as _sqlr
+
 logger = logging.getLogger("db_firewall")
 
 # ============================================================================
@@ -49,6 +55,13 @@ logger = logging.getLogger("db_firewall")
 DEFAULT_CONFIG = {
     "tenant_column": "tenant_id",
     "fail_mode": "closed",
+    # "ast" (sqlglot, scopes CTEs/UNION/joins/INSERT..SELECT) or "regex" (legacy,
+    # refuses those shapes). "ast" raises ImportError when sqlglot is missing.
+    "rewriter": "ast",
+    # INSERT ... (tenant_id) VALUES (%s): the bound value is the caller's, not
+    # the firewall's. Refused unless this is true (then RLS WITH CHECK is the
+    # only guard on it).
+    "allow_tenant_placeholder": False,
     "protect": {"select": True, "insert": True, "update": True, "delete": True},
     "audit": {"enabled": True, "table_name": "_firewall_audit_log", "retention_days": 90},
     # Empty by default: managed Postgres (Supabase, Neon, RDS) apps often connect
@@ -92,6 +105,8 @@ def load_config(project_root: Optional[str] = None) -> dict:
         config["tenant_column"] = os.environ["DB_FIREWALL_TENANT_COLUMN"]
     if os.environ.get("DB_FIREWALL_FAIL_MODE"):
         config["fail_mode"] = os.environ["DB_FIREWALL_FAIL_MODE"]
+    if os.environ.get("DB_FIREWALL_REWRITER"):
+        config["rewriter"] = os.environ["DB_FIREWALL_REWRITER"]
 
     return config
 
@@ -187,72 +202,151 @@ class TenantContext:
 # TABLE INTROSPECTION
 # ============================================================================
 
-_table_cache: Dict[str, Dict[str, bool]] = {}
+# Metadata answers are cached per connection (cleared by protect()) and, when
+# the driver exposes a DSN, per (engine, dsn, table) across connections. Both
+# expire after TABLE_CACHE_TTL seconds and only ever hold successful lookups:
+# a failed lookup raises (fail closed) and is never cached (C9).
+TABLE_CACHE_TTL = 60.0
+_table_cache: Dict[tuple, tuple] = {}            # key -> (has_col, expires_at)
 _cache_lock = threading.Lock()
+_conn_cache: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+_META_SAVEPOINT = "__dbfw_meta"
+
+
+def _conn_table_cache(connection) -> Dict[tuple, tuple]:
+    try:
+        return _conn_cache.setdefault(connection, {})
+    except TypeError:               # connection object is not weak-referenceable
+        return {}
+
+
+def _conn_dsn(connection) -> Optional[str]:
+    dsn = getattr(connection, "dsn", None)                       # psycopg2
+    if dsn is None:
+        dsn = getattr(getattr(connection, "info", None), "dsn", None)   # psycopg3
+    return dsn if isinstance(dsn, str) else None
+
+
+def _in_transaction(connection) -> Optional[bool]:
+    """True when the connection has an open (or aborted) transaction, False
+    when idle, None when the driver does not say."""
+    idle = _pg_transaction_idle(connection)
+    if idle is not None:
+        return not idle
+    in_txn = getattr(connection, "in_transaction", None)         # sqlite3, mysql-connector
+    return bool(in_txn) if isinstance(in_txn, bool) else None
+
+
+def _fold_table_name(table_name: str, quoted: bool, engine: str) -> str:
+    """Unquoted identifiers fold to the engine's canonical case; quoted ones
+    keep theirs (C4)."""
+    if quoted:
+        return table_name
+    if engine in (DBEngine.POSTGRESQL, DBEngine.MYSQL, DBEngine.SQLITE):
+        return table_name.lower()
+    if engine == DBEngine.ORACLE:
+        return table_name.upper()
+    return table_name                       # sqlserver: compared case-insensitively
 
 
 def _has_tenant_column(connection, table_name: str, engine: str,
-                       tenant_column: str) -> bool:
-    """Check if a table has the tenant column."""
-    cache_key = f"{engine}:{table_name}"
-
-    with _cache_lock:
-        if cache_key in _table_cache:
-            return _table_cache[cache_key].get("has_col", False)
-
-    has_col = False
-    try:
-        cursor = connection.cursor()
-        if engine == DBEngine.POSTGRESQL:
-            cursor.execute(
-                "SELECT 1 FROM information_schema.columns "
-                "WHERE table_name = %s AND column_name = %s",
-                (table_name, tenant_column)
-            )
-        elif engine == DBEngine.MYSQL:
-            cursor.execute(
-                "SELECT 1 FROM information_schema.columns "
-                "WHERE table_name = %s AND column_name = %s AND table_schema = DATABASE()",
-                (table_name, tenant_column)
-            )
-        elif engine == DBEngine.SQLSERVER:
-            cursor.execute(
-                "SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS "
-                "WHERE TABLE_NAME = ? AND COLUMN_NAME = ?",
-                (table_name, tenant_column)
-            )
-        elif engine == DBEngine.SQLITE:
-            cursor.execute(f"PRAGMA table_info({table_name})")
-            cols = [row[1] for row in cursor.fetchall()]
-            has_col = tenant_column in cols
-            with _cache_lock:
-                _table_cache[cache_key] = {"has_col": has_col}
-            return has_col
-        else:
-            return False
-
-        has_col = cursor.fetchone() is not None
-        cursor.close()
-    except Exception as e:
-        logger.debug(f"DB Firewall: Could not check columns for {table_name}: {e}")
-
-    with _cache_lock:
-        _table_cache[cache_key] = {"has_col": has_col}
-
+                       tenant_column: str, quoted: bool = False) -> bool:
+    """Check if a table has the tenant column. Raises on lookup failure."""
+    name = _fold_table_name(table_name, quoted, engine)
+    key = (engine, _conn_dsn(connection), name, tenant_column)
+    now = time.monotonic()
+    local = _conn_table_cache(connection)
+    hit = local.get(key)
+    if hit is None and key[1] is not None:
+        with _cache_lock:
+            hit = _table_cache.get(key)
+    if hit is not None and hit[1] > now:
+        return hit[0]
+    has_col = _has_tenant_column_uncached(connection, name, engine, tenant_column)
+    entry = (has_col, now + TABLE_CACHE_TTL)
+    local[key] = entry
+    if key[1] is not None:
+        with _cache_lock:
+            _table_cache[key] = entry
     return has_col
+
+
+def _has_tenant_column_uncached(connection, table_name: str, engine: str,
+                                tenant_column: str) -> bool:
+    """One metadata query. Runs inside a SAVEPOINT when a transaction is open
+    so a failure here (or a previous statement's error) cannot be mistaken
+    for "no tenant column"; any failure propagates."""
+    in_txn = _in_transaction(connection)
+    cursor = connection.cursor()
+    try:
+        if in_txn:
+            cursor.execute(f"SAVEPOINT {_META_SAVEPOINT}")
+        try:
+            has_col = _lookup_tenant_column(cursor, table_name, engine, tenant_column)
+        except Exception:
+            if in_txn:
+                try:
+                    cursor.execute(f"ROLLBACK TO SAVEPOINT {_META_SAVEPOINT}")
+                except Exception:
+                    pass
+            raise
+        if in_txn:
+            cursor.execute(f"RELEASE SAVEPOINT {_META_SAVEPOINT}")
+        return has_col
+    except Exception as e:
+        raise PermissionError(
+            f"DB Firewall: could not verify tenant column on {table_name!r} "
+            f"({type(e).__name__}: {str(e).splitlines()[0][:120]}); query refused") from e
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+
+
+def _lookup_tenant_column(cursor, table_name: str, engine: str, tenant_column: str) -> bool:
+    if engine == DBEngine.POSTGRESQL:
+        cursor.execute(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = %s AND column_name = %s",
+            (table_name, tenant_column))
+    elif engine == DBEngine.MYSQL:
+        cursor.execute(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = %s AND column_name = %s AND table_schema = DATABASE()",
+            (table_name, tenant_column))
+    elif engine == DBEngine.SQLSERVER:
+        cursor.execute(
+            "SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE LOWER(TABLE_NAME) = LOWER(?) AND LOWER(COLUMN_NAME) = LOWER(?)",
+            (table_name, tenant_column))
+    elif engine == DBEngine.ORACLE:
+        cursor.execute(
+            "SELECT 1 FROM all_tab_columns "
+            "WHERE LOWER(table_name) = LOWER(:1) AND LOWER(column_name) = LOWER(:2)",
+            (table_name, tenant_column))
+    elif engine == DBEngine.SQLITE:
+        if not re.fullmatch(r"\w+", table_name):
+            raise ValueError("unsafe table name")
+        cursor.execute(f'PRAGMA table_info("{table_name}")')
+        return any(row[1].lower() == tenant_column.lower() for row in cursor.fetchall())
+    else:
+        raise RuntimeError(f"no column metadata lookup for engine {engine!r}")
+    return cursor.fetchone() is not None
 
 
 # ============================================================================
 # SQL QUERY REWRITING — THE INVISIBLE WHERE CLAUSE
 # ============================================================================
 
-# Regex patterns for SQL parsing
+# Regex patterns for table-name extraction (pre-filter only: the AST rewriter
+# makes the real decision). Optional schema prefix; quotes may follow the
+# keyword directly (FROM"orders").
+_IDENT = r'[`"\[]?(\w+)[`"\]]?'
 _TABLE_PATTERNS = [
-    r'\bFROM\s+([`"\[]?\w+[`"\]]?)',
-    r'\bJOIN\s+([`"\[]?\w+[`"\]]?)',
-    r'\bINTO\s+([`"\[]?\w+[`"\]]?)',
-    r'\bUPDATE\s+([`"\[]?\w+[`"\]]?)',
-    r'\bDELETE\s+FROM\s+([`"\[]?\w+[`"\]]?)',
+    re.compile(rf'\b{kw}(?:\s+|(?=[`"\[]))(?:{_IDENT}\s*\.\s*)?{_IDENT}', re.IGNORECASE)
+    for kw in ("FROM", "JOIN", "INTO", "UPDATE", r"DELETE\s+FROM", "USING",
+               "COPY", r"TRUNCATE(?:\s+TABLE)?")
 ]
 
 _SELECT_RE = re.compile(r'\bSELECT\b', re.IGNORECASE)
@@ -266,9 +360,8 @@ def _extract_tables(sql: str) -> List[str]:
     """Extract table names from a SQL query."""
     tables = set()
     for pattern in _TABLE_PATTERNS:
-        for match in re.finditer(pattern, sql, re.IGNORECASE):
-            table = match.group(1).strip('`"[]')
-            tables.add(table)
+        for match in pattern.finditer(sql):
+            tables.add(match.group(2))      # group 1 = optional schema
     return list(tables)
 
 
@@ -284,62 +377,9 @@ _CLAUSE_RE = re.compile(r'\b(ORDER\s+BY|GROUP\s+BY|HAVING|LIMIT|OFFSET|FETCH|FOR
                         re.IGNORECASE)
 
 
-def _blank_literals(sql: str, backslash_escapes: bool) -> Optional[str]:
-    """Return ``sql`` with the contents of '...' literals and all -- / /* */
-    comments replaced by spaces (same length, so positions line up), or None
-    when a literal/comment is unterminated."""
-    out, i, n = [], 0, len(sql)
-    while i < n:
-        c = sql[i]
-        if c == "'":
-            out.append("'")
-            i += 1
-            while True:
-                if i >= n:
-                    return None
-                if sql[i] == "'":
-                    if i + 1 < n and sql[i + 1] == "'":      # '' escape
-                        out.append("  ")
-                        i += 2
-                        continue
-                    out.append("'")
-                    i += 1
-                    break
-                if backslash_escapes and sql[i] == "\\" and i + 1 < n:
-                    out.append("  ")
-                    i += 2
-                    continue
-                out.append(" " if sql[i] != "\n" else "\n")
-                i += 1
-        elif sql.startswith("--", i):
-            j = sql.find("\n", i)
-            j = n if j < 0 else j
-            out.append(" " * (j - i))
-            i = j
-        elif sql.startswith("/*", i):
-            j = sql.find("*/", i + 2)
-            if j < 0:
-                return None
-            out.append(" " * (j + 2 - i))
-            i = j + 2
-        else:
-            out.append(c)
-            i += 1
-    return "".join(out)
-
-
-def _strip_sql(sql: str) -> str:
-    """Literal/comment-blanked copy of ``sql`` for keyword detection.
-    Raises PermissionError when the text cannot be tokenised unambiguously
-    (unterminated literal/comment, or a backslash-quote whose meaning differs
-    between engines) — we never guess where a literal ends."""
-    plain = _blank_literals(sql, backslash_escapes=False)
-    mysql = _blank_literals(sql, backslash_escapes=True)
-    if plain is None or mysql is None or plain != mysql:
-        raise PermissionError(
-            "DB Firewall: unsupported statement shape (ambiguous or unterminated "
-            "string literal/comment); cannot be safely scoped")
-    return plain
+# Shared with the AST rewriter (middleware/sql_rewriter.py).
+_blank_literals = _sqlr.blank_literals
+_strip_sql = _sqlr.strip_sql
 
 
 def _toplevel_match(regex, clean: str):
@@ -391,6 +431,8 @@ def validate_tenant_id(tenant_id: str) -> str:
         raise ValueError("DB Firewall: tenant_id must be a non-empty string")
     if any(c in tenant_id for c in _BAD_TENANT_CHARS):
         raise ValueError("DB Firewall: tenant_id contains NUL/newline/backslash characters")
+    if _sqlr._PH_PREFIX in tenant_id:
+        raise ValueError("DB Firewall: tenant_id contains the reserved placeholder token")
     return tenant_id
 
 
@@ -405,63 +447,112 @@ def rewrite_query(sql: str, tenant_id: str, config: dict,
     """
     Rewrite a SQL query to inject tenant isolation WHERE clauses.
     This is the middleware-level enforcement for engines without native RLS.
+
+    ``config["rewriter"]``: "ast" (default, sqlglot) parses EVERY statement:
+    only SELECT/INSERT/UPDATE/DELETE (and WITH-wrapped forms), transaction
+    control and harmless SET/RESET get through; every protected table
+    reference is scoped (CTEs, UNION branches, joins, subqueries,
+    INSERT..SELECT) and what cannot be proven scoped is refused. "regex" is
+    the legacy injector that refuses multi-scope shapes outright.
     """
     if not sql or not sql.strip():
         return sql
 
-    tenant_col = config.get("tenant_column", "tenant_id")
-    excluded = config.get("excluded_tables", [])
-    protect = config.get("protect", {})
-
-    # No tenant → don't rewrite (fail-closed is enforced by ProtectedCursor)
+    # No tenant → don't rewrite (fail-closed is enforced by check_no_tenant)
     if tenant_id is None:
         return sql
 
+    protect = config.get("protect", {})
+    is_protected = _protected_predicate(config, connection, engine)
+
+    if config.get("rewriter", "ast") != "regex":
+        validate_tenant_id(tenant_id)
+        # ImportError (sqlglot missing) propagates: never silently fall back.
+        return _sqlr.rewrite(
+            sql, tenant_id, config.get("tenant_column", "tenant_id"), is_protected, engine,
+            protect_ops=protect,
+            allow_tenant_placeholder=bool(config.get("allow_tenant_placeholder", False)))
+
+    return _rewrite_query_regex(sql, tenant_id, config, is_protected)
+
+
+def _protected_predicate(config: dict, connection, engine):
+    """``is_protected(name, quoted)`` for one statement: excluded_tables glob
+    (on the engine-folded name) first, then the live column check. Without a
+    connection every non-excluded table counts as protected."""
+    tenant_col = config.get("tenant_column", "tenant_id")
+    excluded = config.get("excluded_tables", [])
+    memo: Dict[tuple, bool] = {}
+
+    def is_protected(table: str, quoted: bool = False) -> bool:
+        key = (table, quoted)
+        if key not in memo:
+            folded = _fold_table_name(table, quoted, engine or DBEngine.UNKNOWN)
+            memo[key] = not (_is_excluded_table(table, excluded)
+                             or _is_excluded_table(folded, excluded)) and (
+                connection is None
+                or _has_tenant_column(connection, table, engine, tenant_col, quoted))
+        return memo[key]
+    return is_protected
+
+
+def check_no_tenant(sql: str, config: dict, connection=None, engine: str = None) -> None:
+    """fail_mode=closed with no tenant: raise PermissionError unless the
+    statement is on the pass-through list or touches no protected table."""
+    if not sql or not sql.strip():
+        return
+    if config.get("rewriter", "ast") != "regex":
+        _sqlr.rewrite(sql, None, config.get("tenant_column", "tenant_id"),
+                      _protected_predicate(config, connection, engine), engine)
+        return
+    if _strip_sql(sql).lstrip().upper().startswith(_DML_STARTS + _UNSAFE_STARTS):
+        raise PermissionError(_sqlr._NO_TENANT_MSG)
+
+
+def _rewrite_query_regex(sql: str, tenant_id: str, config: dict, is_protected) -> str:
+    """Legacy path: regex table extraction gates the single-WHERE injector."""
+    protect = config.get("protect", {})
     # All keyword detection runs on a copy with string literals and comments
     # blanked out, so 'UNION' inside a literal is not a set operation and a
     # WHERE inside a literal cannot misplace the injected predicate.
     clean = _strip_sql(sql)
     head = clean.lstrip().upper()
 
-    # Skip non-DML (unsafe shapes are checked first: WITH/(/TABLE are DML too)
-    if not head.startswith(_DML_STARTS + _UNSAFE_STARTS):
-        return sql
-
-    # Determine operation type
-    is_select = head.startswith("SELECT")
-    is_insert = head.startswith("INSERT")
-    is_update = head.startswith("UPDATE")
-    is_delete = head.startswith("DELETE")
-
-    # Check if operation is protected
-    if is_select and not protect.get("select", True):
-        return sql
-    if is_insert and not protect.get("insert", True):
-        return sql
-    if is_update and not protect.get("update", True):
-        return sql
-    if is_delete and not protect.get("delete", True):
-        return sql
-
-    # Extract and check tables
     tables = _extract_tables(clean)
     m = _TABLE_CMD_RE.match(clean)
     if m:
         tables.append(m.group(1).strip('`"[]'))
-    protected_tables = [
-        t for t in tables
-        if not _is_excluded_table(t, excluded)
-        and (connection is None or _has_tenant_column(connection, t, engine, tenant_col))
-    ]
+    protected_tables = [t for t in tables if is_protected(t)]
+
+    # Non-DML (DDL, utility) is passed through — unless it names a protected
+    # table (CREATE TABLE AS SELECT, MERGE INTO, COPY, TRUNCATE): fail closed.
+    if not head.startswith(_DML_STARTS + _UNSAFE_STARTS):
+        if protected_tables:
+            raise PermissionError(
+                "DB Firewall: non-DML statement references protected table(s) "
+                f"{sorted(protected_tables)}; refused")
+        return sql
+
+    # Per-operation opt-out
+    for op in ("select", "insert", "update", "delete"):
+        if head.startswith(op.upper()) and not protect.get(op, True):
+            return sql
 
     if not protected_tables:
         return sql
 
+    validate_tenant_id(tenant_id)
+    return _rewrite_regex(sql, clean, tenant_id, config.get("tenant_column", "tenant_id"))
+
+
+def _rewrite_regex(sql: str, clean: str, tenant_id: str, tenant_col: str) -> str:
+    """Legacy injector: one WHERE predicate on single-table-shaped statements."""
+    head = clean.lstrip().upper()
     # A protected table in a shape we cannot scope → refuse, never half-filter
     _reject_unsafe_shape(clean)
 
     # For SELECT/UPDATE/DELETE: inject WHERE clause
-    if is_select or is_update or is_delete:
+    if head.startswith(("SELECT", "UPDATE", "DELETE")):
         tenant_predicate = f"{tenant_col} = {_sql_literal(tenant_id)}"
 
         where = _toplevel_match(_WHERE_RE, clean)
@@ -660,6 +751,19 @@ def _is_connection_error(exc: BaseException) -> bool:
 # PROTECTED CURSOR — Intercepts all SQL execution
 # ============================================================================
 
+# Driver methods that run SQL. The wrappers implement the ones they know; any
+# other attribute with one of these names (or an ``execute*`` / ``copy*``
+# prefix) is refused instead of delegated, so a new driver entry point fails
+# closed rather than bypassing the firewall (H5).
+_SQL_METHOD_NAMES = frozenset({
+    "stream", "callproc", "executescript", "exec_driver_sql", "run", "query",
+    "copy_expert", "copy_from", "copy_to", "execute_batch", "execute_values"})
+
+
+def _is_sql_method(name: str) -> bool:
+    return name in _SQL_METHOD_NAMES or name.startswith(("execute", "copy"))
+
+
 class ProtectedCursor:
     """Wraps a DB-API cursor to enforce tenant isolation on every query."""
 
@@ -671,34 +775,38 @@ class ProtectedCursor:
         self._connection = connection
         self._engine = engine
 
-    def execute(self, sql: str, params=None):
+    def _guard(self, sql: str) -> str:
+        """Rewrite (tenant set) or fail-closed check (no tenant); one code
+        path for execute / executemany / stream / copy (H7)."""
         if self._tenant_id:
-            sql = rewrite_query(
-                sql, self._tenant_id, self._config,
-                self._connection, self._engine
-            )
-        elif self._config.get("fail_mode") == "closed":
-            # No tenant set + fail closed → block everything
-            if _strip_sql(sql).lstrip().upper().startswith(_DML_STARTS + _UNSAFE_STARTS):
-                raise PermissionError(
-                    "DB Firewall: No tenant context. Query blocked (fail_mode=closed)."
-                )
+            return rewrite_query(sql, self._tenant_id, self._config,
+                                 self._connection, self._engine)
+        if self._config.get("fail_mode", "closed") == "closed":
+            check_no_tenant(sql, self._config, self._connection, self._engine)
+        return sql
 
+    def execute(self, sql: str, params=None, **kwargs):
+        sql = self._guard(sql)
         logger.debug(f"DB Firewall: Executing: {sql[:200]}")
-
         if params:
-            return self._cursor.execute(sql, params)
-        return self._cursor.execute(sql)
+            return self._cursor.execute(sql, params, **kwargs)
+        return self._cursor.execute(sql, **kwargs)
 
-    def executemany(self, sql: str, params_list):
-        if self._tenant_id:
-            sql = rewrite_query(
-                sql, self._tenant_id, self._config,
-                self._connection, self._engine
-            )
-        return self._cursor.executemany(sql, params_list)
+    def executemany(self, sql: str, params_list, **kwargs):
+        sql = self._guard(sql)
+        return self._cursor.executemany(sql, params_list, **kwargs)
+
+    def stream(self, sql: str, params=None, **kwargs):            # psycopg3
+        sql = self._guard(sql)
+        return self._cursor.stream(sql, params, **kwargs)
+
+    def copy(self, sql: str, params=None, **kwargs):              # psycopg3
+        sql = self._guard(sql)              # COPY is never allow-listed with a tenant
+        return self._cursor.copy(sql, params, **kwargs)
 
     def __getattr__(self, name):
+        if _is_sql_method(name):
+            raise PermissionError(f"DB Firewall: cursor.{name}() is not mediated; refused")
         return getattr(self._cursor, name)
 
     def __iter__(self):
@@ -750,7 +858,32 @@ class ProtectedConnection:
             self._connection, self._engine
         )
 
+    # psycopg3 / sqlite3 connection-level shortcuts: route through a
+    # ProtectedCursor so they are mediated like cursor.execute() (H5).
+    def execute(self, sql: str, params=None, **kwargs):
+        cur = self.cursor()
+        cur.execute(sql, params, **kwargs)
+        return cur
+
+    def executemany(self, sql: str, params_list, **kwargs):
+        cur = self.cursor()
+        cur.executemany(sql, params_list, **kwargs)
+        return cur
+
+    def stream(self, sql: str, params=None, **kwargs):
+        return self.cursor().stream(sql, params, **kwargs)
+
+    def copy(self, sql: str, params=None, **kwargs):
+        return self.cursor().copy(sql, params, **kwargs)
+
+    def pipeline(self, *args, **kwargs):
+        # Pipeline mode batches round trips; statements still come from this
+        # wrapper's cursors, so delegating the context manager is safe.
+        return self._connection.pipeline(*args, **kwargs)
+
     def __getattr__(self, name):
+        if _is_sql_method(name):
+            raise PermissionError(f"DB Firewall: connection.{name}() is not mediated; refused")
         return getattr(self._connection, name)
 
     def __enter__(self):
@@ -802,6 +935,7 @@ def protect(connection, tenant_id: Optional[str] = None,
         config = load_config()
 
     engine = detect_engine(connection)
+    _conn_table_cache(connection).clear()   # schema may have changed since last protect()
 
     # Resolve tenant
     if tenant_id is None:
@@ -809,39 +943,57 @@ def protect(connection, tenant_id: Optional[str] = None,
     if tenant_id is None:
         tenant_id = os.environ.get("TENANT_ID")
     if tenant_id is None:
-        # Try DB user mapping
-        try:
-            cursor = connection.cursor()
-            if engine == DBEngine.POSTGRESQL:
-                cursor.execute(
-                    "SELECT tenant_id FROM _firewall_tenant_map "
-                    "WHERE db_user = current_user AND is_active = TRUE"
-                )
-            elif engine == DBEngine.MYSQL:
-                cursor.execute(
-                    "SELECT tenant_id FROM _firewall_tenant_map "
-                    "WHERE db_user = SUBSTRING_INDEX(CURRENT_USER(), '@', 1) AND is_active = 1"
-                )
-            elif engine == DBEngine.SQLSERVER:
-                cursor.execute(
-                    "SELECT tenant_id FROM _firewall_tenant_map "
-                    "WHERE db_user = SYSTEM_USER AND is_active = 1"
-                )
-            else:
-                cursor = None
-
-            if cursor:
-                row = cursor.fetchone()
-                if row:
-                    tenant_id = row[0]
-                cursor.close()
-        except Exception as e:
-            logger.debug(f"DB Firewall: Could not auto-resolve tenant: {e}")
+        tenant_id = _resolve_tenant_from_map(connection, engine)
 
     if tenant_id is None and config.get("fail_mode") == "closed":
         logger.warning("DB Firewall: No tenant resolved. All DML will be blocked.")
 
     return ProtectedConnection(connection, tenant_id, config, engine)
+
+
+_TENANT_MAP_SQL = {
+    DBEngine.POSTGRESQL: ("SELECT tenant_id FROM _firewall_tenant_map "
+                          "WHERE db_user = current_user AND is_active = TRUE"),
+    DBEngine.MYSQL: ("SELECT tenant_id FROM _firewall_tenant_map "
+                     "WHERE db_user = SUBSTRING_INDEX(CURRENT_USER(), '@', 1) AND is_active = 1"),
+    DBEngine.SQLSERVER: ("SELECT tenant_id FROM _firewall_tenant_map "
+                         "WHERE db_user = SYSTEM_USER AND is_active = 1"),
+}
+
+
+def _resolve_tenant_from_map(connection, engine: str) -> Optional[str]:
+    """Look the tenant up in _firewall_tenant_map. A missing table or grant
+    must not abort the caller's open transaction (M1): the probe runs inside
+    a SAVEPOINT that is rolled back on failure."""
+    sql = _TENANT_MAP_SQL.get(engine)
+    if sql is None:
+        return None
+    in_txn = _in_transaction(connection)
+    cursor = connection.cursor()
+    try:
+        if in_txn:
+            cursor.execute(f"SAVEPOINT {_META_SAVEPOINT}")
+        try:
+            cursor.execute(sql)
+            row = cursor.fetchone()
+        except Exception as e:
+            logger.debug(f"DB Firewall: Could not auto-resolve tenant: {e}")
+            if in_txn:
+                cursor.execute(f"ROLLBACK TO SAVEPOINT {_META_SAVEPOINT}")
+            elif in_txn is False and not _is_autocommit(connection):
+                connection.rollback()       # the implicit transaction was ours alone
+            return None
+        if in_txn:
+            cursor.execute(f"RELEASE SAVEPOINT {_META_SAVEPOINT}")
+        return row[0] if row else None
+    except Exception as e:
+        logger.debug(f"DB Firewall: Could not auto-resolve tenant: {e}")
+        return None
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
 
 
 def set_tenant(tenant_id: str):
@@ -943,29 +1095,24 @@ def sqlalchemy_event_hooks(engine_instance):
         if dbapi_connection is not None:
             pool_checkin(dbapi_connection)
 
-    @event.listens_for(engine_instance, "before_cursor_execute")
+    # retval=True: SQLAlchemy only uses the returned (statement, parameters)
+    # with this flag; without it the rewrite was computed and thrown away (H6).
+    @event.listens_for(engine_instance, "before_cursor_execute", retval=True)
     def before_execute(conn, cursor, statement, parameters, context, executemany):
         tenant = TenantContext.get()
         config = load_config()
+        dbapi_conn = conn.connection.dbapi_connection
+        db_engine = detect_engine(dbapi_conn)
 
         if tenant and statement:
-            db_engine = detect_engine(conn.connection.dbapi_connection)
-            new_statement = rewrite_query(
-                statement, tenant, config,
-                conn.connection.dbapi_connection, db_engine
-            )
+            new_statement = rewrite_query(statement, tenant, config, dbapi_conn, db_engine)
             if new_statement != statement:
                 context._firewall_original = statement
-                return new_statement, parameters
+            return new_statement, parameters
 
-        elif not tenant and config.get("fail_mode") == "closed":
-            if _strip_sql(statement).lstrip().upper().startswith(_DML_STARTS + _UNSAFE_STARTS):
-                tables = _extract_tables(statement)
-                excluded = config.get("excluded_tables", [])
-                if any(not _is_excluded_table(t, excluded) for t in tables):
-                    raise PermissionError(
-                        "DB Firewall: No tenant context. Query blocked."
-                    )
+        if not tenant and config.get("fail_mode", "closed") == "closed":
+            check_no_tenant(statement, config, dbapi_conn, db_engine)
+        return statement, parameters
 
 
 def fastapi_middleware(app):
