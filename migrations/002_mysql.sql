@@ -85,7 +85,11 @@ END //
 
 -- 4. Connection init procedure — call this on every new connection
 --    Connection pool libraries should call this in their on_connect hook.
-CREATE PROCEDURE IF NOT EXISTS _firewall_init_connection()
+--    DROP + CREATE, not IF NOT EXISTS: the body changed (the hardcoded
+--    root/admin/_migrator bypass became the _firewall_bypass_roles lookup) and
+--    IF NOT EXISTS would keep the old body on an upgraded database.
+DROP PROCEDURE IF EXISTS _firewall_init_connection //
+CREATE PROCEDURE _firewall_init_connection()
 BEGIN
     DECLARE v_tenant VARCHAR(128);
     DECLARE v_user VARCHAR(128);
