@@ -5,7 +5,7 @@ import sys
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'middleware'))
-from db_firewall import rewrite_query, validate_tenant_id  # noqa: E402
+from db_firewall import load_config, rewrite_query, validate_tenant_id  # noqa: E402
 
 CONFIG = {"tenant_column": "tenant_id", "fail_mode": "closed",
           "protect": {"select": True, "insert": True, "update": True, "delete": True},
@@ -39,3 +39,12 @@ def test_rewrite_rejects_control_chars_and_empty(bad, config):
 def test_validate_tenant_id_rejects_non_string():
     with pytest.raises(ValueError):
         validate_tenant_id(123)
+
+
+def test_env_rewriter_override_wins_over_config_file(tmp_path, monkeypatch):
+    """Codex finding on #3: the env override was skipped when a config file existed."""
+    (tmp_path / ".db-firewall.json").write_text('{"rewriter": "ast", "tenant_column": "org_id"}')
+    monkeypatch.setenv("DB_FIREWALL_REWRITER", "regex")
+    cfg = load_config(project_root=str(tmp_path))
+    assert cfg["rewriter"] == "regex"
+    assert cfg["tenant_column"] == "org_id"  # file values still apply

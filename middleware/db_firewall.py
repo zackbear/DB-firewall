@@ -96,18 +96,20 @@ def load_config(project_root: Optional[str] = None) -> dict:
                     else:
                         logger.warning("PyYAML not installed; using default config")
                         continue
-                config.update(user_config)
+                config.update(user_config or {})
                 logger.info(f"DB Firewall: Loaded config from {cfg_path}")
-                return config
+                return _apply_env_overrides(config)
 
-    # Environment variable overrides
-    if os.environ.get("DB_FIREWALL_TENANT_COLUMN"):
-        config["tenant_column"] = os.environ["DB_FIREWALL_TENANT_COLUMN"]
-    if os.environ.get("DB_FIREWALL_FAIL_MODE"):
-        config["fail_mode"] = os.environ["DB_FIREWALL_FAIL_MODE"]
-    if os.environ.get("DB_FIREWALL_REWRITER"):
-        config["rewriter"] = os.environ["DB_FIREWALL_REWRITER"]
+    return _apply_env_overrides(config)
 
+
+def _apply_env_overrides(config: dict) -> dict:
+    """Environment variables win over both defaults and a discovered config file."""
+    for env, key in (("DB_FIREWALL_TENANT_COLUMN", "tenant_column"),
+                     ("DB_FIREWALL_FAIL_MODE", "fail_mode"),
+                     ("DB_FIREWALL_REWRITER", "rewriter")):
+        if os.environ.get(env):
+            config[key] = os.environ[env]
     return config
 
 
