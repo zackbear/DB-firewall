@@ -5,29 +5,46 @@ import sys
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'middleware'))
-from db_firewall import rewrite_query, validate_tenant_id  # noqa: E402
+from db_firewall import load_config, rewrite_query, validate_tenant_id  # noqa: E402
 
 CONFIG = {"tenant_column": "tenant_id", "fail_mode": "closed",
           "protect": {"select": True, "insert": True, "update": True, "delete": True},
           "excluded_tables": ["_firewall_*"]}
 
 
+REGEX_CONFIG = dict(CONFIG, rewriter="regex")
+
+
 def test_rewrite_escapes_single_quote():
     out = rewrite_query("SELECT * FROM orders", "A' OR '1'='1", CONFIG)
+    assert out == "SELECT * FROM orders WHERE orders.tenant_id = 'A'' OR ''1''=''1'"
+    out = rewrite_query("SELECT * FROM orders", "A' OR '1'='1", REGEX_CONFIG)
     assert out == "SELECT * FROM orders WHERE tenant_id = 'A'' OR ''1''=''1'"
 
 
 def test_rewrite_plain_tenant_unchanged():
     assert rewrite_query("SELECT * FROM orders", "TENANT_A", CONFIG) == \
+        "SELECT * FROM orders WHERE orders.tenant_id = 'TENANT_A'"
+    assert rewrite_query("SELECT * FROM orders", "TENANT_A", REGEX_CONFIG) == \
         "SELECT * FROM orders WHERE tenant_id = 'TENANT_A'"
 
 
 @pytest.mark.parametrize("bad", ["A\x00B", "A\nB", "A\rB", "A\\B", "A\\", ""])
-def test_rewrite_rejects_control_chars_and_empty(bad):
+@pytest.mark.parametrize("config", [CONFIG, REGEX_CONFIG], ids=["ast", "regex"])
+def test_rewrite_rejects_control_chars_and_empty(bad, config):
     with pytest.raises(ValueError):
-        rewrite_query("SELECT * FROM orders", bad, CONFIG)
+        rewrite_query("SELECT * FROM orders", bad, config)
 
 
 def test_validate_tenant_id_rejects_non_string():
     with pytest.raises(ValueError):
         validate_tenant_id(123)
+
+
+def test_env_rewriter_override_wins_over_config_file(tmp_path, monkeypatch):
+    """Codex finding on #3: the env override was skipped when a config file existed."""
+    (tmp_path / ".db-firewall.json").write_text('{"rewriter": "ast", "tenant_column": "org_id"}')
+    monkeypatch.setenv("DB_FIREWALL_REWRITER", "regex")
+    cfg = load_config(project_root=str(tmp_path))
+    assert cfg["rewriter"] == "regex"
+    assert cfg["tenant_column"] == "org_id"  # file values still apply

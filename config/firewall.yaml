@@ -23,6 +23,25 @@ tenant_column: "tenant_id"
 fail_mode: "closed"
 
 # ----------------------------------------------------------------------------
+# REWRITER — How the middleware injects the tenant predicate.
+#   "ast"   → sqlglot parse + rewrite (DEFAULT). Scopes every table reference:
+#             CTEs, UNION branches, joins, subqueries, UPDATE..FROM,
+#             DELETE..USING, INSERT..SELECT/VALUES (stamps the tenant column).
+#             Requires `pip install sqlglot`; raises ImportError if missing.
+#   "regex" → legacy single-WHERE injector, no dependency. Refuses CTE/UNION/
+#             multi-table shapes outright (fail closed) instead of scoping them.
+# Env override: DB_FIREWALL_REWRITER=regex
+# ----------------------------------------------------------------------------
+rewriter: "ast"
+
+# ----------------------------------------------------------------------------
+# TENANT PLACEHOLDER — INSERT ... (tenant_id) VALUES (%s) binds the tenant
+# column to a driver parameter the firewall cannot see. Refused by default;
+# set true only when the database layer (RLS WITH CHECK) verifies it.
+# ----------------------------------------------------------------------------
+allow_tenant_placeholder: false
+
+# ----------------------------------------------------------------------------
 # PROTECTED OPERATIONS — Which SQL operations are filtered?
 # ----------------------------------------------------------------------------
 protect:

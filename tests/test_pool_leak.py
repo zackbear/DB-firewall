@@ -31,6 +31,7 @@ from db_firewall import protect, TenantContext  # noqa: E402
 
 MIGRATION = os.path.join(os.path.dirname(__file__), '..', 'migrations', '001_postgresql.sql')
 TABLE = "dbfw_leak_orders"
+ITEMS = "dbfw_leak_items"
 APP_ROLE = "dbfw_app"          # non-owner, non-superuser: RLS actually applies
 APP_DSN = make_conninfo(DSN, user=APP_ROLE)
 CONFIG = {"tenant_column": "tenant_id", "fail_mode": "closed",
@@ -67,8 +68,16 @@ def schema():
         conn.execute(f"DROP TABLE IF EXISTS {TABLE}")
         conn.execute(f"CREATE TABLE {TABLE} (id serial primary key, tenant_id text not null, item text)")
         conn.execute(f"INSERT INTO {TABLE} (tenant_id, item) VALUES ('A','a1'),('A','a2'),('B','b1')")
+        # Child table for join shapes; the last row is a cross-tenant trap
+        # (tenant B item hanging off tenant A's order 1).
+        conn.execute(f"DROP TABLE IF EXISTS {ITEMS}")
+        conn.execute(f"CREATE TABLE {ITEMS} (id serial primary key, tenant_id text not null, "
+                     "oid int not null, item text)")
+        conn.execute(f"INSERT INTO {ITEMS} (tenant_id, oid, item) VALUES "
+                     "('A',1,'i1'),('A',1,'i2'),('B',3,'i3'),('B',1,'trap')")
         conn.execute(f"GRANT USAGE ON SCHEMA public TO {APP_ROLE}")
-        conn.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON {TABLE} TO {APP_ROLE}")
+        conn.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON {TABLE}, {ITEMS} TO {APP_ROLE}")
+        conn.execute(f"GRANT USAGE ON SEQUENCE {ITEMS}_id_seq TO {APP_ROLE}")
         if conn.execute("SELECT to_regclass('_firewall_bypass_roles')").fetchone()[0]:
             conn.execute("DELETE FROM _firewall_bypass_roles")
         conn.execute(sql)   # pass 1
@@ -178,27 +187,33 @@ def test_pool_checkin_reset_hook_clears_session_scope():
 # Migration upgrade path (P1-a) and long table names (P2-b)
 # ============================================================================
 
-LEGACY_MIGRATION_REF = "origin/main:migrations/001_postgresql.sql"
+_LEGACY_BYPASS = ("tenant_id = NULLIF(current_setting('app.current_tenant', true), '') "
+                  "OR current_user IN ('postgres', 'admin', '_migrator')")
 
 
-def _legacy_migration_sql():
-    import subprocess
-    repo = os.path.join(os.path.dirname(__file__), '..')
-    try:
-        return subprocess.check_output(["git", "-C", repo, "show", LEGACY_MIGRATION_REF],
-                                       stderr=subprocess.DEVNULL, text=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        pytest.skip(f"{LEGACY_MIGRATION_REF} not available")
+def _legacy_migration_sql(table):
+    """What the pre-hash-stem migration left behind: RLS on, and one
+    'firewall_rls_<table>_<cmd>' policy per command carrying the hardcoded
+    role bypass. Inline so the test does not depend on git history."""
+    return f"""
+        ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE {table} FORCE ROW LEVEL SECURITY;
+        CREATE POLICY firewall_rls_{table}_sel ON {table} FOR SELECT USING ({_LEGACY_BYPASS});
+        CREATE POLICY firewall_rls_{table}_ins ON {table} FOR INSERT WITH CHECK ({_LEGACY_BYPASS});
+        CREATE POLICY firewall_rls_{table}_upd ON {table} FOR UPDATE
+            USING ({_LEGACY_BYPASS}) WITH CHECK ({_LEGACY_BYPASS});
+        CREATE POLICY firewall_rls_{table}_del ON {table} FOR DELETE USING ({_LEGACY_BYPASS});
+    """
 
 
 def test_upgrade_from_legacy_migration_removes_hardcoded_bypass():
     """P1-a: permissive policies OR together, so a legacy policy with the hardcoded
     postgres/admin/_migrator bypass must be dropped by the new migration, both the
     legacy per-command names and the older single 'firewall_rls_<table>' name."""
-    legacy_sql = _legacy_migration_sql()
     new_sql = open(MIGRATION).read()
     scratch = "dbfw_upgrade_scratch"
     table = "upg_orders"
+    legacy_sql = _legacy_migration_sql(table)
     with psycopg.connect(DSN, autocommit=True) as admin:
         admin.execute(f"DROP DATABASE IF EXISTS {scratch}")
         admin.execute(f"CREATE DATABASE {scratch}")
@@ -340,3 +355,75 @@ def test_sqlalchemy_tenant_context_reapplied_after_commit():
     finally:
         TenantContext.clear()
         engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# AST rewriter end-to-end: rewritten multi-scope statements against live RLS
+# ---------------------------------------------------------------------------
+
+# (agent SQL, hand-written tenant-A-scoped equivalent). Each shape used to be
+# refused by the regex rewriter; the AST rewriter scopes every reference.
+E2E_CASES = [
+    ("union",
+     f"SELECT id, tenant_id FROM {TABLE} UNION ALL "
+     f"SELECT id, tenant_id FROM {TABLE} WHERE tenant_id = 'B'",
+     f"SELECT id, tenant_id FROM {TABLE} WHERE tenant_id = 'A'"),
+    ("cte-join",
+     f"WITH o AS (SELECT * FROM {TABLE}) "
+     f"SELECT o.id, i.item, i.tenant_id FROM o JOIN {ITEMS} i ON i.oid = o.id",
+     f"SELECT o.id, i.item, i.tenant_id FROM {TABLE} o JOIN {ITEMS} i ON i.oid = o.id "
+     f"WHERE o.tenant_id = 'A' AND i.tenant_id = 'A'"),
+    ("left-join",
+     f"SELECT o.id, i.item, coalesce(i.tenant_id, o.tenant_id) FROM {TABLE} o "
+     f"LEFT JOIN {ITEMS} i ON i.oid = o.id",
+     f"SELECT o.id, i.item, coalesce(i.tenant_id, o.tenant_id) FROM {TABLE} o "
+     f"LEFT JOIN {ITEMS} i ON i.oid = o.id AND i.tenant_id = 'A' WHERE o.tenant_id = 'A'"),
+    ("where-subquery",
+     f"SELECT id, tenant_id FROM {TABLE} WHERE id IN (SELECT oid FROM {ITEMS})",
+     f"SELECT id, tenant_id FROM {TABLE} WHERE tenant_id = 'A' AND "
+     f"id IN (SELECT oid FROM {ITEMS} WHERE tenant_id = 'A')"),
+    ("insert-select-returning",
+     f"INSERT INTO {ITEMS} (oid, item) SELECT id, 'copy' FROM {TABLE} RETURNING oid, item, tenant_id",
+     f"INSERT INTO {ITEMS} (oid, item, tenant_id) SELECT id, 'copy', 'A' FROM {TABLE} "
+     f"WHERE tenant_id = 'A' RETURNING oid, item, tenant_id"),
+]
+
+
+def _rows(conn, sql):
+    rows = sorted(conn.execute(sql).fetchall())
+    conn.rollback()                      # the INSERT case must not persist
+    return rows
+
+
+@pytest.mark.parametrize("name,agent_sql,expected_sql", E2E_CASES, ids=[c[0] for c in E2E_CASES])
+def test_ast_rewriter_end_to_end_matches_hand_scoped_query(name, agent_sql, expected_sql):
+    from db_firewall import rewrite_query, DBEngine
+    with psycopg.connect(DSN) as admin:          # superuser: RLS does not apply
+        expected = _rows(admin, expected_sql)
+        assert expected and all(r[-1] == "A" for r in expected)
+        assert "trap" not in {r[1] for r in expected if len(r) > 1}
+        # Layer 1 alone: the rewritten text, run without RLS, is already scoped.
+        rewritten = rewrite_query(agent_sql, "A", CONFIG, admin, DBEngine.POSTGRESQL)
+        assert rewritten != agent_sql
+        assert _rows(admin, rewritten) == expected, rewritten
+    # Both layers: protected connection as the RLS-bound app role.
+    with psycopg.connect(APP_DSN) as raw:
+        pc = protect(raw, "A", CONFIG)
+        cur = pc.cursor()
+        cur.execute(agent_sql)
+        got = sorted(cur.fetchall())
+        raw.rollback()
+        pc.release()
+    assert got == expected, (name, got)
+    assert all(r[-1] == "A" for r in got)
+
+
+def test_ast_rewriter_refuses_unscoped_shape_before_it_reaches_the_db():
+    with psycopg.connect(APP_DSN) as raw:
+        pc = protect(raw, "A", CONFIG)
+        with pytest.raises(PermissionError, match="unsupported statement shape"):
+            pc.cursor().execute(f"INSERT INTO {ITEMS} VALUES (99, 'B', 1, 'x')")
+        with pytest.raises(PermissionError, match="unsupported statement shape"):
+            pc.cursor().execute(f"UPDATE {ITEMS} SET tenant_id = 'B'")
+        raw.rollback()
+        pc.release()

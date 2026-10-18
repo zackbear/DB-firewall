@@ -10,9 +10,10 @@ When you give an AI agent access to your database, it will happily run `SELECT *
 
 ## Quick Start
 
-### 1. Drop the config into your project root
+### 1. Install and drop the config into your project root
 
 ```bash
+pip install -r requirements.txt        # sqlglot (AST rewriter) + pyyaml
 cp config/firewall.yaml .db-firewall.yaml
 ```
 
@@ -70,6 +71,52 @@ cursor.execute("SELECT * FROM orders")  # Returns ONLY Tenant A's orders
 2. **Database-native** — RLS (Postgres, SQL Server) or VPD (Oracle) as a second enforcement layer
 
 Even if the middleware is bypassed, the database-native layer still blocks cross-tenant access.
+
+### What the middleware rewriter scopes
+
+The default rewriter (`rewriter: "ast"`, built on [sqlglot](https://github.com/tobymao/sqlglot)) parses **every** statement that goes through a protected connection; there is no regex pre-filter deciding which statements "look like" they touch a tenant table. Only these statement heads get through:
+
+* `SELECT` / `UNION` / `INTERSECT` / `EXCEPT`, `INSERT`, `UPDATE`, `DELETE` — optionally `WITH`-wrapped or parenthesised. Every reference to a protected table (a table that has the tenant column and is not in `excluded_tables`; unquoted names are case-folded per engine, quoted names keep their case) gets `<alias>.tenant_id = '<tenant>'`, not just the first `FROM`.
+* transaction control: `BEGIN` / `START TRANSACTION`, `COMMIT` / `END`, `ROLLBACK` / `ABORT`, `SAVEPOINT`, `RELEASE`, `ROLLBACK TO`.
+* `SET` / `RESET` of any setting **except** `app.current_tenant`, `role`, `session_authorization`, `search_path`, `row_security`, `RESET ALL` and MySQL's `@_fw_tenant_id` (so `SET statement_timeout`, `SET TIME ZONE`, `SET LOCAL lock_timeout` work; nothing that moves the tenant or the role does). `set_config()` inside a `SELECT` follows the same list and must name its setting with a literal.
+* `SELECT` without tables (`SELECT 1`, `SELECT now()`).
+
+Everything else — `DO`, `CALL`, `EXECUTE`, `PREPARE`, `DECLARE`, `EXPLAIN`, `SHOW`, `COPY`, `TRUNCATE`, `MERGE`, `VACUUM`, every `CREATE`/`ALTER`/`DROP`/`GRANT`, `TABLE t`, `VALUES`, several statements in one string, `U&"…"` unicode-escaped identifiers/literals, nested `/* /* */ */` comments, anything sqlglot cannot parse — raises `PermissionError` while a tenant is set, whatever tables it names. With no tenant and `fail_mode: closed` the same allow-list applies and any statement touching a protected table is refused.
+
+Shapes the rewriter scopes:
+
+| Shape | Result |
+| --- | --- |
+| `SELECT … FROM t [WHERE …]`, `UPDATE t …`, `DELETE FROM t …` | predicate ANDed into `WHERE` (existing `OR`s are parenthesised) |
+| `JOIN` (inner, comma, cross), self-joins with aliases | one predicate per reference, qualified by its alias |
+| `LEFT JOIN t` / left side of `RIGHT JOIN` | predicate goes into that join's `ON`, so outer-join semantics are kept |
+| `FULL JOIN`, `JOIN … USING`, `NATURAL JOIN` | predicate goes into `WHERE` (always safe; may drop NULL-extended rows) |
+| `UNION` / `INTERSECT` / `EXCEPT` | every branch scoped |
+| `WITH … AS (…)` (incl. `RECURSIVE`, data-modifying CTEs) | CTE bodies and the main query scoped; CTE names are never treated as tables |
+| subqueries in `WHERE` / `SELECT` list, derived tables, `LATERAL (…)`, `EXISTS` | scoped in their own scope |
+| `UPDATE t … FROM other`, `DELETE FROM t USING other`, MySQL multi-table forms | target and sources all scoped |
+| `INSERT INTO t (cols) VALUES (…)` / `SELECT …` / `… RETURNING` | `tenant_id` appended to the column list and stamped into every row / branch; the `SELECT` source is scoped |
+| `INSERT … (…, tenant_id, …)` with the right literal | left alone; a different literal is refused |
+| `INSERT … (…, tenant_id, …) VALUES (…, %s)` (placeholder in the tenant column) | **refused** unless `allow_tenant_placeholder: true` — the bound value is the caller's, and only Postgres RLS `WITH CHECK` would verify it |
+| `INSERT … ON CONFLICT DO UPDATE SET …` | `AND <target>.tenant_id = '<tenant>'` is added to the `DO UPDATE … WHERE`, so a conflict with another tenant's row updates nothing; assigning the tenant column there is refused. MySQL `ON DUPLICATE KEY UPDATE` has no `WHERE` and is refused on protected tables |
+| driver placeholders `%s`, `%(name)s`, `$1`, `?`, `?1`, `:name`, `:1` | preserved byte-for-byte (`?` is a jsonb operator on PostgreSQL, so it is not a placeholder there) |
+| SQL comments | stripped from the rewritten statement |
+| statements touching only excluded / non-tenant tables | returned unchanged |
+
+Still **refused** (`PermissionError`, fail closed) because they cannot be proven scoped:
+
+* more than one statement; anything sqlglot cannot parse (incl. unterminated literals and backslash-escaped quotes, which mean different things per engine)
+* `SELECT … INTO` and every statement head outside the allow-list above (DDL included — run migrations on an unprotected connection)
+* `INSERT` without a column list / `DEFAULT VALUES`; `INSERT … SELECT *` when the column list already names `tenant_id`; an `INSERT` literal, `UPDATE … SET`, `ON CONFLICT DO UPDATE SET` or `ON DUPLICATE KEY UPDATE` that assigns a different tenant (or a placeholder) to the tenant column; tuple assignments that include it (`SET (a, tenant_id) = (…)` / `= ROW(…)` / `= (SELECT …)`)
+* table-valued functions in `FROM` (`generate_series(…)`), a bare table in parentheses `(t) AS x`, a column-list alias on a protected table (`t AS x(a, b)` renames the tenant column), the same unaliased table twice in one scope
+
+**Metadata lookups fail closed.** Whether a table carries the tenant column is read from the catalog once per table and cached per connection (cleared by `protect()`) and per DSN for 60 s. A lookup that errors — permission denied, an aborted transaction from an earlier failed statement, a dead connection — raises `PermissionError` and is never cached, so a transient error can never demote a table to "unprotected". Inside an open transaction the lookup runs in its own `SAVEPOINT`, as does the `_firewall_tenant_map` probe in `protect()`, so neither can abort the caller's transaction. On an engine the middleware cannot introspect (`DBEngine.UNKNOWN`) every non-excluded table counts as protected and the lookup refuses the query.
+
+**Driver entry points.** `ProtectedConnection` mediates `cursor()`, `execute()`, `executemany()`, `stream()`, `copy()` and `pipeline()`; `ProtectedCursor` mediates `execute()`, `executemany()`, `stream()` and `copy()`, all through one guard that applies the rewrite (tenant set) or the fail-closed check (no tenant). Any other attribute named like a SQL entry point (`execute*`, `copy*`, `executescript`, `callproc`, `exec_driver_sql`, …) raises `PermissionError` instead of being delegated, so a driver method the wrapper does not know cannot bypass it. The SQLAlchemy hook registers `before_cursor_execute` with `retval=True`, so the scoped statement is the one that executes.
+
+`rewriter: "regex"` (or `DB_FIREWALL_REWRITER=regex`) keeps the old dependency-free injector: it handles single-table statements and refuses every multi-scope shape above. With `rewriter: "ast"` and sqlglot missing, `protect()`'d queries raise `ImportError` rather than silently downgrading.
+
+In both modes the database-native RLS/VPD policy remains the second layer: the rewriter can only narrow a query, never widen it, and a statement that slips past it unscoped still hits the row policy.
 
 ---
 
@@ -158,6 +205,8 @@ Create `.db-firewall.yaml` in your project root:
 version: "1.0"
 tenant_column: "tenant_id"
 fail_mode: "closed"           # "closed" = no tenant → 0 rows (SAFE)
+rewriter: "ast"               # "ast" (sqlglot, default) or "regex" (legacy, no dependency)
+allow_tenant_placeholder: false   # INSERT ... (tenant_id) VALUES (%s) is refused unless true
 
 protect:
   select: true
@@ -226,7 +275,7 @@ A failure to set the DB-side context raises when `fail_mode: closed` (the defaul
 | --- | --- |
 | **Fail closed** | No tenant context = 0 rows returned. Never defaults to "show all". |
 | **Defense in depth** | Middleware + database-native RLS/VPD. Two independent layers. |
-| **Full DML protection** | SELECT, INSERT, UPDATE, AND DELETE are all filtered. |
+| **Full DML protection** | SELECT, INSERT, UPDATE, AND DELETE are all filtered — every table reference, in every CTE, branch and subquery. |
 | **Audit trail** | Every tenant assignment logged with session, IP, timestamp. |
 | **Zero trust the agent** | The AI doesn't know about tenancy. The database enforces it. |
 | **Connection pool safe** | Postgres context is transaction-local; every engine is cleared on `release()`/`pool_checkin`. See "Connection pooling". |
@@ -245,14 +294,18 @@ db-firewall/
 │   ├── 003_sqlserver.sql         # SQL Server security policies
 │   └── 004_oracle.sql            # Oracle VPD (production-hardened)
 ├── middleware/
-│   └── db_firewall.py            # Universal Python middleware (DB-agnostic)
+│   ├── db_firewall.py            # Universal Python middleware (DB-agnostic)
+│   └── sql_rewriter.py           # sqlglot AST rewriter (scopes every table reference)
 ├── hooks/
 │   ├── mcp_wrapper.py            # MCP server stdio proxy with SQL rewriting
 │   └── scanner.py                # CI/CD security scanner
 ├── tests/
 │   ├── test_firewall.py          # SQL rewriting / context unit tests
+│   ├── test_sql_rewriter.py      # AST rewriter: structural proof per shape (no DB)
 │   ├── test_rewrite_safety.py    # tenant-id injection safety
-│   └── test_pool_leak.py         # Postgres pool-leak proof (opt-in: DBFW_PG_DSN)
+│   ├── test_sqlalchemy_hook.py   # SQLAlchemy hook actually swaps the statement (sqlite, no DB)
+│   ├── test_pool_leak.py         # Postgres pool-leak + rewriter-vs-RLS e2e (opt-in: DBFW_PG_DSN)
+│   └── test_gate_live.py         # middleware alone vs RLS-less tables as dbfw_app (opt-in: DBFW_PG_DSN)
 ├── SKILL.md                      # Auto-integration trigger for AI workflows
 └── README.md                     # This file
 ```
