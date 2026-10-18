@@ -26,7 +26,8 @@ Assess these before implementing — they determine which layers you need:
 - **NEVER rely on application-layer filtering alone** — when the agent is compromised, hallucinates, or bugs out, application code fails; the database must enforce isolation independently as a second layer
 - **NEVER share a DB user across tenants** — the `_firewall_tenant_map` must map one DB user per tenant; shared credentials make audit logs meaningless and break per-tenant revocation
 - **NEVER skip the CI scanner** — new tables added without RLS policies are silent cross-tenant leaks; the scanner is the only automated check that catches them before production
-- **NEVER use `SET` instead of `SET LOCAL` for tenant context in transactions** — `SET` persists across transaction boundaries in connection pools; a pooled connection reused by another tenant inherits the previous tenant's context
+- **NEVER use `SET` instead of `SET LOCAL` for tenant context in transactions** — `SET` persists across transaction boundaries in connection pools; a pooled connection reused by another tenant inherits the previous tenant's context. The middleware uses `set_config(..., true)` (transaction-local), so it refuses autocommit connections; release wrapped connections via `release()`/`close()` and hook `pool_checkin` into the pool
+- **NEVER hardcode bypass roles** — `excluded_users` and the `_firewall_bypass_roles` table are empty by default; on Supabase/Neon/RDS the app connects as `postgres`, so a built-in `postgres` bypass disables every policy. Opt roles in explicitly, and never run the agent as the table owner, a superuser or a `BYPASSRLS` role
 - **NEVER assume policy creation equals enforcement in PostgreSQL** — `CREATE POLICY` alone is insufficient; you must also run `ALTER TABLE your_table ENABLE ROW LEVEL SECURITY` separately, or the policy exists but silently does nothing
 
 ## Step 1: Add Config to Project Root
@@ -37,6 +38,7 @@ Copy `config/firewall.yaml` into the project root. Required customizations:
 |-------|--------|
 | `tenant_column` | Match the project's actual column name (e.g. `org_id`, `company_id`) |
 | `excluded_tables` | Add migration/audit/config tables that are legitimately cross-tenant |
+| `excluded_users` | Leave empty unless a specific role (e.g. `_migrator`) must bypass; mirror it in `_firewall_bypass_roles` |
 | `fail_mode` | **ALWAYS set to `closed` for production** — `open` is for local dev only |
 
 ## Step 2: Run the Database Migration
@@ -135,7 +137,25 @@ One row per DB user. Never share a DB user between tenants.
 |---------|-------------|-----|
 | RLS not firing; all rows returned | DB user is a superuser or has `BYPASSRLS` attribute | Create an unprivileged role; never use superuser for agent connections |
 | RLS not firing; policy exists | `ENABLE ROW LEVEL SECURITY` was not run on the table | `ALTER TABLE your_table ENABLE ROW LEVEL SECURITY` |
-| Tenant context bleeds between requests | Using `SET` instead of `SET LOCAL` for context variable | Replace all `SET app.current_tenant` with `SET LOCAL app.current_tenant` |
+| Tenant context bleeds between requests | Using `SET` instead of `SET LOCAL` for context variable, or connection returned to pool without `release()` | Use `set_config(..., true)`/`SET LOCAL`; call `release()` on the wrapper; add `pool_checkin` as the pool reset hook |
+| `RuntimeError: ... autocommit` from `protect()` on Postgres | Transaction-local context needs an open transaction | `connection.autocommit = False`, or use `tenant_scope()` with middleware-only enforcement |
+| All rows visible although policies exist | Role listed in `_firewall_bypass_roles`, or app connects as owner/superuser/`BYPASSRLS` | Remove the row; connect the app as an unprivileged role |
 | Middleware filtering but raw SQL queries bypass it | Raw SQL not routed through middleware connection wrapper | Add `protect()` to all connection acquisition paths; use DB-level RLS as primary layer |
 | INSERT rows have NULL tenant_id despite firewall | Policy only filters SELECT; INSERT policy is missing | Add a separate `WITH CHECK` policy or use a trigger to stamp tenant_id on INSERT |
 | CI scanner passes but new table leaks data | Scanner only checks tables with existing rows (empty tables skipped) | Run `--strict --include-empty` to check schema-only tables |
+
+## NoSQL Stores (MongoDB, Redis, Firestore, Convex)
+
+The SQL middleware does not apply. Use `adapters/` (read the module docstring first; drivers import lazily):
+
+| Store | Call | Second layer |
+|-------|------|--------------|
+| MongoDB | `adapters.mongodb.protect_collection(col, tenant_id)` / `protect_database(db, tenant_id)` | None — use per-tenant DB users |
+| Redis | `adapters.redis.protect_redis(client, tenant_id)` | `client.acl_setuser(**acl_setuser_args(tenant_id, password))` |
+| Firestore | `adapters.firestore.protect_firestore(client, tenant_id, mode="subcollection")` | Write `generate_rules()` to `firestore.rules`; gate with `hooks.scanner --firestore-rules` |
+| Convex | Copy `adapters/convex/tenant.ts`; use `tenantQuery`/`tenantMutation` and `ctx.tdb` | N/A — enforcement is the Convex function itself |
+
+- **NEVER** hand the agent `.raw` — it is the unscoped client.
+- **NEVER** use a tenant id containing `* ? [ ] : \` with Redis, or `/` with Firestore; the adapters reject them.
+- Firestore `collection_group()` and Mongo `allow_cross_collection=True` are the two places scoping depends on the data, not the path — stamp `tenant_id` on every document.
+- Only MongoDB (mongomock) and Redis (real server) adapters are exercised by tests; Firestore runs against a fake client and Convex is type-checked only.

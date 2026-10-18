@@ -16,6 +16,13 @@ CREATE TABLE IF NOT EXISTS _firewall_tenant_map (
     updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
 
+-- 1b. Bypass roles — EMPTY by default (no hardcoded root/admin bypass).
+--     Opt a role in deliberately: INSERT INTO _firewall_bypass_roles VALUES ('_migrator');
+CREATE TABLE IF NOT EXISTS _firewall_bypass_roles (
+    role_name       VARCHAR(128) PRIMARY KEY,
+    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- 2. Audit log
 CREATE TABLE IF NOT EXISTS _firewall_audit_log (
     id              BIGINT AUTO_INCREMENT PRIMARY KEY,
@@ -30,6 +37,13 @@ CREATE TABLE IF NOT EXISTS _firewall_audit_log (
 );
 
 -- 3. Set/Get tenant via session variables
+--    Routines below run with the default SQL SECURITY DEFINER. Unqualified
+--    table names inside a stored routine resolve in the routine's OWN database
+--    (not the caller's current database), so a caller cannot redirect
+--    _firewall_bypass_roles / _firewall_tenant_map by switching databases
+--    (unlike PostgreSQL search_path). Session TEMPORARY tables do shadow a
+--    same-named base table inside routines, so do NOT grant
+--    CREATE TEMPORARY TABLES to application users.
 DELIMITER //
 
 CREATE PROCEDURE IF NOT EXISTS _firewall_set_tenant(IN p_tenant VARCHAR(128))
@@ -78,8 +92,8 @@ BEGIN
 
     SET v_user = SUBSTRING_INDEX(CURRENT_USER(), '@', 1);
 
-    -- Skip excluded users
-    IF v_user IN ('root', 'admin', '_migrator', 'mysql.sys') THEN
+    -- Bypass only for roles deliberately listed in _firewall_bypass_roles
+    IF EXISTS (SELECT 1 FROM _firewall_bypass_roles WHERE role_name = v_user) THEN
         SET @_fw_tenant_id = '__BYPASS__';
         SIGNAL SQLSTATE '01000'
             SET MESSAGE_TEXT = 'DB Firewall: Bypassed for admin user';

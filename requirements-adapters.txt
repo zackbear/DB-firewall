@@ -1,0 +1,10 @@
+# Optional drivers for adapters/. Importing `adapters` needs none of these;
+# install only what your project talks to.
+pymongo>=4.6          # adapters.mongodb (bulk_write needs pymongo.operations)
+redis>=5.0            # adapters.redis
+google-cloud-firestore>=2.14   # adapters.firestore (not required for generate_rules)
+
+# Test-only
+mongomock>=4.1        # tests/test_adapters_mongodb.py
+# Redis tests need a live server:  redis-server --port 6390 --daemonize yes --save '' --appendonly no
+# Convex adapter is TypeScript:     npm i convex convex-helpers  (see adapters/convex/README.md)
