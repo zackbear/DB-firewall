@@ -213,15 +213,43 @@ def print_report(results: Dict[str, dict], engine: str):
     print(f"\n{'='*60}\n")
 
 
+_OPEN_RULES = ("allow read, write: if true", "allow read: if true", "allow write: if true",
+               "allow read,write: if true", "allow write, read: if true")
+
+
+def check_firestore_rules(path: str) -> List[str]:
+    """Return offending lines in a firestore.rules file that grant open access."""
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    return [line.strip() for line in text.splitlines()
+            if any(rule in " ".join(line.split()) for rule in _OPEN_RULES)]
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="DB Firewall Scanner")
-    parser.add_argument("--dsn", required=True, help="Database connection string")
+    parser.add_argument("--dsn", help="Database connection string")
     parser.add_argument("--strict", action="store_true",
                         help="Exit with code 1 if unprotected tables found")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
     parser.add_argument("--config", help="Path to config directory")
+    parser.add_argument("--firestore-rules", metavar="PATH",
+                        help="Fail if this firestore.rules file contains an open 'if true' rule")
 
     args = parser.parse_args()
+
+    if args.firestore_rules:
+        bad = check_firestore_rules(args.firestore_rules)
+        if bad:
+            print(f"❌ {args.firestore_rules}: open Firestore rules found:")
+            for line in bad:
+                print(f"     • {line}")
+            sys.exit(1)
+        print(f"✅ {args.firestore_rules}: no open rules.")
+        if not args.dsn:
+            sys.exit(0)
+
+    if not args.dsn:
+        parser.error("--dsn is required (or pass --firestore-rules PATH)")
 
     config = load_config(args.config)
     conn = get_connection(args.dsn)

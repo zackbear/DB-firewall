@@ -17,6 +17,14 @@ CREATE TABLE dbo._firewall_tenant_map (
     updated_at      DATETIME2 DEFAULT SYSUTCDATETIME()
 );
 
+-- 1b. Bypass roles — EMPTY by default (no hardcoded sa/dbo/admin bypass).
+--     Opt a login in deliberately: INSERT INTO dbo._firewall_bypass_roles VALUES ('_migrator');
+IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = '_firewall_bypass_roles')
+CREATE TABLE dbo._firewall_bypass_roles (
+    role_name       NVARCHAR(128) PRIMARY KEY,
+    created_at      DATETIME2 DEFAULT SYSUTCDATETIME()
+);
+
 -- 2. Audit log
 IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = '_firewall_audit_log')
 CREATE TABLE dbo._firewall_audit_log (
@@ -69,8 +77,8 @@ BEGIN
     DECLARE @tenant NVARCHAR(128);
     DECLARE @user NVARCHAR(128) = SYSTEM_USER;
 
-    -- Skip excluded users
-    IF @user IN ('sa', 'dbo', 'admin', '_migrator')
+    -- Bypass only for logins deliberately listed in _firewall_bypass_roles
+    IF EXISTS (SELECT 1 FROM dbo._firewall_bypass_roles WHERE role_name = @user)
         RETURN;
 
     -- Check if already set
@@ -91,6 +99,10 @@ GO
 
 -- 6. Security predicate function
 --    Returns 1 (allow) or 0 (deny) for each row.
+--    All firewall objects are referenced two-part (dbo.*) here and in the
+--    procedures above; SCHEMABINDING requires it, and #temp tables cannot
+--    shadow a schema-qualified name, so there is no PostgreSQL-style
+--    search_path shadowing on this engine.
 CREATE OR ALTER FUNCTION dbo._firewall_tenant_predicate(
     @tenant_id NVARCHAR(128)
 )
@@ -101,8 +113,8 @@ RETURN SELECT 1 AS result
 WHERE
     -- Row matches current tenant
     @tenant_id = CAST(SESSION_CONTEXT(N'tenant_id') AS NVARCHAR(128))
-    -- OR user is excluded (admin bypass)
-    OR SYSTEM_USER IN ('sa', 'dbo', 'admin', '_migrator');
+    -- OR login is deliberately listed in the bypass table (empty by default)
+    OR EXISTS (SELECT 1 FROM dbo._firewall_bypass_roles WHERE role_name = SYSTEM_USER);
 GO
 
 

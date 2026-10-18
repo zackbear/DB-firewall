@@ -51,7 +51,9 @@ DEFAULT_CONFIG = {
     "fail_mode": "closed",
     "protect": {"select": True, "insert": True, "update": True, "delete": True},
     "audit": {"enabled": True, "table_name": "_firewall_audit_log", "retention_days": 90},
-    "excluded_users": ["postgres", "root", "sa", "sys", "system", "admin", "_migrator"],
+    # Empty by default: managed Postgres (Supabase, Neon, RDS) apps often connect
+    # as "postgres", so a built-in bypass list would disable the firewall entirely.
+    "excluded_users": [],
     "excluded_tables": [
         "_firewall_*", "schema_migrations", "alembic_version",
         "knex_migrations", "prisma_migrations", "flyway_schema_history",
@@ -270,6 +272,104 @@ def _extract_tables(sql: str) -> List[str]:
     return list(tables)
 
 
+_DML_STARTS = ("SELECT", "INSERT", "UPDATE", "DELETE")
+# Shapes the regex rewriter cannot scope safely; rejected when a protected table
+# is involved (fail closed) instead of being passed through half-filtered.
+_UNSAFE_STARTS = ("WITH", "(", "TABLE")
+_SET_OP_RE = re.compile(r'\b(UNION|INTERSECT|EXCEPT)\b', re.IGNORECASE)
+_FROM_RE = re.compile(r'\bFROM\b', re.IGNORECASE)
+_USING_RE = re.compile(r'\bUSING\b', re.IGNORECASE)
+_TABLE_CMD_RE = re.compile(r'^\s*TABLE\s+([`"\[]?\w+[`"\]]?)', re.IGNORECASE)
+_CLAUSE_RE = re.compile(r'\b(ORDER\s+BY|GROUP\s+BY|HAVING|LIMIT|OFFSET|FETCH|FOR)\b',
+                        re.IGNORECASE)
+
+
+def _blank_literals(sql: str, backslash_escapes: bool) -> Optional[str]:
+    """Return ``sql`` with the contents of '...' literals and all -- / /* */
+    comments replaced by spaces (same length, so positions line up), or None
+    when a literal/comment is unterminated."""
+    out, i, n = [], 0, len(sql)
+    while i < n:
+        c = sql[i]
+        if c == "'":
+            out.append("'")
+            i += 1
+            while True:
+                if i >= n:
+                    return None
+                if sql[i] == "'":
+                    if i + 1 < n and sql[i + 1] == "'":      # '' escape
+                        out.append("  ")
+                        i += 2
+                        continue
+                    out.append("'")
+                    i += 1
+                    break
+                if backslash_escapes and sql[i] == "\\" and i + 1 < n:
+                    out.append("  ")
+                    i += 2
+                    continue
+                out.append(" " if sql[i] != "\n" else "\n")
+                i += 1
+        elif sql.startswith("--", i):
+            j = sql.find("\n", i)
+            j = n if j < 0 else j
+            out.append(" " * (j - i))
+            i = j
+        elif sql.startswith("/*", i):
+            j = sql.find("*/", i + 2)
+            if j < 0:
+                return None
+            out.append(" " * (j + 2 - i))
+            i = j + 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _strip_sql(sql: str) -> str:
+    """Literal/comment-blanked copy of ``sql`` for keyword detection.
+    Raises PermissionError when the text cannot be tokenised unambiguously
+    (unterminated literal/comment, or a backslash-quote whose meaning differs
+    between engines) — we never guess where a literal ends."""
+    plain = _blank_literals(sql, backslash_escapes=False)
+    mysql = _blank_literals(sql, backslash_escapes=True)
+    if plain is None or mysql is None or plain != mysql:
+        raise PermissionError(
+            "DB Firewall: unsupported statement shape (ambiguous or unterminated "
+            "string literal/comment); cannot be safely scoped")
+    return plain
+
+
+def _toplevel_match(regex, clean: str):
+    """First match of ``regex`` in ``clean`` that sits at parenthesis depth 0."""
+    for m in regex.finditer(clean):
+        if clean.count("(", 0, m.start()) == clean.count(")", 0, m.start()):
+            return m
+    return None
+
+
+def _reject_unsafe_shape(clean: str) -> None:
+    """Fail closed on statement shapes the WHERE injector cannot scope."""
+    head = clean.lstrip().upper()
+    why = None
+    if head.startswith(_UNSAFE_STARTS):
+        why = "CTE / parenthesised / TABLE statement"
+    elif re.search(r';\s*\S', clean):
+        why = "multiple statements"
+    elif _toplevel_match(_SET_OP_RE, clean):
+        why = "UNION/INTERSECT/EXCEPT"
+    elif head.startswith("UPDATE") and _toplevel_match(_FROM_RE, clean):
+        why = "UPDATE ... FROM"
+    elif head.startswith("DELETE") and _toplevel_match(_USING_RE, clean):
+        why = "DELETE ... USING"
+    if why:
+        raise PermissionError(
+            f"DB Firewall: unsupported statement shape ({why}); "
+            "cannot be safely scoped to a tenant")
+
+
 def _is_excluded_table(table: str, excluded: List[str]) -> bool:
     """Check if table matches exclusion patterns."""
     import fnmatch
@@ -277,6 +377,27 @@ def _is_excluded_table(table: str, excluded: List[str]) -> bool:
         if fnmatch.fnmatch(table, pattern):
             return True
     return False
+
+
+# Backslash: MySQL treats \' as an escape, so 'A\' would swallow the closing quote.
+# Backslash: MySQL treats \' as an escape, so a tenant ending in \ would swallow
+# the closing quote of the injected literal.
+_BAD_TENANT_CHARS = ("\x00", "\n", "\r", "\\")
+
+
+def validate_tenant_id(tenant_id: str) -> str:
+    """Reject tenant ids that cannot be safely embedded in SQL or session state."""
+    if not isinstance(tenant_id, str) or not tenant_id:
+        raise ValueError("DB Firewall: tenant_id must be a non-empty string")
+    if any(c in tenant_id for c in _BAD_TENANT_CHARS):
+        raise ValueError("DB Firewall: tenant_id contains NUL/newline/backslash characters")
+    return tenant_id
+
+
+def _sql_literal(tenant_id: str) -> str:
+    """Return tenant_id as a quoted SQL string literal (single quotes doubled)."""
+    validate_tenant_id(tenant_id)
+    return "'" + tenant_id.replace("'", "''") + "'"
 
 
 def rewrite_query(sql: str, tenant_id: str, config: dict,
@@ -288,7 +409,6 @@ def rewrite_query(sql: str, tenant_id: str, config: dict,
     if not sql or not sql.strip():
         return sql
 
-    sql_upper = sql.upper().strip()
     tenant_col = config.get("tenant_column", "tenant_id")
     excluded = config.get("excluded_tables", [])
     protect = config.get("protect", {})
@@ -297,15 +417,21 @@ def rewrite_query(sql: str, tenant_id: str, config: dict,
     if tenant_id is None:
         return sql
 
-    # Skip non-DML
-    if not any(sql_upper.startswith(k) for k in ["SELECT", "INSERT", "UPDATE", "DELETE"]):
+    # All keyword detection runs on a copy with string literals and comments
+    # blanked out, so 'UNION' inside a literal is not a set operation and a
+    # WHERE inside a literal cannot misplace the injected predicate.
+    clean = _strip_sql(sql)
+    head = clean.lstrip().upper()
+
+    # Skip non-DML (unsafe shapes are checked first: WITH/(/TABLE are DML too)
+    if not head.startswith(_DML_STARTS + _UNSAFE_STARTS):
         return sql
 
     # Determine operation type
-    is_select = bool(_SELECT_RE.match(sql_upper))
-    is_insert = bool(_INSERT_RE.match(sql_upper))
-    is_update = bool(_UPDATE_RE.match(sql_upper))
-    is_delete = bool(_DELETE_RE.match(sql_upper))
+    is_select = head.startswith("SELECT")
+    is_insert = head.startswith("INSERT")
+    is_update = head.startswith("UPDATE")
+    is_delete = head.startswith("DELETE")
 
     # Check if operation is protected
     if is_select and not protect.get("select", True):
@@ -318,7 +444,10 @@ def rewrite_query(sql: str, tenant_id: str, config: dict,
         return sql
 
     # Extract and check tables
-    tables = _extract_tables(sql)
+    tables = _extract_tables(clean)
+    m = _TABLE_CMD_RE.match(clean)
+    if m:
+        tables.append(m.group(1).strip('`"[]'))
     protected_tables = [
         t for t in tables
         if not _is_excluded_table(t, excluded)
@@ -328,24 +457,29 @@ def rewrite_query(sql: str, tenant_id: str, config: dict,
     if not protected_tables:
         return sql
 
+    # A protected table in a shape we cannot scope → refuse, never half-filter
+    _reject_unsafe_shape(clean)
+
     # For SELECT/UPDATE/DELETE: inject WHERE clause
     if is_select or is_update or is_delete:
-        tenant_predicate = f"{tenant_col} = '{tenant_id}'"
+        tenant_predicate = f"{tenant_col} = {_sql_literal(tenant_id)}"
 
-        if _WHERE_RE.search(sql):
-            # Inject after existing WHERE
-            sql = _WHERE_RE.sub(f"WHERE {tenant_predicate} AND ", sql, count=1)
+        where = _toplevel_match(_WHERE_RE, clean)
+        if where:
+            # Inject after the real (top-level, non-literal) WHERE
+            sql = sql[:where.end()] + f" {tenant_predicate} AND" + sql[where.end():]
         else:
             # Find insertion point (before ORDER BY, GROUP BY, LIMIT, etc.)
-            insert_before = re.search(
-                r'\b(ORDER\s+BY|GROUP\s+BY|HAVING|LIMIT|OFFSET|UNION|INTERSECT|EXCEPT|;)\b',
-                sql, re.IGNORECASE
-            )
+            insert_before = _toplevel_match(_CLAUSE_RE, clean)
             if insert_before:
                 pos = insert_before.start()
                 sql = sql[:pos] + f" WHERE {tenant_predicate} " + sql[pos:]
             else:
-                sql = sql.rstrip(';') + f" WHERE {tenant_predicate}"
+                # Append after the last real token, i.e. before any trailing
+                # comment (otherwise the predicate would be commented out).
+                code_end = len(clean.rstrip())
+                body = sql[:code_end].rstrip(';').rstrip()
+                sql = body + f" WHERE {tenant_predicate}" + sql[code_end:]
 
     return sql
 
@@ -354,10 +488,34 @@ def rewrite_query(sql: str, tenant_id: str, config: dict,
 # DATABASE-SPECIFIC CONTEXT SETTERS
 # ============================================================================
 
+def _is_autocommit(connection) -> bool:
+    return bool(getattr(connection, "autocommit", False))
+
+
 def _set_context_postgres(connection, tenant_id: str):
-    """Set tenant via PostgreSQL session variable."""
+    """Set tenant via a TRANSACTION-local GUC (set_config(..., true)).
+
+    Session scope (false) survives commit and leaks to the next borrower of a
+    pooled connection. Local scope dies with the transaction, so it needs one:
+    in the DB-API default (autocommit=False) the driver opens it implicitly.
+    """
+    if _is_autocommit(connection):
+        raise RuntimeError(
+            "DB Firewall: PostgreSQL tenant context is transaction-local and "
+            "cannot be set on an autocommit connection. Disable autocommit "
+            "(connection.autocommit = False) or use tenant_scope() with "
+            "middleware-only enforcement."
+        )
     cursor = connection.cursor()
-    cursor.execute("SELECT set_config('app.current_tenant', %s, false)", (tenant_id,))
+    cursor.execute("SELECT set_config('app.current_tenant', %s, true)", (tenant_id,))
+    cursor.close()
+
+
+def _clear_context_postgres(connection):
+    # Belt for session-scoped values (e.g. set by _firewall_set_tenant() SQL).
+    # Transaction-local values are already dropped by commit/rollback.
+    cursor = connection.cursor()
+    cursor.execute("SELECT set_config('app.current_tenant', '', false)")
     cursor.close()
 
 
@@ -368,10 +526,22 @@ def _set_context_mysql(connection, tenant_id: str):
     cursor.close()
 
 
+def _clear_context_mysql(connection):
+    cursor = connection.cursor()
+    cursor.execute("SET @_fw_tenant_id = NULL")
+    cursor.close()
+
+
 def _set_context_sqlserver(connection, tenant_id: str):
     """Set tenant via SQL Server SESSION_CONTEXT."""
     cursor = connection.cursor()
     cursor.execute("EXEC sp_set_session_context @key=N'tenant_id', @value=?", (tenant_id,))
+    cursor.close()
+
+
+def _clear_context_sqlserver(connection):
+    cursor = connection.cursor()
+    cursor.execute("EXEC sp_set_session_context @key=N'tenant_id', @value=NULL")
     cursor.close()
 
 
@@ -385,12 +555,75 @@ def _set_context_oracle(connection, tenant_id: str):
     cursor.close()
 
 
+def _clear_context_oracle(connection):
+    # clear_tenant is defined in migrations/004_oracle.sql
+    cursor = connection.cursor()
+    cursor.execute("BEGIN PKG_SAAS_SECURITY.clear_tenant; END;")
+    cursor.close()
+
+
 _CONTEXT_SETTERS = {
     DBEngine.POSTGRESQL: _set_context_postgres,
     DBEngine.MYSQL: _set_context_mysql,
     DBEngine.SQLSERVER: _set_context_sqlserver,
     DBEngine.ORACLE: _set_context_oracle,
 }
+
+_CONTEXT_CLEARERS = {
+    DBEngine.POSTGRESQL: _clear_context_postgres,
+    DBEngine.MYSQL: _clear_context_mysql,
+    DBEngine.SQLSERVER: _clear_context_sqlserver,
+    DBEngine.ORACLE: _clear_context_oracle,
+}
+
+
+def clear_db_context(connection, engine: Optional[str] = None) -> None:
+    """Clear the DB-side tenant context on a raw connection. Logs, never raises."""
+    if engine is None:
+        engine = detect_engine(connection)
+    clearer = _CONTEXT_CLEARERS.get(engine)
+    if not clearer:
+        return
+    try:
+        clearer(connection)
+    except Exception as e:
+        logger.warning(f"DB Firewall: Could not clear DB context ({engine}): {e}")
+
+
+def pool_checkin(connection, engine: Optional[str] = None) -> None:
+    """
+    Reset hook for connection pools: clears tenant context on a raw connection
+    being returned to the pool and leaves it idle (no open transaction).
+
+    Hook it in:
+        psycopg_pool.ConnectionPool(dsn, reset=pool_checkin)
+        sqlalchemy: event.listen(engine.pool, "checkin",
+                                 lambda dbapi_conn, rec: pool_checkin(dbapi_conn))
+    """
+    if engine is None:
+        engine = detect_engine(connection)
+    clearer = _CONTEXT_CLEARERS.get(engine)
+    if not clearer:
+        return  # engine without DB-side context: nothing to clear (benign)
+    try:
+        clearer(connection)
+        # The clear statement opens an implicit transaction in non-autocommit
+        # mode; the pool already rolled back/committed user work before us.
+        if not _is_autocommit(connection) and hasattr(connection, "commit"):
+            connection.commit()
+    except Exception as e:
+        # A dead connection must NOT be returned to the pool with stale
+        # context: re-raise so the pool (psycopg_pool reset=, SQLAlchemy
+        # checkin) discards it. Only swallow when the connection is healthy.
+        if getattr(connection, "closed", False) or _is_connection_error(e):
+            raise
+        logger.warning(f"DB Firewall: Could not clear DB context ({engine}): {e}")
+
+
+def _is_connection_error(exc: BaseException) -> bool:
+    """DB-API OperationalError/InterfaceError (any driver) signal a broken link."""
+    return any(k.__name__ in ("OperationalError", "InterfaceError")
+               for k in type(exc).__mro__)
 
 
 # ============================================================================
@@ -416,8 +649,7 @@ class ProtectedCursor:
             )
         elif self._config.get("fail_mode") == "closed":
             # No tenant set + fail closed → block everything
-            sql_upper = sql.upper().strip()
-            if any(sql_upper.startswith(k) for k in ["SELECT", "INSERT", "UPDATE", "DELETE"]):
+            if _strip_sql(sql).lstrip().upper().startswith(_DML_STARTS + _UNSAFE_STARTS):
                 raise PermissionError(
                     "DB Firewall: No tenant context. Query blocked (fail_mode=closed)."
                 )
@@ -462,6 +694,9 @@ class ProtectedConnection:
         self._config = config
         self._engine = engine
 
+        if tenant_id is not None:
+            validate_tenant_id(tenant_id)
+
         # Set database-level context if engine supports it
         setter = _CONTEXT_SETTERS.get(engine)
         if setter and tenant_id:
@@ -469,8 +704,11 @@ class ProtectedConnection:
                 setter(connection, tenant_id)
                 logger.info(f"DB Firewall: Set DB-level context for {engine}")
             except Exception as e:
-                logger.warning(f"DB Firewall: Could not set DB context: {e}")
-                logger.info("DB Firewall: Falling back to middleware-only enforcement")
+                # Silent fallback would leave the DB layer unguarded: fail closed.
+                if config.get("fail_mode", "closed") == "closed":
+                    raise
+                logger.warning(f"DB Firewall: Could not set DB context: {e}; "
+                               "fail_mode=open, middleware-only enforcement")
 
         # Also set thread-local context
         TenantContext.set(tenant_id)
@@ -488,12 +726,18 @@ class ProtectedConnection:
     def __enter__(self):
         return self
 
-    def __exit__(self, *args):
+    def release(self):
+        """Drop tenant context (DB-side + thread-local) without closing the
+        underlying connection. Call before handing it back to a pool."""
+        clear_db_context(self._connection, self._engine)
         TenantContext.clear()
+
+    def __exit__(self, *args):
+        self.release()
         self._connection.__exit__(*args) if hasattr(self._connection, '__exit__') else None
 
     def close(self):
-        TenantContext.clear()
+        self.release()
         self._connection.close()
 
 
@@ -636,14 +880,21 @@ def sqlalchemy_event_hooks(engine_instance):
     """
     from sqlalchemy import event
 
-    @event.listens_for(engine_instance, "connect")
-    def on_connect(dbapi_connection, connection_record):
+    # Per-checkout, not per-connect: a pooled connection serves many tenants.
+    # Postgres uses a transaction-local GUC, so it dies with the transaction.
+    @event.listens_for(engine_instance, "checkout")
+    def on_checkout(dbapi_connection, connection_record, connection_proxy):
         tenant = TenantContext.get()
         if tenant:
             db_engine = detect_engine(dbapi_connection)
             setter = _CONTEXT_SETTERS.get(db_engine)
             if setter:
                 setter(dbapi_connection, tenant)
+
+    @event.listens_for(engine_instance, "checkin")
+    def on_checkin(dbapi_connection, connection_record):
+        if dbapi_connection is not None:
+            pool_checkin(dbapi_connection)
 
     @event.listens_for(engine_instance, "before_cursor_execute")
     def before_execute(conn, cursor, statement, parameters, context, executemany):
@@ -661,8 +912,7 @@ def sqlalchemy_event_hooks(engine_instance):
                 return new_statement, parameters
 
         elif not tenant and config.get("fail_mode") == "closed":
-            upper = statement.upper().strip()
-            if any(upper.startswith(k) for k in ["SELECT", "INSERT", "UPDATE", "DELETE"]):
+            if _strip_sql(statement).lstrip().upper().startswith(_DML_STARTS + _UNSAFE_STARTS):
                 tables = _extract_tables(statement)
                 excluded = config.get("excluded_tables", [])
                 if any(not _is_excluded_table(t, excluded) for t in tables):

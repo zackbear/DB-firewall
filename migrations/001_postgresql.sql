@@ -31,15 +31,42 @@ CREATE TABLE IF NOT EXISTS _firewall_audit_log (
 CREATE INDEX IF NOT EXISTS idx_firewall_audit_tenant
     ON _firewall_audit_log (tenant_id, assigned_at);
 
+-- 2b. Bypass roles — EMPTY by default. No role is hardcoded: on Supabase,
+--     Neon, RDS etc. the app itself connects as "postgres", so a built-in
+--     bypass would disable every policy. Opt a role in deliberately:
+--       INSERT INTO _firewall_bypass_roles VALUES ('_migrator');
+--     Superusers and BYPASSRLS roles skip RLS regardless of this table.
+CREATE TABLE IF NOT EXISTS _firewall_bypass_roles (
+    role_name       TEXT PRIMARY KEY,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- SECURITY DEFINER so policies can consult the table without granting
+-- SELECT on it to application roles.
+-- The caller passes current_user: inside SECURITY DEFINER it would resolve
+-- to the function owner.
+-- Every SECURITY DEFINER function below pins search_path (pg_temp LAST) and
+-- schema-qualifies its tables: otherwise any caller could CREATE TEMP TABLE
+-- _firewall_bypass_roles listing itself, put pg_temp first in search_path,
+-- and switch every RLS policy off. It must stay executable by PUBLIC because
+-- policies evaluate it as the calling role.
+CREATE OR REPLACE FUNCTION _firewall_is_bypass_role(p_role TEXT)
+RETURNS BOOLEAN AS $$
+    SELECT EXISTS (SELECT 1 FROM public._firewall_bypass_roles WHERE role_name = p_role);
+$$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
+
 -- 3. Session variable helper functions
+--    NOTE: _firewall_set_tenant is SESSION-scoped (manual/DBA use and the
+--    per-DB-user auto-resolve). The Python middleware sets the GUC
+--    transaction-locally instead; pool_checkin()/release() clear this one.
 CREATE OR REPLACE FUNCTION _firewall_set_tenant(p_tenant TEXT)
 RETURNS VOID AS $$
 BEGIN
     PERFORM set_config('app.current_tenant', p_tenant, false);
-    INSERT INTO _firewall_audit_log (client_addr, tenant_id, auth_method)
+    INSERT INTO public._firewall_audit_log (client_addr, tenant_id, auth_method)
     VALUES (inet_client_addr(), p_tenant, 'set_tenant');
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
 
 CREATE OR REPLACE FUNCTION _firewall_get_tenant()
 RETURNS TEXT AS $$
@@ -53,7 +80,7 @@ RETURNS VOID AS $$
 BEGIN
     PERFORM set_config('app.current_tenant', '', false);
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
 
 -- 4. Auto-resolve tenant from user mapping
 CREATE OR REPLACE FUNCTION _firewall_auto_resolve()
@@ -62,23 +89,23 @@ DECLARE
     v_tenant TEXT;
 BEGIN
     -- Check if already set
-    v_tenant := _firewall_get_tenant();
+    v_tenant := public._firewall_get_tenant();
     IF v_tenant IS NOT NULL AND v_tenant != '' THEN
         RETURN v_tenant;
     END IF;
 
     -- Resolve from mapping table
     SELECT tenant_id INTO v_tenant
-    FROM _firewall_tenant_map
+    FROM public._firewall_tenant_map
     WHERE db_user = current_user AND is_active = TRUE;
 
     IF v_tenant IS NOT NULL THEN
-        PERFORM _firewall_set_tenant(v_tenant);
+        PERFORM public._firewall_set_tenant(v_tenant);
     END IF;
 
     RETURN v_tenant;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
 
 -- 5. Universal RLS policy function
 --    This is applied to every protected table.
@@ -88,13 +115,13 @@ DECLARE
     v_tenant TEXT;
     v_user TEXT := current_user;
 BEGIN
-    -- Bypass for excluded users
-    IF v_user IN ('postgres', 'admin', '_migrator') THEN
+    -- Bypass only for roles deliberately listed in _firewall_bypass_roles
+    IF public._firewall_is_bypass_role(v_user) THEN
         RETURN TRUE;
     END IF;
 
     -- Auto-resolve tenant
-    v_tenant := _firewall_auto_resolve();
+    v_tenant := public._firewall_auto_resolve();
 
     -- FAIL CLOSED: no tenant = deny all
     IF v_tenant IS NULL OR v_tenant = '' THEN
@@ -142,17 +169,17 @@ BEGIN
         -- Force RLS even for table owners
         EXECUTE format('ALTER TABLE %I.%I FORCE ROW LEVEL SECURITY', r.table_schema, r.table_name);
 
-        -- Drop existing policy if re-running
-        BEGIN
-            EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', policy_name, r.table_schema, r.table_name);
-        EXCEPTION WHEN OTHERS THEN NULL;
-        END;
+        -- Drop existing policies if re-running (idempotent)
+        EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', policy_name || '_sel', r.table_schema, r.table_name);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', policy_name || '_ins', r.table_schema, r.table_name);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', policy_name || '_upd', r.table_schema, r.table_name);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', policy_name || '_del', r.table_schema, r.table_name);
 
         -- SELECT policy
         EXECUTE format(
             'CREATE POLICY %I ON %I.%I FOR SELECT USING (
                 tenant_id = NULLIF(current_setting(''app.current_tenant'', true), '''')
-                OR current_user IN (''postgres'', ''admin'', ''_migrator'')
+                OR public._firewall_is_bypass_role(current_user::text)
             )',
             policy_name || '_sel', r.table_schema, r.table_name
         );
@@ -161,7 +188,7 @@ BEGIN
         EXECUTE format(
             'CREATE POLICY %I ON %I.%I FOR INSERT WITH CHECK (
                 tenant_id = NULLIF(current_setting(''app.current_tenant'', true), '''')
-                OR current_user IN (''postgres'', ''admin'', ''_migrator'')
+                OR public._firewall_is_bypass_role(current_user::text)
             )',
             policy_name || '_ins', r.table_schema, r.table_name
         );
@@ -170,10 +197,10 @@ BEGIN
         EXECUTE format(
             'CREATE POLICY %I ON %I.%I FOR UPDATE USING (
                 tenant_id = NULLIF(current_setting(''app.current_tenant'', true), '''')
-                OR current_user IN (''postgres'', ''admin'', ''_migrator'')
+                OR public._firewall_is_bypass_role(current_user::text)
             ) WITH CHECK (
                 tenant_id = NULLIF(current_setting(''app.current_tenant'', true), '''')
-                OR current_user IN (''postgres'', ''admin'', ''_migrator'')
+                OR public._firewall_is_bypass_role(current_user::text)
             )',
             policy_name || '_upd', r.table_schema, r.table_name
         );
@@ -182,7 +209,7 @@ BEGIN
         EXECUTE format(
             'CREATE POLICY %I ON %I.%I FOR DELETE USING (
                 tenant_id = NULLIF(current_setting(''app.current_tenant'', true), '''')
-                OR current_user IN (''postgres'', ''admin'', ''_migrator'')
+                OR public._firewall_is_bypass_role(current_user::text)
             )',
             policy_name || '_del', r.table_schema, r.table_name
         );
@@ -199,7 +226,7 @@ RETURNS INTEGER AS $$
 DECLARE
     deleted INTEGER;
 BEGIN
-    DELETE FROM _firewall_audit_log
+    DELETE FROM public._firewall_audit_log
     WHERE assigned_at < NOW() - (retention_days || ' days')::INTERVAL;
     GET DIAGNOSTICS deleted = ROW_COUNT;
     RETURN deleted;

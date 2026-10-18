@@ -66,17 +66,14 @@ resolution:
     enabled: false    # Enable for single-tenant deployments
 
 # ----------------------------------------------------------------------------
-# EXCLUDED USERS — These users/roles bypass tenant filtering entirely.
-# Use for DBA, migration runners, and admin dashboards.
+# EXCLUDED USERS — DB users/roles that bypass middleware tenant filtering.
+# EMPTY BY DEFAULT. On managed Postgres (Supabase, Neon, RDS) the application
+# often connects as "postgres"; a built-in bypass list would disable the
+# firewall for the app itself. Add roles deliberately, e.g. "_migrator".
+# The DB-native layer has its own opt-in list: the _firewall_bypass_roles
+# table created by the migrations (also empty by default).
 # ----------------------------------------------------------------------------
-excluded_users:
-  - "postgres"        # PostgreSQL superuser
-  - "root"            # MySQL root
-  - "sa"              # SQL Server admin
-  - "sys"             # Oracle SYS
-  - "system"          # Oracle SYSTEM
-  - "admin"           # Generic admin
-  - "_migrator"       # Migration runner service account
+excluded_users: []
 
 # ----------------------------------------------------------------------------
 # EXCLUDED TABLES — Tables that should NOT have tenant filtering.

@@ -198,11 +198,63 @@ class TestFailClosed:
 
 class TestSecurityAttacks:
 
-    def test_union_injection_still_filtered(self, config):
-        """Even if AI generates UNION, the base query is still filtered."""
+    def test_union_injection_rejected(self, config):
+        """A regex rewriter cannot scope both UNION branches (the first one used
+        to pass through unfiltered), so the statement is refused outright."""
         sql = "SELECT * FROM orders UNION SELECT * FROM orders WHERE tenant_id = 'TENANT_B'"
+        with pytest.raises(PermissionError, match="unsupported statement shape"):
+            rewrite_query(sql, "TENANT_A", config)
+
+    @pytest.mark.parametrize("sql", [
+        "SELECT a FROM orders INTERSECT SELECT a FROM orders",
+        "SELECT a FROM orders EXCEPT SELECT a FROM orders WHERE tenant_id = 'B'",
+        "WITH o AS (SELECT * FROM orders) SELECT * FROM o",
+        "(SELECT * FROM orders)",
+        "TABLE orders",
+        "UPDATE orders SET status = 'x' FROM customers WHERE orders.cid = customers.id",
+        "DELETE FROM orders USING customers WHERE orders.cid = customers.id",
+        "SELECT * FROM orders; DELETE FROM orders",
+        "SELECT * FROM orders WHERE note = 'unterminated",
+        "SELECT * FROM orders /* unterminated",
+    ], ids=["intersect", "except", "cte", "leading-paren", "table-cmd",
+            "update-from", "delete-using", "multi-statement",
+            "unterminated-literal", "unterminated-comment"])
+    def test_unsafe_shapes_rejected(self, config, sql):
+        with pytest.raises(PermissionError, match="unsupported statement shape"):
+            rewrite_query(sql, "TENANT_A", config)
+
+    def test_unsafe_shape_on_unprotected_table_passes_through(self, config):
+        for sql in ("(SELECT * FROM schema_migrations)",
+                    "TABLE schema_migrations",
+                    "SELECT v FROM schema_migrations UNION SELECT v FROM _firewall_audit_log"):
+            assert rewrite_query(sql, "TENANT_A", config) == sql
+
+    def test_union_inside_string_literal_still_allowed_and_filtered(self, config):
+        sql = "SELECT * FROM orders WHERE note = 'a UNION b' ORDER BY id"
         result = rewrite_query(sql, "TENANT_A", config)
-        assert "tenant_id = 'TENANT_A'" in result
+        assert result == ("SELECT * FROM orders WHERE tenant_id = 'TENANT_A' AND "
+                          "note = 'a UNION b' ORDER BY id")
+
+    def test_union_inside_comment_still_allowed_and_filtered(self, config):
+        sql = "SELECT * FROM orders /* UNION SELECT * FROM orders */"
+        result = rewrite_query(sql, "TENANT_A", config)
+        assert result == "SELECT * FROM orders WHERE tenant_id = 'TENANT_A' /* UNION SELECT * FROM orders */"
+
+    def test_where_inside_literal_does_not_misplace_predicate(self, config):
+        sql = "SELECT * FROM orders WHERE note = 'x WHERE y' AND status = 'a'"
+        result = rewrite_query(sql, "TENANT_A", config)
+        assert result == ("SELECT * FROM orders WHERE tenant_id = 'TENANT_A' AND "
+                          "note = 'x WHERE y' AND status = 'a'")
+
+    def test_where_in_select_list_subquery_does_not_capture_predicate(self, config):
+        sql = "SELECT (SELECT count(*) FROM items WHERE qty > 1) FROM orders"
+        result = rewrite_query(sql, "TENANT_A", config)
+        assert result == sql + " WHERE tenant_id = 'TENANT_A'"
+
+    def test_leading_comment_is_still_dml(self, config):
+        sql = "/* hint */ SELECT * FROM orders"
+        result = rewrite_query(sql, "TENANT_A", config)
+        assert result == "/* hint */ SELECT * FROM orders WHERE tenant_id = 'TENANT_A'"
 
     def test_subquery_still_filtered(self, config):
         sql = "SELECT * FROM orders WHERE id IN (SELECT id FROM orders)"
@@ -210,9 +262,10 @@ class TestSecurityAttacks:
         assert "tenant_id = 'TENANT_A'" in result
 
     def test_sql_comment_bypass_attempt(self, config):
+        """The predicate must land BEFORE a trailing comment, not inside it."""
         sql = "SELECT * FROM orders -- WHERE tenant_id = 'TENANT_B'"
         result = rewrite_query(sql, "TENANT_A", config)
-        assert "tenant_id = 'TENANT_A'" in result
+        assert result == "SELECT * FROM orders WHERE tenant_id = 'TENANT_A' -- WHERE tenant_id = 'TENANT_B'"
 
 
 if __name__ == "__main__":
