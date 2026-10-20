@@ -15,16 +15,25 @@ import sys
 import threading
 from types import SimpleNamespace
 
+import logging
+
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'middleware'))
 import sqlite3  # noqa: E402
 import uuid  # noqa: E402
 
+import db_firewall  # noqa: E402
 from db_firewall import (  # noqa: E402
-    clear_tenant, django_middleware_class, fastapi_middleware, flask_hooks,
-    get_tenant, protect, set_tenant, tenant_scope,
+    TenantContext, clear_tenant, django_middleware_class, fastapi_middleware,
+    flask_hooks, get_tenant, protect, set_tenant, tenant_scope,
 )
+
+CONFIG = {"fail_mode": "closed", "rewriter": "ast"}
+
+
+def _conn(tenant=None):
+    return protect(sqlite3.connect(":memory:"), tenant_id=tenant, config=CONFIG)
 
 HEADER = "X-Tenant-ID"
 
@@ -79,15 +88,50 @@ class TestContextIsolation:
             assert get_tenant() == "A"
         assert get_tenant() is None
 
-    def test_protect_release_restores_request_tenant(self):
+    def test_protect_does_not_change_shared_tenant(self):
         set_tenant("A")                     # the request's tenant
-        conn = protect(sqlite3.connect(":memory:"), tenant_id="B",
-                       config={"fail_mode": "closed", "rewriter": "ast"})
-        assert get_tenant() == "B"
-        conn.release()
+        conn = _conn("B")
         assert get_tenant() == "A"
-        conn.close()                        # second release must not clobber it
+        conn.close()
         assert get_tenant() == "A"
+
+    def test_connection_from_old_request_closed_in_new_request(self):
+        old = TenantContext.enter("A")      # request A on a reused worker thread
+        conn = _conn()                      # inherits A for its own cursors
+        TenantContext.exit(old)
+        new = TenantContext.enter("C")      # request C on the same thread
+        conn.close()
+        assert get_tenant() == "C"          # must not bring back A
+        TenantContext.exit(new)
+
+    def test_release_inside_scope_leaves_no_stale_tenant(self):
+        conn = _conn("A")
+        with tenant_scope("B"):
+            conn.release()
+        assert get_tenant() is None
+
+    def test_close_after_scope_leaves_no_stale_tenant(self):
+        with tenant_scope("A"):
+            conn = _conn()
+        conn.close()
+        assert get_tenant() is None
+
+    def test_cross_context_exit_fails_closed_with_warning(self, caplog):
+        token = TenantContext.enter("A")
+        set_tenant("B")
+
+        def other_thread():
+            TenantContext.exit(token)       # token from another context
+            seen.append(get_tenant())
+
+        seen = []
+        with caplog.at_level(logging.WARNING, logger="db_firewall"):
+            t = threading.Thread(target=other_thread)
+            t.start()
+            t.join()
+        assert seen == [None]
+        assert "different context" in caplog.text
+        assert get_tenant() == "B"          # the creating context is untouched
 
 
 # ============================================================================
@@ -168,6 +212,34 @@ class TestDjango:
         monkeypatch.setenv("USERPROFILE", str(tmp_path))
         assert _run_django(_django_request(headers={HEADER: "B"})) == "B"
 
+    def test_streaming_body_runs_as_request_tenant(self):
+        set_tenant("Z")                     # ambient tenant that must not leak in
+
+        def view(req):
+            body = (get_tenant() for _ in range(2))   # read lazily, after middleware returns
+            return SimpleNamespace(streaming=True, streaming_content=body)
+
+        response = django_middleware_class(tenant_id_source=lambda r: "A")(view)(_django_request())
+        assert get_tenant() == "Z"          # restored before the body is read
+        assert list(response.streaming_content) == ["A", "A"]
+        assert get_tenant() == "Z"
+
+    def test_ignored_header_logged_once(self, caplog, monkeypatch):
+        monkeypatch.setattr(db_firewall, "_warned_untrusted_header", False)
+        with caplog.at_level(logging.WARNING, logger="db_firewall"):
+            _run_django(_django_request(headers={HEADER: "B"}))
+            _run_django(_django_request(headers={HEADER: "B"}))
+        assert caplog.text.count("X-Tenant-ID header ignored") == 1
+
+    def test_fail_open_logged_at_setup(self, caplog, tmp_path, monkeypatch):
+        (tmp_path / ".db-firewall.json").write_text('{"fail_mode": "open"}')
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        with caplog.at_level(logging.WARNING, logger="db_firewall"):
+            django_middleware_class()
+        assert "fail_mode=open" in caplog.text
+
     def test_tenant_cleared_when_view_raises(self):
         def view(req):
             raise RuntimeError("view failed")
@@ -232,6 +304,22 @@ class TestFastAPI:
         client = _starlette_client()
         client.app.add_middleware(Stray)
         assert client.get(path).text == "None"
+
+    def test_outer_tenant_restored_after_request(self):
+        from starlette.middleware.base import BaseHTTPMiddleware
+        after = []
+
+        class Outer(BaseHTTPMiddleware):
+            async def dispatch(self, request, call_next):
+                set_tenant("A")
+                response = await call_next(request)
+                after.append(get_tenant())
+                return response
+
+        client = _starlette_client(tenant_id_source=lambda req: "B")
+        client.app.add_middleware(Outer)
+        assert client.get("/async").text == "B"
+        assert after == ["A"]
 
     def test_request_state_is_default_source(self):
         from starlette.middleware.base import BaseHTTPMiddleware
@@ -304,7 +392,12 @@ class TestFlask:
 
         assert _flask_client(before=login).get("/").text == "A"
 
-    def test_tenant_restored_after_request(self):
-        client = _flask_client(tenant_id_source=lambda: "A")
-        client.get("/")
-        assert get_tenant() is None
+    def test_outer_tenant_restored_after_request(self):
+        app = flask.Flask(__name__)
+        after = []
+        app.before_request(lambda: set_tenant("A"))
+        app.teardown_request(lambda exc: after.append(get_tenant()))  # registered first, runs last
+        app.route("/")(lambda: str(get_tenant()))
+        flask_hooks(app, tenant_id_source=lambda: "B")
+        assert app.test_client().get("/").text == "B"
+        assert after == ["A"]

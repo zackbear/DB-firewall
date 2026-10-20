@@ -218,7 +218,9 @@ class TenantContext:
             return
         try:
             _TENANT_VAR.reset(token)
-        except (ValueError, RuntimeError):
+        except (ValueError, RuntimeError) as e:
+            logger.warning(f"DB Firewall: tenant scope ended in a different context ({e}); "
+                           "clearing the tenant here (fail closed)")
             _TENANT_VAR.set(None)
 
     @classmethod
@@ -879,8 +881,10 @@ class ProtectedConnection:
                 logger.warning(f"DB Firewall: Could not set DB context: {e}; "
                                "fail_mode=open, middleware-only enforcement")
 
-        # Also set the request context; release() restores the outer tenant.
-        self._ctx_token = TenantContext.enter(tenant_id)
+        # The shared request context is deliberately NOT changed here: a
+        # connection can outlive the scope it was made in, and restoring a
+        # context out of order brings back a stale tenant. Cursors carry
+        # self._tenant_id, which is all the enforcement needs.
 
     def cursor(self, *args, **kwargs):
         raw_cursor = self._connection.cursor(*args, **kwargs)
@@ -921,7 +925,7 @@ class ProtectedConnection:
         return self
 
     def release(self):
-        """Drop tenant context (DB-side + request context) without closing the
+        """Drop the DB-side tenant context without closing the
         underlying connection. Call before handing it back to a pool.
 
         PostgreSQL: the transaction-local tenant dies with the transaction
@@ -930,8 +934,6 @@ class ProtectedConnection:
         open transaction that is then rolled back, the pool's ``reset`` hook
         must be ``pool_checkin`` (which rolls back, clears and commits)."""
         clear_db_context(self._connection, self._engine)
-        TenantContext.exit(self._ctx_token)     # restore, do not wipe, the outer tenant
-        self._ctx_token = None                  # release() may run twice (close + __exit__)
 
     def __exit__(self, *args):
         self.release()
@@ -1105,6 +1107,16 @@ def _request_tenant(verified, headers, trust_header: bool) -> Optional[str]:
         return None
 
 
+def _stream_as(tenant: Optional[str], content):
+    """Iterate a streaming body as the request's tenant. A WSGI server reads the
+    body after the middleware has returned and restored the outer context."""
+    token = TenantContext.enter(tenant)
+    try:
+        yield from content
+    finally:
+        TenantContext.exit(token)
+
+
 def _django_default_source(request):
     tenant = getattr(request, "tenant_id", None)
     if tenant is None:
@@ -1136,12 +1148,18 @@ def django_middleware_class(tenant_id_source=None, trust_tenant_header: Optional
             self.get_response = get_response
 
         def __call__(self, request):
+            tenant = _request_tenant(source(request), request.headers, trust)
             # Enter even when None: hides any tenant left in this context.
-            token = TenantContext.enter(_request_tenant(source(request), request.headers, trust))
+            token = TenantContext.enter(tenant)
             try:
-                return self.get_response(request)
+                response = self.get_response(request)
             finally:
                 TenantContext.exit(token)   # runs even when the view raises
+            content = getattr(response, "streaming_content", None)
+            if getattr(response, "streaming", False) and content is not None \
+                    and not hasattr(content, "__aiter__"):  # async bodies: [Unverified], not wrapped
+                response.streaming_content = _stream_as(tenant, content)
+            return response
 
     return DBFirewallMiddleware
 
@@ -1255,6 +1273,9 @@ def flask_hooks(app, tenant_id_source=None, trust_tenant_header: Optional[bool] 
         Default: g.tenant_id (set by your auth hook) or session["tenant_id"].
         Call flask_hooks() AFTER registering your auth before_request hook,
         and on the app, not a blueprint: blueprint hooks run too late.
+    Streaming responses: Flask runs teardown before the body is read, so a
+    streaming generator must open its own tenant_scope(tenant) or use
+    protect(conn, tenant_id=...).
     trust_tenant_header: also accept X-Tenant-ID when no verified tenant is
         found. Only for a gateway that sets it after auth. Default: config key.
     """

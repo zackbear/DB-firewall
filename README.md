@@ -156,6 +156,12 @@ that tenant, or none, and restores the previous context when it ends.
   `contextvars.copy_context().run(...)`.
 - **Flask:** call `flask_hooks(app)` after registering your auth `before_request`
   hook, on the app rather than a blueprint.
+- **Streaming responses:** Django streaming bodies run as the request's tenant.
+  Flask runs teardown before a streaming body is read, so a Flask generator must
+  open its own `tenant_scope(tenant)` or use `protect(conn, tenant_id=...)`.
+  Django async streaming bodies under ASGI are not covered yet.
+- **Outside requests:** prefer `tenant_scope(...)` or `protect(conn, tenant_id=...)`
+  over a bare `set_tenant()`, which stays set for the rest of that thread or task.
 - **`fail_mode: open`:** a request with no verified tenant runs unscoped. Use
   `closed` in production; the web integrations log a warning when they see `open`.
 
@@ -274,7 +280,7 @@ Independently of this table, PostgreSQL **superusers, roles with `BYPASSRLS`, an
 Tenant context is cleared when a connection goes back to the pool. Three rules:
 
 1. **PostgreSQL context is transaction-local** (`set_config(..., true)`), so it dies on `commit`/`rollback` and cannot leak to the next borrower. It therefore needs an open transaction: the DB-API default (`autocommit=False`) opens one implicitly. `protect()` raises `RuntimeError` on an autocommit connection instead of silently falling back. Set the context again (`protect()`) after each commit if you issue more tenant queries on the same connection.
-2. **Release through the wrapper.** `ProtectedConnection.release()` (also run by `close()` and `__exit__`) clears the DB-side context on every engine (`set_config('',false)`, `SET @_fw_tenant_id = NULL`, `sp_set_session_context ... NULL`, `PKG_SAAS_SECURITY.clear_tenant`) and restores the request's previous tenant context. `release()` does not close or commit the underlying connection.
+2. **Release through the wrapper.** `ProtectedConnection.release()` (also run by `close()` and `__exit__`) clears the DB-side context on every engine (`set_config('',false)`, `SET @_fw_tenant_id = NULL`, `sp_set_session_context ... NULL`, `PKG_SAAS_SECURITY.clear_tenant`) and leaves the request's tenant context alone (a wrapped connection never changes it; its cursors carry their own tenant). `release()` does not close or commit the underlying connection.
 3. **Hook `pool_checkin` into your pool** as a belt for anything that bypassed the wrapper:
 
 ```python
