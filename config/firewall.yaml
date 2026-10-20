@@ -44,7 +44,8 @@ allow_tenant_placeholder: false
 # ----------------------------------------------------------------------------
 # TENANT HEADER — Django / FastAPI / Flask integrations ignore the X-Tenant-ID
 # request header unless this is true. Any client can send it, so enable it
-# only behind a gateway that sets it after authenticating the caller.
+# only behind a gateway that authenticates the caller and overwrites any
+# client-sent X-Tenant-ID.
 # ?tenant_id= in the URL is never trusted.
 # ----------------------------------------------------------------------------
 trust_tenant_header: false

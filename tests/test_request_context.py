@@ -18,9 +18,12 @@ from types import SimpleNamespace
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'middleware'))
+import sqlite3  # noqa: E402
+import uuid  # noqa: E402
+
 from db_firewall import (  # noqa: E402
     clear_tenant, django_middleware_class, fastapi_middleware, flask_hooks,
-    get_tenant, set_tenant,
+    get_tenant, protect, set_tenant, tenant_scope,
 )
 
 HEADER = "X-Tenant-ID"
@@ -68,6 +71,23 @@ class TestContextIsolation:
         for t in threads:
             t.join()
         assert seen == {"A": "A", "B": "B"}
+
+    def test_nested_tenant_scope_restores_outer(self):
+        with tenant_scope("A"):
+            with tenant_scope("B"):
+                assert get_tenant() == "B"
+            assert get_tenant() == "A"
+        assert get_tenant() is None
+
+    def test_protect_release_restores_request_tenant(self):
+        set_tenant("A")                     # the request's tenant
+        conn = protect(sqlite3.connect(":memory:"), tenant_id="B",
+                       config={"fail_mode": "closed", "rewriter": "ast"})
+        assert get_tenant() == "B"
+        conn.release()
+        assert get_tenant() == "A"
+        conn.close()                        # second release must not clobber it
+        assert get_tenant() == "A"
 
 
 # ============================================================================
@@ -118,6 +138,35 @@ class TestDjango:
     def test_invalid_header_value_is_ignored(self):
         req = _django_request(headers={HEADER: "A\nB"})
         assert _run_django(req, trust_tenant_header=True) is None
+
+    def test_anonymous_request_hides_ambient_tenant(self):
+        set_tenant("A")                     # stray tenant left in this context
+        assert _run_django(_django_request()) is None
+        assert get_tenant() == "A"          # restored after the request
+
+    def test_invalid_id_hides_ambient_tenant(self):
+        set_tenant("A")
+        req = _django_request(headers={HEADER: "A\nB"})
+        assert _run_django(req, trust_tenant_header=True) is None
+
+    def test_zero_id_does_not_fall_through_to_session(self):
+        req = _django_request(tenant_id=0, session={"tenant_id": "B"})
+        assert _run_django(req) == "0"
+
+    @pytest.mark.parametrize("bad", [True, b"A", ["A"], 1.5])
+    def test_wrong_type_from_source_is_ignored(self, bad):
+        assert _run_django(_django_request(), tenant_id_source=lambda r: bad) is None
+
+    def test_uuid_from_source_is_accepted(self):
+        tid = uuid.UUID("12345678-1234-5678-1234-567812345678")
+        assert _run_django(_django_request(), tenant_id_source=lambda r: tid) == str(tid)
+
+    def test_trust_from_config_file(self, tmp_path, monkeypatch):
+        (tmp_path / ".db-firewall.json").write_text('{"trust_tenant_header": true}')
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        assert _run_django(_django_request(headers={HEADER: "B"})) == "B"
 
     def test_tenant_cleared_when_view_raises(self):
         def view(req):
@@ -170,6 +219,19 @@ class TestFastAPI:
         client = _starlette_client(tenant_id_source=lambda req: "A")
         assert client.get("/async").text == "A"
         assert client.get("/sync").text == "A"
+
+    @pytest.mark.parametrize("path", ["/async", "/sync"])
+    def test_anonymous_request_hides_ambient_tenant(self, path):
+        from starlette.middleware.base import BaseHTTPMiddleware
+
+        class Stray(BaseHTTPMiddleware):    # code that sets a tenant before ours runs
+            async def dispatch(self, request, call_next):
+                set_tenant("A")
+                return await call_next(request)
+
+        client = _starlette_client()
+        client.app.add_middleware(Stray)
+        assert client.get(path).text == "None"
 
     def test_request_state_is_default_source(self):
         from starlette.middleware.base import BaseHTTPMiddleware
@@ -224,3 +286,25 @@ class TestFlask:
     def test_source_wins_over_trusted_header(self):
         client = _flask_client(tenant_id_source=lambda: "A", trust_tenant_header=True)
         assert client.get("/", headers={HEADER: "B"}).text == "A"
+
+    def test_anonymous_request_hides_ambient_tenant(self):
+        assert _flask_client(before=lambda: set_tenant("A")).get("/").text == "None"
+
+    def test_invalid_header_value_is_ignored(self):
+        client = _flask_client(trust_tenant_header=True)   # werkzeug refuses "\n" in headers
+        assert client.get("/", headers={HEADER: "A\\B"}).text == "None"
+
+    def test_query_string_never_trusted(self):
+        client = _flask_client(trust_tenant_header=True)
+        assert client.get("/?tenant_id=B").text == "None"
+
+    def test_session_is_default_source(self):
+        def login():
+            flask.session["tenant_id"] = "A"
+
+        assert _flask_client(before=login).get("/").text == "A"
+
+    def test_tenant_restored_after_request(self):
+        client = _flask_client(tenant_id_source=lambda: "A")
+        client.get("/")
+        assert get_tenant() is None

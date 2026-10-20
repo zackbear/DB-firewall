@@ -95,8 +95,10 @@ flask_hooks(app, tenant_id_source=lambda: g.tenant_id)
 
 All three web integrations ignore `X-Tenant-ID` unless you pass
 `trust_tenant_header=True` (or set it in config), and never read `?tenant_id=`.
-Any client can send that header, so trust it only behind a gateway that sets
-it after authenticating the caller.
+Any client can send that header, so trust it only behind a gateway that
+authenticates the caller and overwrites any client-sent value. Register
+`flask_hooks(app)` after your auth hook. Jobs sent to your own thread pool need
+`contextvars.copy_context().run(...)` to see the request's tenant.
 
 **SQLAlchemy:**
 ```python

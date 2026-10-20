@@ -144,10 +144,26 @@ In both modes the database-native RLS/VPD policy remains the second layer: the r
 
 Web integrations take the tenant from a verified source: `tenant_id_source`, or
 by default `request.tenant_id` / the session (Django), `request.state.tenant_id`
-(FastAPI), `g.tenant_id` / the session (Flask). The `X-Tenant-ID` header is
-ignored unless `trust_tenant_header: true`, because any client can send it.
-`?tenant_id=` is never read. The tenant lives in a `ContextVar`, so concurrent
-async requests and thread-pool endpoints each see their own tenant.
+(FastAPI), `g.tenant_id` / the session (Flask). Each request starts with exactly
+that tenant, or none, and restores the previous context when it ends.
+
+- **Header:** `X-Tenant-ID` is ignored unless `trust_tenant_header: true`, because
+  any client can send it. Enable it only behind a gateway that authenticates the
+  caller and **overwrites** any client-sent `X-Tenant-ID`. `?tenant_id=` is never read.
+- **Concurrency:** the tenant lives in a `ContextVar`. Concurrent asyncio requests
+  and FastAPI/Starlette sync endpoints each see their own tenant. Jobs you submit to
+  your own `ThreadPoolExecutor` do not inherit it: wrap them with
+  `contextvars.copy_context().run(...)`.
+- **Flask:** call `flask_hooks(app)` after registering your auth `before_request`
+  hook, on the app rather than a blueprint.
+- **`fail_mode: open`:** a request with no verified tenant runs unscoped. Use
+  `closed` in production; the web integrations log a warning when they see `open`.
+
+> **Upgrading:** earlier versions read `X-Tenant-ID` (and `?tenant_id=` on FastAPI
+> and Flask) from every request. If you relied on that, pass `tenant_id_source=...`,
+> or set `trust_tenant_header: true` behind an authenticating gateway. Until then,
+> such requests have no tenant: blocked with `fail_mode: closed`, unscoped with
+> `open`. The first ignored header is logged as a warning.
 
 ---
 
@@ -258,7 +274,7 @@ Independently of this table, PostgreSQL **superusers, roles with `BYPASSRLS`, an
 Tenant context is cleared when a connection goes back to the pool. Three rules:
 
 1. **PostgreSQL context is transaction-local** (`set_config(..., true)`), so it dies on `commit`/`rollback` and cannot leak to the next borrower. It therefore needs an open transaction: the DB-API default (`autocommit=False`) opens one implicitly. `protect()` raises `RuntimeError` on an autocommit connection instead of silently falling back. Set the context again (`protect()`) after each commit if you issue more tenant queries on the same connection.
-2. **Release through the wrapper.** `ProtectedConnection.release()` (also run by `close()` and `__exit__`) clears the DB-side context on every engine (`set_config('',false)`, `SET @_fw_tenant_id = NULL`, `sp_set_session_context ... NULL`, `PKG_SAAS_SECURITY.clear_tenant`) and the thread-local. `release()` does not close or commit the underlying connection.
+2. **Release through the wrapper.** `ProtectedConnection.release()` (also run by `close()` and `__exit__`) clears the DB-side context on every engine (`set_config('',false)`, `SET @_fw_tenant_id = NULL`, `sp_set_session_context ... NULL`, `PKG_SAAS_SECURITY.clear_tenant`) and restores the request's previous tenant context. `release()` does not close or commit the underlying connection.
 3. **Hook `pool_checkin` into your pool** as a belt for anything that bypassed the wrapper:
 
 ```python
