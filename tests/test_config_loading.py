@@ -82,14 +82,14 @@ class TestExplicitPath:
     def test_non_mapping_file_raises(self, tmp_path, body):
         cfg = tmp_path / "fw.json"
         cfg.write_text(body)
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="fw.json"):
             load_config(project_root=str(cfg))
 
     def test_empty_yaml_raises(self, tmp_path):
         pytest.importorskip("yaml")
         cfg = tmp_path / "fw.yaml"
         cfg.write_text("")
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="must hold a mapping"):
             load_config(project_root=str(cfg))
 
     def test_project_root_file(self, tmp_path):

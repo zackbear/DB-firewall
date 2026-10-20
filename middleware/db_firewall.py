@@ -120,13 +120,13 @@ def _resolve_config_path(path: Path) -> Path:
 
 
 def _read_config_file(path: Path) -> dict:
+    if path.suffix != ".json" and not HAS_YAML:
+        raise ImportError(f"PyYAML is required to read {path}: pip install pyyaml")
     with open(path) as f:
-        if path.suffix == ".json":
-            data = json.load(f)
-        elif HAS_YAML:
-            data = yaml.safe_load(f)
-        else:
-            raise ImportError(f"PyYAML is required to read {path}: pip install pyyaml")
+        try:
+            data = json.load(f) if path.suffix == ".json" else yaml.safe_load(f)
+        except ValueError as e:             # JSONDecodeError: name the file
+            raise ValueError(f"DB Firewall: {path} is not valid JSON: {e}") from e
     if not isinstance(data, dict):
         raise ValueError(f"DB Firewall: {path} must hold a mapping of settings, "
                          f"got {type(data).__name__}")
