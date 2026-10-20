@@ -92,7 +92,9 @@ def load_config(project_root: Optional[str] = None) -> dict:
     project_root (argument) or DB_FIREWALL_CONFIG (env var) may name a config
     file or a folder holding .db-firewall.yaml/.yml/.json. Neither set: built-in
     defaults. The current folder and home folder are never searched, so a file
-    dropped there cannot change the policy. A named file that is missing raises.
+    dropped there cannot change the policy. A named path with no config file,
+    or a file that does not hold a mapping, raises: silently falling back to
+    defaults could drop a custom tenant_column and leave tables unscoped.
     """
     config = copy.deepcopy(DEFAULT_CONFIG)
     explicit = project_root or os.environ.get("DB_FIREWALL_CONFIG")
@@ -100,28 +102,35 @@ def load_config(project_root: Optional[str] = None) -> dict:
         _warn_orphan_config()
         return _apply_env_overrides(config)
     cfg_path = _resolve_config_path(Path(explicit))
-    if cfg_path is not None:
-        config.update(_read_config_file(cfg_path) or {})
-        logger.info(f"DB Firewall: Loaded config from {cfg_path}")
+    config.update(_read_config_file(cfg_path))
+    logger.info(f"DB Firewall: Loaded config from {cfg_path}")
     return _apply_env_overrides(config)
 
 
-def _resolve_config_path(path: Path) -> Optional[Path]:
-    """A folder: the first config name in it, or None. A file: it must exist."""
+def _resolve_config_path(path: Path) -> Path:
+    """A folder: the first config name in it. A file: itself. Missing: raise."""
     if path.is_dir():
-        return next((path / n for n in CONFIG_NAMES if (path / n).is_file()), None)
+        found = next((path / n for n in CONFIG_NAMES if (path / n).is_file()), None)
+        if found is None:
+            raise FileNotFoundError(f"DB Firewall: no {'/'.join(CONFIG_NAMES)} in {path}")
+        return found
     if not path.is_file():
         raise FileNotFoundError(f"DB Firewall config not found: {path}")
     return path
 
 
-def _read_config_file(path: Path) -> Optional[dict]:
+def _read_config_file(path: Path) -> dict:
     with open(path) as f:
         if path.suffix == ".json":
-            return json.load(f)
-        if not HAS_YAML:
+            data = json.load(f)
+        elif HAS_YAML:
+            data = yaml.safe_load(f)
+        else:
             raise ImportError(f"PyYAML is required to read {path}: pip install pyyaml")
-        return yaml.safe_load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"DB Firewall: {path} must hold a mapping of settings, "
+                         f"got {type(data).__name__}")
+    return data
 
 
 def _warn_orphan_config() -> None:
@@ -134,7 +143,9 @@ def _warn_orphan_config() -> None:
         _warned_orphan_config = True
         logger.warning(f"DB Firewall: {found} in the current folder is NOT read. "
                        f"Set DB_FIREWALL_CONFIG={Path.cwd() / found} or pass "
-                       f"load_config(project_root=...). Using defaults.")
+                       f"load_config(project_root=...). Using built-in defaults: a "
+                       f"custom tenant_column in that file is NOT applied, so tables "
+                       f"that use it are unscoped.")
 
 
 def _apply_env_overrides(config: dict) -> dict:

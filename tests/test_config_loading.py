@@ -4,6 +4,7 @@ DB_FIREWALL_CONFIG env var. No silent current-folder or home-folder search,
 so a file dropped in the working directory cannot change the policy.
 """
 
+import copy
 import json
 import logging
 import os
@@ -66,10 +67,30 @@ class TestExplicitPath:
         _write(root / ".db-firewall.json", tenant_column="org_id")
         assert load_config(project_root=str(root))["tenant_column"] == "org_id"
 
-    def test_project_root_dir_without_file_gives_defaults(self, tmp_path):
-        root = tmp_path / "empty"
+    @pytest.mark.parametrize("via", ["arg", "env"])
+    def test_named_dir_without_file_raises(self, tmp_path, monkeypatch, via):
+        root = tmp_path / "app"
         root.mkdir()
-        assert load_config(project_root=str(root)) == DEFAULT_CONFIG
+        (root / "firewall.json").write_text('{"tenant_column": "org_id"}')   # wrong name
+        (root / ".db-firewall.yaml").mkdir()                               # a folder, not a file
+        if via == "env":
+            monkeypatch.setenv("DB_FIREWALL_CONFIG", str(root))
+        with pytest.raises(FileNotFoundError):
+            load_config(project_root=str(root) if via == "arg" else None)
+
+    @pytest.mark.parametrize("body", ["null", "[]", '[["fail_mode", "open"]]', '"x"', "3", ""])
+    def test_non_mapping_file_raises(self, tmp_path, body):
+        cfg = tmp_path / "fw.json"
+        cfg.write_text(body)
+        with pytest.raises(ValueError):
+            load_config(project_root=str(cfg))
+
+    def test_empty_yaml_raises(self, tmp_path):
+        pytest.importorskip("yaml")
+        cfg = tmp_path / "fw.yaml"
+        cfg.write_text("")
+        with pytest.raises(ValueError):
+            load_config(project_root=str(cfg))
 
     def test_project_root_file(self, tmp_path):
         cfg = _write(tmp_path / "firewall.json", tenant_column="org_id")
@@ -118,13 +139,13 @@ class TestExplicitPath:
 
 
 class TestDefaultsIsolation:
-    def test_mutating_result_leaves_defaults_alone(self):
+    def test_mutating_result_leaves_defaults_alone(self, monkeypatch):
+        snapshot = copy.deepcopy(DEFAULT_CONFIG)
+        monkeypatch.setattr(db_firewall, "DEFAULT_CONFIG", copy.deepcopy(DEFAULT_CONFIG))
         cfg = load_config()
         cfg["protect"]["select"] = False
         cfg["excluded_tables"].append("orders")
-        assert DEFAULT_CONFIG["protect"]["select"] is True
-        assert "orders" not in DEFAULT_CONFIG["excluded_tables"]
-        assert load_config()["protect"]["select"] is True
+        assert db_firewall.DEFAULT_CONFIG == snapshot
 
 
 class TestSqlAlchemyLoadsOnce:

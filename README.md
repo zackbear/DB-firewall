@@ -174,8 +174,10 @@ that tenant, or none, and restores the previous context when it ends.
 >
 > Config is no longer found automatically in the current folder or the home
 > folder. Set `DB_FIREWALL_CONFIG` to your file, or pass `project_root=`. Until
-> then the built-in defaults apply, and a `.db-firewall.*` file left in the
-> current folder is logged once as a warning. `sqlalchemy_event_hooks()` now
+> then the built-in defaults apply. If your file set a custom `tenant_column`
+> (for example `org_id`), tables that use it are NOT scoped until you set the
+> path. A `.db-firewall.*` file left in the current folder is logged once as a
+> warning. `sqlalchemy_event_hooks()` now
 > reads config once when you attach it, not on every query.
 >
 > `protect(conn, tenant_id="A")` no longer sets the shared tenant, so a later
@@ -246,7 +248,8 @@ current folder or your home folder, so a stray file cannot change the policy.
 
 - `DB_FIREWALL_CONFIG=/path/to/.db-firewall.yaml` (a file, or a folder that holds one), or
 - `load_config(project_root="/path/to/app")`, then pass the dict to `protect(conn, config=...)` or `sqlalchemy_event_hooks(engine, config=...)`.
-- Neither set: built-in defaults (`fail_mode: closed`). A named path that does not exist raises `FileNotFoundError`. A YAML file without PyYAML raises `ImportError`.
+- Use an absolute path. A relative one is resolved against the current folder each time config is read.
+- Neither set: built-in defaults (`fail_mode: closed`, `tenant_column: tenant_id`). A named file or folder with no config file raises `FileNotFoundError`. A file that does not hold a mapping (empty, `null`, a list) raises `ValueError`. A YAML file without PyYAML raises `ImportError`.
 - `DB_FIREWALL_TENANT_COLUMN`, `DB_FIREWALL_FAIL_MODE` and `DB_FIREWALL_REWRITER` override the file.
 
 Example `.db-firewall.yaml`:
