@@ -31,8 +31,12 @@ from middleware.db_firewall import (
 def get_connection(dsn: str):
     """Create a connection from a DSN string."""
     if dsn.startswith("postgresql://") or dsn.startswith("postgres://"):
-        import psycopg2
-        return psycopg2.connect(dsn)
+        try:
+            import psycopg                      # psycopg 3
+            return psycopg.connect(dsn)
+        except ImportError:
+            import psycopg2
+            return psycopg2.connect(dsn)
     elif dsn.startswith("mysql://") or dsn.startswith("mysql+"):
         import mysql.connector
         # Parse basic mysql:// URL
@@ -66,34 +70,38 @@ def scan_tables(connection, engine: str, config: dict) -> Dict[str, dict]:
 
     # Get all tables with tenant_id
     if engine == DBEngine.POSTGRESQL:
+        # Exact schema.table match (pg_class + pg_namespace), so a same-named
+        # table elsewhere cannot vouch for this one. Protected = RLS enabled AND
+        # forced (owners bypass unforced RLS) AND all four firewall policies.
         cursor.execute("""
-            SELECT c.table_name,
-                   EXISTS (
-                       SELECT 1 FROM pg_policies p
-                       WHERE p.tablename = c.table_name
-                         AND (p.policyname LIKE 'firewall_rls_%'       -- legacy names
-                              OR p.policyname = 'fw_' || left(md5(c.table_schema || '.' || c.table_name), 12) || '_sel')
-                   ) as has_policy,
-                   (SELECT relrowsecurity FROM pg_class
-                    WHERE relname = c.table_name) as rls_enabled
-            FROM information_schema.columns c
-            JOIN information_schema.tables t
-                ON c.table_name = t.table_name AND c.table_schema = t.table_schema
-            WHERE c.column_name = %s
-                AND t.table_type = 'BASE TABLE'
-                AND c.table_schema = 'public'
-            ORDER BY c.table_name
+            SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity,
+                   ARRAY(SELECT op FROM unnest(ARRAY['sel', 'ins', 'upd', 'del']) AS op
+                         WHERE NOT EXISTS (
+                             SELECT 1 FROM pg_policies p
+                             WHERE p.schemaname = n.nspname AND p.tablename = c.relname
+                               AND p.policyname IN (
+                                   'fw_' || left(md5(n.nspname || '.' || c.relname), 12) || '_' || op,
+                                   'firewall_rls_' || c.relname || '_' || op)))
+            FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relkind IN ('r', 'p') AND n.nspname = 'public'
+              AND EXISTS (SELECT 1 FROM pg_attribute a
+                          WHERE a.attrelid = c.oid AND a.attname = %s
+                            AND a.attnum > 0 AND NOT a.attisdropped)
+            ORDER BY c.relname
         """, (tenant_col,))
 
-        for row in cursor.fetchall():
-            table = row[0]
+        for table, enabled, forced, missing in cursor.fetchall():
             if _is_excluded_table(table, excluded):
                 continue
+            missing = sorted(missing)
             results[table] = {
                 "has_tenant_col": True,
-                "has_rls_policy": bool(row[1]),
-                "rls_enabled": bool(row[2]),
-                "protected": bool(row[1]) and bool(row[2])
+                "has_rls_policy": not missing,
+                "missing_policies": missing,
+                "rls_enabled": bool(enabled),
+                "rls_forced": bool(forced),
+                "protected": bool(enabled) and bool(forced) and not missing,
             }
 
     elif engine == DBEngine.MYSQL:

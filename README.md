@@ -224,6 +224,9 @@ What the wrapper does with each line from the agent:
 > and are removed: apply migrations with `psql`/`mysql`/`sqlcmd` or
 > `run_migration(conn)`, and audit with `hooks/scanner.py`. `run_migration()`
 > now finds `migrations/` and raises `FileNotFoundError` instead of logging.
+> The PostgreSQL scanner failed on every run (a literal `%` in a parameterised
+> query) and, had it run, accepted unforced RLS and a single policy. It now
+> uses psycopg 3 when installed, else psycopg2.
 
 ---
 
@@ -244,7 +247,7 @@ db-security-check:
 RUN python -m hooks.scanner --dsn $DATABASE_URL --strict
 ```
 
-The scanner returns exit code 1 if ANY table with a `tenant_id` column is missing RLS/VPD protection.
+The scanner returns exit code 1 if ANY table with a `tenant_id` column is missing RLS/VPD protection. On PostgreSQL a table counts as protected only when row-level security is enabled AND forced (table owners bypass unforced RLS) and all four firewall policies (select, insert, update, delete) exist on that exact `public.<table>`. The JSON report lists `missing_policies` and `rls_forced`.
 
 ---
 
