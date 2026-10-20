@@ -10,11 +10,12 @@ When you give an AI agent access to your database, it will happily run `SELECT *
 
 ## Quick Start
 
-### 1. Install and drop the config into your project root
+### 1. Install and point the firewall at your config
 
 ```bash
 pip install -r requirements.txt        # sqlglot (AST rewriter) + pyyaml
 cp config/firewall.yaml .db-firewall.yaml
+export DB_FIREWALL_CONFIG="$PWD/.db-firewall.yaml"
 ```
 
 ### 2. Run the migration for your database
@@ -171,6 +172,12 @@ that tenant, or none, and restores the previous context when it ends.
 > such requests have no tenant: blocked with `fail_mode: closed`, unscoped with
 > `open`. The first ignored header is logged as a warning.
 >
+> Config is no longer found automatically in the current folder or the home
+> folder. Set `DB_FIREWALL_CONFIG` to your file, or pass `project_root=`. Until
+> then the built-in defaults apply, and a `.db-firewall.*` file left in the
+> current folder is logged once as a warning. `sqlalchemy_event_hooks()` now
+> reads config once when you attach it, not on every query.
+>
 > `protect(conn, tenant_id="A")` no longer sets the shared tenant, so a later
 > `protect(other_conn)` without a tenant does not inherit "A". It falls back to
 > the `TENANT_ID` environment variable or `_firewall_tenant_map`, then fails
@@ -234,7 +241,15 @@ The scanner returns exit code 1 if ANY table with a `tenant_id` column is missin
 
 ## Configuration
 
-Create `.db-firewall.yaml` in your project root:
+The firewall reads config only from a path you name. It never searches the
+current folder or your home folder, so a stray file cannot change the policy.
+
+- `DB_FIREWALL_CONFIG=/path/to/.db-firewall.yaml` (a file, or a folder that holds one), or
+- `load_config(project_root="/path/to/app")`, then pass the dict to `protect(conn, config=...)` or `sqlalchemy_event_hooks(engine, config=...)`.
+- Neither set: built-in defaults (`fail_mode: closed`). A named path that does not exist raises `FileNotFoundError`. A YAML file without PyYAML raises `ImportError`.
+- `DB_FIREWALL_TENANT_COLUMN`, `DB_FIREWALL_FAIL_MODE` and `DB_FIREWALL_REWRITER` override the file.
+
+Example `.db-firewall.yaml`:
 
 ```yaml
 version: "1.0"

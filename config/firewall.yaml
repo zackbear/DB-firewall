@@ -1,10 +1,12 @@
 # ============================================================================
 # DB FIREWALL — Universal AI Agent Tenant Isolation
 # ============================================================================
-# Drop this file into any project root. The middleware auto-detects your
-# database engine and applies row-level security accordingly.
+# The middleware auto-detects your database engine and applies row-level
+# security accordingly. It reads this file only from an explicit path:
 #
-# Rename to: .db-firewall.yaml  (dotfile in project root)
+#   export DB_FIREWALL_CONFIG=/path/to/.db-firewall.yaml
+#
+# or load_config(project_root="/path/to/app"). No folder is searched.
 # ============================================================================
 
 version: "1.0"

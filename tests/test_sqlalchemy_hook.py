@@ -14,9 +14,8 @@ from db_firewall import sqlalchemy_event_hooks, TenantContext  # noqa: E402
 
 
 @pytest.fixture
-def engine(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)                       # no .db-firewall.yaml → defaults
-    monkeypatch.setattr(os.path, "expanduser", lambda p: str(tmp_path))
+def engine(monkeypatch):
+    monkeypatch.delenv("DB_FIREWALL_CONFIG", raising=False)   # defaults
     eng = create_engine("sqlite://", poolclass=sa.pool.StaticPool,
                         connect_args={"check_same_thread": False})
     with eng.begin() as c:

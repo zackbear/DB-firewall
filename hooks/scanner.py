@@ -240,7 +240,7 @@ if __name__ == "__main__":
     parser.add_argument("--strict", action="store_true",
                         help="Exit with code 1 if unprotected tables found")
     parser.add_argument("--json", action="store_true", help="Output as JSON")
-    parser.add_argument("--config", help="Path to config directory")
+    parser.add_argument("--config", help="Config file or folder (default: DB_FIREWALL_CONFIG)")
     parser.add_argument("--firestore-rules", metavar="PATH",
                         help="Fail if this firestore.rules file contains an open 'if true' rule")
 

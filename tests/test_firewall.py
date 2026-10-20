@@ -317,9 +317,8 @@ class TestSecurityAttacks:
         assert rewrite_query(sql, "TENANT_A", config) == \
             "SELECT * FROM orders WHERE orders.tenant_id = 'TENANT_A' AND (id = %s AND name = %(n)s)"
 
-    def test_env_var_selects_rewriter(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setattr(os.path, "expanduser", lambda p: str(tmp_path))
+    def test_env_var_selects_rewriter(self, monkeypatch):
+        monkeypatch.delenv("DB_FIREWALL_CONFIG", raising=False)
         monkeypatch.setenv("DB_FIREWALL_REWRITER", "regex")
         assert load_config()["rewriter"] == "regex"
         monkeypatch.delenv("DB_FIREWALL_REWRITER")

@@ -21,6 +21,7 @@ Usage:
     cursor.execute("SELECT * FROM orders")  # Only returns TENANT_A rows
 """
 
+import copy
 import os
 import re
 import time
@@ -81,36 +82,63 @@ DEFAULT_CONFIG = {
 }
 
 
+CONFIG_NAMES = (".db-firewall.yaml", ".db-firewall.yml", ".db-firewall.json")
+_warned_orphan_config = False
+
+
 def load_config(project_root: Optional[str] = None) -> dict:
-    """Load configuration from .db-firewall.yaml or environment."""
-    config = DEFAULT_CONFIG.copy()
+    """Load config from an explicit path only, then apply env overrides.
 
-    search_paths = []
-    if project_root:
-        search_paths.append(Path(project_root))
-    search_paths.extend([Path.cwd(), Path.home()])
-
-    for base in search_paths:
-        for name in [".db-firewall.yaml", ".db-firewall.yml", ".db-firewall.json"]:
-            cfg_path = base / name
-            if cfg_path.exists():
-                with open(cfg_path) as f:
-                    if name.endswith(".json"):
-                        user_config = json.load(f)
-                    elif HAS_YAML:
-                        user_config = yaml.safe_load(f)
-                    else:
-                        logger.warning("PyYAML not installed; using default config")
-                        continue
-                config.update(user_config or {})
-                logger.info(f"DB Firewall: Loaded config from {cfg_path}")
-                return _apply_env_overrides(config)
-
+    project_root (argument) or DB_FIREWALL_CONFIG (env var) may name a config
+    file or a folder holding .db-firewall.yaml/.yml/.json. Neither set: built-in
+    defaults. The current folder and home folder are never searched, so a file
+    dropped there cannot change the policy. A named file that is missing raises.
+    """
+    config = copy.deepcopy(DEFAULT_CONFIG)
+    explicit = project_root or os.environ.get("DB_FIREWALL_CONFIG")
+    if not explicit:
+        _warn_orphan_config()
+        return _apply_env_overrides(config)
+    cfg_path = _resolve_config_path(Path(explicit))
+    if cfg_path is not None:
+        config.update(_read_config_file(cfg_path) or {})
+        logger.info(f"DB Firewall: Loaded config from {cfg_path}")
     return _apply_env_overrides(config)
 
 
+def _resolve_config_path(path: Path) -> Optional[Path]:
+    """A folder: the first config name in it, or None. A file: it must exist."""
+    if path.is_dir():
+        return next((path / n for n in CONFIG_NAMES if (path / n).is_file()), None)
+    if not path.is_file():
+        raise FileNotFoundError(f"DB Firewall config not found: {path}")
+    return path
+
+
+def _read_config_file(path: Path) -> Optional[dict]:
+    with open(path) as f:
+        if path.suffix == ".json":
+            return json.load(f)
+        if not HAS_YAML:
+            raise ImportError(f"PyYAML is required to read {path}: pip install pyyaml")
+        return yaml.safe_load(f)
+
+
+def _warn_orphan_config() -> None:
+    """Upgrade aid: older versions read a config file from the current folder."""
+    global _warned_orphan_config
+    if _warned_orphan_config:
+        return
+    found = next((n for n in CONFIG_NAMES if (Path.cwd() / n).is_file()), None)
+    if found:
+        _warned_orphan_config = True
+        logger.warning(f"DB Firewall: {found} in the current folder is NOT read. "
+                       f"Set DB_FIREWALL_CONFIG={Path.cwd() / found} or pass "
+                       f"load_config(project_root=...). Using defaults.")
+
+
 def _apply_env_overrides(config: dict) -> dict:
-    """Environment variables win over both defaults and a discovered config file."""
+    """Environment variables win over both defaults and the config file."""
     for env, key in (("DB_FIREWALL_TENANT_COLUMN", "tenant_column"),
                      ("DB_FIREWALL_FAIL_MODE", "fail_mode"),
                      ("DB_FIREWALL_REWRITER", "rewriter")):
@@ -959,8 +987,8 @@ def protect(connection, tenant_id: Optional[str] = None,
                     1. The request's TenantContext
                     2. DB user mapping table
                     3. TENANT_ID environment variable
-        config:     Override configuration dict. If None, loads from
-                    .db-firewall.yaml or defaults.
+        config:     Override configuration dict. If None, load_config():
+                    DB_FIREWALL_CONFIG, else defaults.
 
     Returns:
         ProtectedConnection that silently filters all queries.
@@ -1178,7 +1206,7 @@ def django_middleware_class(tenant_id_source=None, trust_tenant_header: Optional
     return DBFirewallMiddleware
 
 
-def sqlalchemy_event_hooks(engine_instance):
+def sqlalchemy_event_hooks(engine_instance, config: Optional[dict] = None):
     """
     Attach tenant isolation to a SQLAlchemy engine.
 
@@ -1188,8 +1216,12 @@ def sqlalchemy_event_hooks(engine_instance):
 
         engine = create_engine(...)
         sqlalchemy_event_hooks(engine)
+
+    config is read once here, not per query. Pass one to override load_config().
     """
     from sqlalchemy import event
+    if config is None:
+        config = load_config()
 
     def _apply_tenant(dbapi_connection):
         tenant = TenantContext.get()
@@ -1223,7 +1255,6 @@ def sqlalchemy_event_hooks(engine_instance):
     @event.listens_for(engine_instance, "before_cursor_execute", retval=True)
     def before_execute(conn, cursor, statement, parameters, context, executemany):
         tenant = TenantContext.get()
-        config = load_config()
         dbapi_conn = conn.connection.dbapi_connection
         db_engine = detect_engine(dbapi_conn)
 
