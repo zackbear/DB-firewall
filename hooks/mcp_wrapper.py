@@ -58,6 +58,7 @@ SQL_KEYWORDS = frozenset("""
 _LEADING_NOISE = re.compile(r"(?:\s+|--[^\n]*(?:\n|$)|#[^\n]*(?:\n|$)|/\*.*?\*/|[;(])*", re.S)
 _FIRST_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
 _LABEL = re.compile(r"\s*:(?!:)")
+_KEY_SQL_CHARS = re.compile(r"[\s;(),'\"`*#-]")
 _ANY_KEYWORD = re.compile(r"\b(?:" + "|".join(sorted(SQL_KEYWORDS)) + r")\b", re.I)
 
 
@@ -72,23 +73,26 @@ def looks_like_sql(s: str) -> bool:
         # Comments can hide where a statement starts (nested /* */ in
         # PostgreSQL, /*! */ executable comments in MySQL): any keyword counts.
         return bool(_ANY_KEYWORD.search(s))
-    word = _FIRST_WORD.match(s, _LEADING_NOISE.match(s).end())
-    if not word:
-        return False
-    if word.group().lower().startswith(("sp_", "xp_")):
-        return True                     # T-SQL runs a leading procedure name without EXEC
-    label = _LABEL.match(s, word.end())
-    if label:                           # T-SQL label "lbl: SELECT ...": check the next word
-        word = _FIRST_WORD.match(s, _LEADING_NOISE.match(s, label.end()).end())
-        return bool(word) and word.group().upper() in SQL_KEYWORDS
-    return word.group().upper() in SQL_KEYWORDS
+    pos = 0
+    while True:
+        word = _FIRST_WORD.match(s, _LEADING_NOISE.match(s, pos).end())
+        if not word:
+            return False
+        if word.group().lower().startswith(("sp_", "xp_")):
+            return True                 # T-SQL runs a leading procedure name without EXEC
+        label = _LABEL.match(s, word.end())
+        if not label:
+            return word.group().upper() in SQL_KEYWORDS
+        pos = label.end()               # T-SQL label "lbl: SELECT ...": check the next word
 
 
 def _scope(value, tenant_id: str, config: dict):
     """Rewrite every SQL-looking string at any depth. Raises when one cannot be scoped."""
     if isinstance(value, dict):
         for k in value:
-            if looks_like_sql(k):       # keys are not rewritten, so SQL there is refused
+            # Keys are not rewritten, so a key that could be a statement is refused.
+            # A bare identifier ("table", "values") cannot name and read a table.
+            if _KEY_SQL_CHARS.search(k) and looks_like_sql(k):
                 raise PermissionError(f"DB Firewall: SQL in an object key: {k[:80]!r}")
         return {k: _scope(v, tenant_id, config) for k, v in value.items()}
     if isinstance(value, list):

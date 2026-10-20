@@ -56,6 +56,7 @@ class TestLooksLikeSql:
         "MERGE INTO orders USING x ON 1=1 WHEN MATCHED THEN DELETE",
         "sp_executesql N'SELECT * FROM orders'", "xp_cmdshell 'dir'",
         "lbl: SELECT * FROM orders", "CHECK TABLE orders", "RECEIVE * FROM q",
+        "a: b: SELECT * FROM orders", "lbl: sp_executesql N'SELECT 1'",
     ])
     def test_sql(self, s):
         assert looks_like_sql(s)
@@ -94,6 +95,11 @@ class TestScoping:
     def test_sql_in_object_key_refused(self, cfg):
         with pytest.raises(PermissionError):
             intercept_sql_in_tool_call(_call({"SELECT * FROM orders": 1}), "A", cfg)
+
+    @pytest.mark.parametrize("args", [{"table": "orders"}, {"values": [1]}, {"set": {"a": 1}},
+                                      {"check": True}, {"start": 1, "end": 5}, {"desc": "x"}])
+    def test_keyword_named_keys_pass(self, cfg, args):
+        assert intercept_sql_in_tool_call(_call(dict(args)), "A", cfg)["params"]["arguments"] == args
 
     def test_non_string_name_is_scoped(self, cfg):
         msg = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
