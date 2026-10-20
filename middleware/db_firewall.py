@@ -956,7 +956,7 @@ def protect(connection, tenant_id: Optional[str] = None,
     Args:
         connection: Any DB-API 2.0 connection (psycopg2, mysql-connector, etc.)
         tenant_id:  Explicit tenant ID. If None, resolves from:
-                    1. Thread-local TenantContext
+                    1. The request's TenantContext
                     2. DB user mapping table
                     3. TENANT_ID environment variable
         config:     Override configuration dict. If None, loads from
@@ -1107,14 +1107,28 @@ def _request_tenant(verified, headers, trust_header: bool) -> Optional[str]:
         return None
 
 
-def _stream_as(tenant: Optional[str], content):
-    """Iterate a streaming body as the request's tenant. A WSGI server reads the
-    body after the middleware has returned and restored the outer context."""
-    token = TenantContext.enter(tenant)
-    try:
-        yield from content
-    finally:
-        TenantContext.exit(token)
+class _ScopedStream:
+    """Iterate a streaming body as the request's tenant, inside a private copy
+    of the context. A WSGI server reads the body after the middleware has
+    returned. The caller's context is never changed, so a body read late, read
+    in pieces, finalized by the garbage collector, or interleaved with another
+    stream cannot set a tenant in some other request."""
+
+    def __init__(self, tenant: Optional[str], content):
+        self._ctx = contextvars.copy_context()
+        self._ctx.run(_TENANT_VAR.set, tenant)
+        self._it = iter(content)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return self._ctx.run(next, self._it)
+
+    def close(self):                    # Django calls this when the response closes
+        close = getattr(self._it, "close", None)
+        if close is not None:
+            self._ctx.run(close)
 
 
 def _django_default_source(request):
@@ -1158,7 +1172,7 @@ def django_middleware_class(tenant_id_source=None, trust_tenant_header: Optional
             content = getattr(response, "streaming_content", None)
             if getattr(response, "streaming", False) and content is not None \
                     and not hasattr(content, "__aiter__"):  # async bodies: [Unverified], not wrapped
-                response.streaming_content = _stream_as(tenant, content)
+                response.streaming_content = _ScopedStream(tenant, content)
             return response
 
     return DBFirewallMiddleware

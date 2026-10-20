@@ -224,6 +224,32 @@ class TestDjango:
         assert list(response.streaming_content) == ["A", "A"]
         assert get_tenant() == "Z"
 
+    def _streaming_view(self, chunks=3):
+        def view(req):
+            body = (get_tenant() for _ in range(chunks))
+            return SimpleNamespace(streaming=True, streaming_content=body)
+        return view
+
+    def test_late_finalized_stream_does_not_touch_later_request(self):
+        import gc
+        mw = django_middleware_class(tenant_id_source=lambda r: "A")(self._streaming_view())
+        stream = mw(_django_request()).streaming_content
+        assert next(stream) == "A"          # partly read, never closed
+        token = TenantContext.enter("D")    # next request on the same thread
+        del stream
+        gc.collect()                        # finalized mid-request
+        assert get_tenant() == "D"
+        TenantContext.exit(token)
+
+    def test_interleaved_streams_keep_own_tenant(self):
+        mw_c = django_middleware_class(tenant_id_source=lambda r: "C")(self._streaming_view())
+        mw_d = django_middleware_class(tenant_id_source=lambda r: "D")(self._streaming_view())
+        c = mw_c(_django_request()).streaming_content
+        d = mw_d(_django_request()).streaming_content
+        seen = [next(c), next(d), next(c), next(d)]
+        assert seen == ["C", "D", "C", "D"]
+        assert get_tenant() is None         # the caller's context is untouched
+
     def test_ignored_header_logged_once(self, caplog, monkeypatch):
         monkeypatch.setattr(db_firewall, "_warned_untrusted_header", False)
         with caplog.at_level(logging.WARNING, logger="db_firewall"):

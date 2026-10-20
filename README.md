@@ -170,6 +170,12 @@ that tenant, or none, and restores the previous context when it ends.
 > or set `trust_tenant_header: true` behind an authenticating gateway. Until then,
 > such requests have no tenant: blocked with `fail_mode: closed`, unscoped with
 > `open`. The first ignored header is logged as a warning.
+>
+> `protect(conn, tenant_id="A")` no longer sets the shared tenant, so a later
+> `protect(other_conn)` without a tenant does not inherit "A". It falls back to
+> the `TENANT_ID` environment variable or `_firewall_tenant_map`, then fails
+> closed. Pass `tenant_id=` to every `protect()` call, or wrap the work in
+> `tenant_scope("A")`.
 
 ---
 
