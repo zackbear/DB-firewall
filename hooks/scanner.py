@@ -72,36 +72,50 @@ def scan_tables(connection, engine: str, config: dict) -> Dict[str, dict]:
     if engine == DBEngine.POSTGRESQL:
         # Exact schema.table match (pg_class + pg_namespace), so a same-named
         # table elsewhere cannot vouch for this one. Protected = RLS enabled AND
-        # forced (owners bypass unforced RLS) AND all four firewall policies.
+        # forced (owners bypass unforced RLS) AND all four firewall policies AND
+        # no other PERMISSIVE policy: PostgreSQL ORs permissive policies, so one
+        # extra "USING (true)" opens every row.
         cursor.execute("""
-            SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity,
+            WITH t AS (
+                SELECT c.oid, n.nspname, c.relname, c.relrowsecurity, c.relforcerowsecurity,
+                       'fw_' || left(md5(n.nspname || '.' || c.relname), 12) AS stem,
+                       'firewall_rls_' || c.relname AS legacy
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE c.relkind IN ('r', 'p') AND n.nspname = 'public'
+                  AND EXISTS (SELECT 1 FROM pg_attribute a
+                              WHERE a.attrelid = c.oid AND a.attname = %s
+                                AND a.attnum > 0 AND NOT a.attisdropped)
+            )
+            SELECT t.relname, t.relrowsecurity, t.relforcerowsecurity,
                    ARRAY(SELECT op FROM unnest(ARRAY['sel', 'ins', 'upd', 'del']) AS op
                          WHERE NOT EXISTS (
                              SELECT 1 FROM pg_policies p
-                             WHERE p.schemaname = n.nspname AND p.tablename = c.relname
-                               AND p.policyname IN (
-                                   'fw_' || left(md5(n.nspname || '.' || c.relname), 12) || '_' || op,
-                                   'firewall_rls_' || c.relname || '_' || op)))
-            FROM pg_class c
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE c.relkind IN ('r', 'p') AND n.nspname = 'public'
-              AND EXISTS (SELECT 1 FROM pg_attribute a
-                          WHERE a.attrelid = c.oid AND a.attname = %s
-                            AND a.attnum > 0 AND NOT a.attisdropped)
-            ORDER BY c.relname
+                             WHERE p.schemaname = t.nspname AND p.tablename = t.relname
+                               AND p.policyname IN (t.stem || '_' || op, t.legacy || '_' || op))),
+                   ARRAY(SELECT p.policyname FROM pg_policies p
+                         WHERE p.schemaname = t.nspname AND p.tablename = t.relname
+                           AND p.permissive = 'PERMISSIVE'
+                           AND p.policyname NOT IN (
+                               SELECT pre || '_' || op
+                               FROM unnest(ARRAY[t.stem, t.legacy]) AS pre,
+                                    unnest(ARRAY['sel', 'ins', 'upd', 'del']) AS op))
+            FROM t
+            ORDER BY t.relname
         """, (tenant_col,))
 
-        for table, enabled, forced, missing in cursor.fetchall():
+        for table, enabled, forced, missing, extra in cursor.fetchall():
             if _is_excluded_table(table, excluded):
                 continue
-            missing = sorted(missing)
+            missing, extra = sorted(missing), sorted(extra)
             results[table] = {
                 "has_tenant_col": True,
                 "has_rls_policy": not missing,
                 "missing_policies": missing,
+                "extra_permissive_policies": extra,
                 "rls_enabled": bool(enabled),
                 "rls_forced": bool(forced),
-                "protected": bool(enabled) and bool(forced) and not missing,
+                "protected": bool(enabled) and bool(forced) and not missing and not extra,
             }
 
     elif engine == DBEngine.MYSQL:

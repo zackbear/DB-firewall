@@ -53,13 +53,17 @@ class TestLooksLikeSql:
         "-- c\nINSERT INTO orders VALUES (1)", "# c\nREPLACE INTO orders VALUES (1)",
         "/* /* */ */ DELETE FROM orders", "/*!DELETE FROM orders*/",
         "EXEC sp_who", "IF 1=1 DELETE FROM orders", "COPY orders TO STDOUT",
+        "MERGE INTO orders USING x ON 1=1 WHEN MATCHED THEN DELETE",
+        "sp_executesql N'SELECT * FROM orders'", "xp_cmdshell 'dir'",
+        "lbl: SELECT * FROM orders", "CHECK TABLE orders", "RECEIVE * FROM q",
     ])
     def test_sql(self, s):
         assert looks_like_sql(s)
 
     @pytest.mark.parametrize("s", [
         "", "hello", "Please pick a colour", "select_rows", "orders", "42",
-        "https://example.com/select", "Total -- about 40",
+        "https://example.com/select", "Total -- about 40", "Note: ring me later",
+        "a::text",
     ])
     def test_not_sql(self, s):
         assert not looks_like_sql(s)
@@ -86,6 +90,19 @@ class TestScoping:
     def test_sql_outside_arguments_is_scoped(self, cfg):
         msg = intercept_sql_in_tool_call(_call({}, sql="SELECT * FROM orders"), "A", cfg)
         assert msg["params"]["sql"] == SCOPED
+
+    def test_sql_in_object_key_refused(self, cfg):
+        with pytest.raises(PermissionError):
+            intercept_sql_in_tool_call(_call({"SELECT * FROM orders": 1}), "A", cfg)
+
+    def test_non_string_name_is_scoped(self, cfg):
+        msg = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+               "params": {"name": {"sql": "SELECT * FROM orders"}}}
+        assert intercept_sql_in_tool_call(msg, "A", cfg)["params"]["name"]["sql"] == SCOPED
+
+    def test_list_params_are_scoped(self, cfg):
+        msg = {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": ["SELECT * FROM orders"]}
+        assert intercept_sql_in_tool_call(msg, "A", cfg)["params"] == [SCOPED]
 
     def test_other_methods_pass(self, cfg):
         msg = {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
@@ -129,6 +146,25 @@ class TestHandleLine:
         b'"just a string"\n',
     ])
     def test_unparseable_line_is_dropped(self, cfg, raw):
+        assert handle_line(raw, "A", cfg) == (None, None)
+
+    def test_deeply_nested_line_is_dropped(self, cfg):
+        raw = b'{"a":' * 200_000 + b'1' + b'}' * 200_000 + b"\n"
+        assert handle_line(raw, "A", cfg) == (None, None)
+
+    def test_deep_arguments_refused_not_crashed(self, cfg):
+        # Deep enough to exceed the Python recursion limit in the scoping walk,
+        # shallow enough for the C JSON decoder on 3.12+ (3.11 drops it at parse).
+        deep = "[" * 1500 + '"SELECT * FROM orders"' + "]" * 1500
+        raw = ('{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"arguments":{"q":'
+               + deep + '}}}\n').encode()
+        fwd, reply = handle_line(raw, "A", cfg)
+        assert fwd is None
+        if sys.version_info >= (3, 12):
+            assert json.loads(reply)["id"] == 9
+
+    def test_nan_line_is_dropped(self, cfg):
+        raw = b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"arguments":{"n":NaN}}}\n'
         assert handle_line(raw, "A", cfg) == (None, None)
 
     def test_blank_line_ignored(self, cfg):

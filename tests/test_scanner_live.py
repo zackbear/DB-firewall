@@ -26,11 +26,17 @@ from middleware.db_firewall import DBEngine, load_config  # noqa: E402
 
 FULL, NO_RLS, NOT_FORCED, SEL_ONLY, SHADOW = (
     "sc_full", "sc_no_rls", "sc_not_forced", "sc_sel_only", "sc_shadow")
+NOT_ENABLED, LEGACY, OPEN_EXTRA, RESTRICT_EXTRA, PART, DROPPED, LEGACY_SHADOW = (
+    "sc_not_enabled", "sc_legacy", "sc_open_extra", "sc_restrict_extra", "sc_part",
+    "sc_dropped", "sc_legacy_shadow")
+ALL = (FULL, NO_RLS, NOT_FORCED, SEL_ONLY, SHADOW, NOT_ENABLED, LEGACY, OPEN_EXTRA,
+       RESTRICT_EXTRA, LEGACY_SHADOW)
 OPS = {"sel": "SELECT", "ins": "INSERT", "upd": "UPDATE", "del": "DELETE"}
 
 
-def _policies(c, schema, table, ops):
-    stem = c.execute("SELECT 'fw_' || left(md5(%s || '.' || %s), 12)", (schema, table)).fetchone()[0]
+def _policies(c, schema, table, ops, legacy=False):
+    stem = (f"firewall_rls_{table}" if legacy else
+            c.execute("SELECT 'fw_' || left(md5(%s || '.' || %s), 12)", (schema, table)).fetchone()[0])
     for suffix in ops:
         clause = "WITH CHECK (true)" if suffix == "ins" else "USING (true)"
         c.execute(f'CREATE POLICY "{stem}_{suffix}" ON {schema}.{table} FOR {OPS[suffix]} {clause}')
@@ -41,14 +47,28 @@ def db():
     with psycopg.connect(DSN, autocommit=True) as c:
         c.execute("DROP SCHEMA IF EXISTS sc_other CASCADE")
         c.execute("CREATE SCHEMA sc_other")
-        for t in (FULL, NO_RLS, NOT_FORCED, SEL_ONLY, SHADOW):
+        c.execute(f"DROP TABLE IF EXISTS public.{PART}, public.{DROPPED}")
+        for t in ALL:
             c.execute(f"DROP TABLE IF EXISTS public.{t}")
             c.execute(f"CREATE TABLE public.{t} (id int, tenant_id text)")
-        for t in (FULL, NOT_FORCED, SEL_ONLY):
+        for t in (FULL, NOT_FORCED, SEL_ONLY, LEGACY, OPEN_EXTRA, RESTRICT_EXTRA):
             c.execute(f"ALTER TABLE public.{t} ENABLE ROW LEVEL SECURITY")
-        for t in (FULL, SEL_ONLY):
+        for t in (FULL, SEL_ONLY, NOT_ENABLED, LEGACY, OPEN_EXTRA, RESTRICT_EXTRA):
             c.execute(f"ALTER TABLE public.{t} FORCE ROW LEVEL SECURITY")
-        _policies(c, "public", FULL, OPS)
+        for t in (FULL, NOT_ENABLED, OPEN_EXTRA, RESTRICT_EXTRA):
+            _policies(c, "public", t, OPS)
+        _policies(c, "public", LEGACY, OPS, legacy=True)
+        c.execute(f"CREATE POLICY open_all ON public.{OPEN_EXTRA} USING (true)")
+        c.execute(f"CREATE POLICY narrow ON public.{RESTRICT_EXTRA} AS RESTRICTIVE USING (id > 0)")
+        # Partitioned table with tenant_id; a table whose tenant_id column was dropped.
+        c.execute(f"CREATE TABLE public.{PART} (id int, tenant_id text) PARTITION BY RANGE (id)")
+        c.execute(f"CREATE TABLE public.{DROPPED} (id int, tenant_id text)")
+        c.execute(f"ALTER TABLE public.{DROPPED} DROP COLUMN tenant_id")
+        # Legacy-named policies on a same-named table in another schema must not count.
+        c.execute(f"CREATE TABLE sc_other.{LEGACY_SHADOW} (id int, tenant_id text)")
+        c.execute(f"ALTER TABLE public.{LEGACY_SHADOW} ENABLE ROW LEVEL SECURITY")
+        c.execute(f"ALTER TABLE public.{LEGACY_SHADOW} FORCE ROW LEVEL SECURITY")
+        _policies(c, "sc_other", LEGACY_SHADOW, OPS, legacy=True)
         _policies(c, "public", NOT_FORCED, OPS)
         _policies(c, "public", SEL_ONLY, ["sel"])
         # Same name in another schema, fully protected: must not vouch for public.sc_shadow.
@@ -58,7 +78,7 @@ def db():
         _policies(c, "public", SHADOW, [])          # nothing on the public one
         _policies(c, "sc_other", SHADOW, OPS)
         yield c
-        for t in (FULL, NO_RLS, NOT_FORCED, SEL_ONLY, SHADOW):
+        for t in ALL + (PART, DROPPED):
             c.execute(f"DROP TABLE IF EXISTS public.{t}")
         c.execute("DROP SCHEMA sc_other CASCADE")
 
@@ -68,11 +88,22 @@ def results(db):
     return scan_tables(db, DBEngine.POSTGRESQL, load_config())
 
 
-def test_fully_protected(results):
-    assert results[FULL]["protected"] is True
+@pytest.mark.parametrize("table", [FULL, LEGACY, RESTRICT_EXTRA])
+def test_fully_protected(results, table):
+    assert results[table]["protected"] is True
 
 
-@pytest.mark.parametrize("table", [NO_RLS, NOT_FORCED, SEL_ONLY, SHADOW])
+def test_extra_permissive_policy_reported(results):
+    assert results[OPEN_EXTRA]["extra_permissive_policies"] == ["open_all"]
+
+
+def test_partitioned_scanned_dropped_column_ignored(results):
+    assert results[PART]["protected"] is False
+    assert DROPPED not in results
+
+
+@pytest.mark.parametrize("table", [NO_RLS, NOT_FORCED, SEL_ONLY, SHADOW, NOT_ENABLED,
+                                   OPEN_EXTRA, LEGACY_SHADOW])
 def test_not_protected(results, table):
     assert results[table]["protected"] is False
 

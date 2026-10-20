@@ -52,10 +52,12 @@ SQL_KEYWORDS = frozenset("""
     REINDEX RELEASE RENAME REPAIR REPLACE RESET RESTORE RETURN REVOKE ROLLBACK
     SAVEPOINT SECURITY SELECT SET SHOW START TABLE THROW TRUNCATE UNINSTALL UNLISTEN
     UPDATE UPSERT USE VACUUM VALUES WAITFOR WHILE WITH XA
+    AUDIT CHECK FLASHBACK NOAUDIT READTEXT RECEIVE SEND SHUTDOWN UPDATETEXT WRITETEXT
 """.split())
 
 _LEADING_NOISE = re.compile(r"(?:\s+|--[^\n]*(?:\n|$)|#[^\n]*(?:\n|$)|/\*.*?\*/|[;(])*", re.S)
 _FIRST_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
+_LABEL = re.compile(r"\s*:(?!:)")
 _ANY_KEYWORD = re.compile(r"\b(?:" + "|".join(sorted(SQL_KEYWORDS)) + r")\b", re.I)
 
 
@@ -71,12 +73,23 @@ def looks_like_sql(s: str) -> bool:
         # PostgreSQL, /*! */ executable comments in MySQL): any keyword counts.
         return bool(_ANY_KEYWORD.search(s))
     word = _FIRST_WORD.match(s, _LEADING_NOISE.match(s).end())
-    return bool(word) and word.group().upper() in SQL_KEYWORDS
+    if not word:
+        return False
+    if word.group().lower().startswith(("sp_", "xp_")):
+        return True                     # T-SQL runs a leading procedure name without EXEC
+    label = _LABEL.match(s, word.end())
+    if label:                           # T-SQL label "lbl: SELECT ...": check the next word
+        word = _FIRST_WORD.match(s, _LEADING_NOISE.match(s, label.end()).end())
+        return bool(word) and word.group().upper() in SQL_KEYWORDS
+    return word.group().upper() in SQL_KEYWORDS
 
 
 def _scope(value, tenant_id: str, config: dict):
     """Rewrite every SQL-looking string at any depth. Raises when one cannot be scoped."""
     if isinstance(value, dict):
+        for k in value:
+            if looks_like_sql(k):       # keys are not rewritten, so SQL there is refused
+                raise PermissionError(f"DB Firewall: SQL in an object key: {k[:80]!r}")
         return {k: _scope(v, tenant_id, config) for k, v in value.items()}
     if isinstance(value, list):
         return [_scope(v, tenant_id, config) for v in value]
@@ -99,8 +112,15 @@ def intercept_sql_in_tool_call(message: dict, tenant_id: str, config: dict) -> d
         return message
     params = message.get("params")
     if isinstance(params, dict):
-        message["params"] = {k: (v if k == "name" else _scope(v, tenant_id, config))
-                             for k, v in params.items()}
+        name = params.get("name")
+        rest = {k: v for k, v in params.items() if not (k == "name" and isinstance(v, str))}
+        params = _scope(rest, tenant_id, config)
+        if isinstance(name, str):
+            params["name"] = name       # the tool name is never SQL
+    else:
+        params = _scope(params, tenant_id, config)
+    if "params" in message:
+        message["params"] = params
     return message
 
 
@@ -135,16 +155,19 @@ def handle_line(raw: bytes, tenant_id: str, config: dict) -> Tuple[Optional[byte
         message = json.loads(raw)
         if isinstance(message, list):
             results = [_process(m, tenant_id, config) for m in message]
-            fwd = [f for f, _ in results if f is not None]
-            err = [e for _, e in results if e is not None]
-            return ((json.dumps(fwd) + "\n").encode() if fwd else None,
-                    (json.dumps(err) + "\n").encode() if err else None)
-        fwd, err = _process(message, tenant_id, config)
-    except (ValueError, UnicodeDecodeError) as exc:   # JSONDecodeError is a ValueError
+            fwd = [f for f, _ in results if f is not None] or None
+            err = [e for _, e in results if e is not None] or None
+        else:
+            fwd, err = _process(message, tenant_id, config)
+        return _encode(fwd), _encode(err)
+    except (ValueError, RecursionError) as exc:   # JSONDecodeError, UnicodeDecodeError, deep nesting
         print(f"[DB Firewall] Dropped unparseable line: {exc}", file=sys.stderr)
         return None, None
-    return ((json.dumps(fwd) + "\n").encode() if fwd is not None else None,
-            (json.dumps(err) + "\n").encode() if err is not None else None)
+
+
+def _encode(obj) -> Optional[bytes]:
+    # allow_nan=False: NaN/Infinity are not JSON; such a line is dropped, not re-emitted
+    return None if obj is None else (json.dumps(obj, allow_nan=False) + "\n").encode()
 
 
 def proxy_stdio(tenant_id: str, child_command: list, config: dict):
