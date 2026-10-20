@@ -71,15 +71,19 @@ conn = protect(raw_connection, tenant_id="TENANT_A")
 
 **Django:**
 ```python
-# settings.py — use the dotted class path, NOT a function call expression
-MIDDLEWARE = ['db_firewall.django.TenantFirewallMiddleware', ...]
+# myapp/middleware.py — build the class once, then reference it by dotted path
+from db_firewall import django_middleware_class
+TenantMiddleware = django_middleware_class()   # default: request.tenant_id or session["tenant_id"]
+
+# settings.py — after your auth middleware, so request.tenant_id is set
+MIDDLEWARE = [..., 'myapp.middleware.TenantMiddleware']
 ```
 
 **FastAPI:**
 ```python
 from db_firewall import fastapi_middleware
-# tenant_id_source: callable that extracts tenant from request (JWT claim, header, etc.)
-fastapi_middleware(app, tenant_id_source=lambda req: req.headers.get("X-Tenant-ID"))
+# tenant_id_source: callable(request) -> tenant from a VERIFIED source (JWT claim, session)
+fastapi_middleware(app, tenant_id_source=lambda req: req.state.user.tenant_id)
 ```
 
 **Flask:**
@@ -88,6 +92,13 @@ from db_firewall import flask_hooks
 # tenant_id_source: callable that extracts tenant from Flask request context
 flask_hooks(app, tenant_id_source=lambda: g.tenant_id)
 ```
+
+All three web integrations ignore `X-Tenant-ID` unless you pass
+`trust_tenant_header=True` (or set it in config), and never read `?tenant_id=`.
+Any client can send that header, so trust it only behind a gateway that
+authenticates the caller and overwrites any client-sent value. Register
+`flask_hooks(app)` after your auth hook. Jobs sent to your own thread pool need
+`contextvars.copy_context().run(...)` to see the request's tenant.
 
 **SQLAlchemy:**
 ```python
