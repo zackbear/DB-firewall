@@ -110,7 +110,7 @@ sqlalchemy_event_hooks(engine)
 ```json
 {
   "command": "python",
-  "args": ["-m", "db_firewall.mcp_wrapper", "--tenant", "TENANT_A",
+  "args": ["-m", "hooks.mcp_wrapper", "--tenant", "TENANT_A",
            "--", "npx", "-y", "@mcp/server-postgres", "postgresql://..."]
 }
 ```
@@ -121,7 +121,7 @@ sqlalchemy_event_hooks(engine)
 
 ```yaml
 - name: DB Firewall Security Check
-  run: python -m db_firewall.scanner --dsn $DATABASE_URL --strict
+  run: python -m hooks.scanner --dsn $DATABASE_URL --strict
 ```
 
 The scanner detects tables without RLS policies applied. `--strict` fails the build on any unprotected table. Run `hooks/scanner.py` locally first to review output before adding to CI.

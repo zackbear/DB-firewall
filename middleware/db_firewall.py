@@ -1312,6 +1312,9 @@ def flask_hooks(app, tenant_id_source=None, trust_tenant_header: Optional[bool] 
 # CLI — Run migrations
 # ============================================================================
 
+MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
+
+
 def run_migration(connection, engine: Optional[str] = None):
     """
     Run the appropriate migration script for the detected database engine.
@@ -1319,8 +1322,6 @@ def run_migration(connection, engine: Optional[str] = None):
     """
     if engine is None:
         engine = detect_engine(connection)
-
-    migration_dir = Path(__file__).parent / "migrations"
 
     engine_file_map = {
         DBEngine.POSTGRESQL: "001_postgresql.sql",
@@ -1334,10 +1335,10 @@ def run_migration(connection, engine: Optional[str] = None):
         logger.info(f"DB Firewall: No migration needed for {engine} (middleware-only enforcement)")
         return
 
-    migration_path = migration_dir / filename
-    if not migration_path.exists():
-        logger.error(f"DB Firewall: Migration file not found: {migration_path}")
-        return
+    migration_path = MIGRATIONS_DIR / filename
+    if not migration_path.is_file():
+        # Returning here would leave the database without row-level security.
+        raise FileNotFoundError(f"DB Firewall: migration file not found: {migration_path}")
 
     sql = migration_path.read_text()
     cursor = connection.cursor()
@@ -1365,9 +1366,9 @@ def run_migration(connection, engine: Optional[str] = None):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="DB Firewall CLI")
-    parser.add_argument("command", choices=["migrate", "check", "info"])
-    parser.add_argument("--dsn", help="Database connection string")
-    parser.add_argument("--tenant", help="Test tenant ID")
+    # ponytail: "info" only. Apply migrations with psql/mysql/sqlcmd (README)
+    # or run_migration(conn); audit coverage with hooks/scanner.py.
+    parser.add_argument("command", choices=["info"])
     args = parser.parse_args()
 
     print(f"DB Firewall v1.0 — Universal AI Agent Tenant Isolation")

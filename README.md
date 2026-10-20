@@ -209,6 +209,22 @@ Wrap any MCP database server to auto-inject tenant isolation:
 }
 ```
 
+What the wrapper does with each line from the agent:
+
+- `tools/call`: every string that looks like SQL is scoped to the tenant, under any argument name and at any depth (nested objects, lists). A string counts as SQL when its first word is a SQL statement keyword, or when it holds a comment marker (`/*`, `--`, `#`) and any keyword.
+- SQL the rewriter cannot scope (DDL, multiple statements, `COPY`, `CALL`, ...) gets a JSON-RPC error and never reaches the server.
+- A line that is not a JSON object or array is dropped, not passed through.
+- Limit: prose that starts with a keyword ("Update the report") is treated as SQL, so it is rewritten or refused.
+- Defence in depth: run the migrations and give the wrapped server a role without `BYPASSRLS`, so row-level security still blocks anything a string check misses.
+
+> **Upgrading:** earlier versions rewrote only the top-level `query`, `sql`,
+> `statement`, `command` and `code` arguments, passed non-JSON lines through
+> unchanged, and stopped proxying after the first refused query. The
+> `migrate` and `check` commands of `middleware/db_firewall.py` did nothing
+> and are removed: apply migrations with `psql`/`mysql`/`sqlcmd` or
+> `run_migration(conn)`, and audit with `hooks/scanner.py`. `run_migration()`
+> now finds `migrations/` and raises `FileNotFoundError` instead of logging.
+
 ---
 
 ## CI/CD Security Gate
