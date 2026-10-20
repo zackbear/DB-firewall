@@ -29,6 +29,7 @@ import logging
 import hashlib
 import threading
 import functools
+import contextvars
 import weakref
 from pathlib import Path
 from typing import Optional, Dict, List, Any, Union
@@ -62,6 +63,10 @@ DEFAULT_CONFIG = {
     # the firewall's. Refused unless this is true (then RLS WITH CHECK is the
     # only guard on it).
     "allow_tenant_placeholder": False,
+    # Web integrations: trust the X-Tenant-ID request header only when an
+    # upstream gateway sets it after authenticating the caller. Any client can
+    # send that header, so it is off by default. ?tenant_id= is never trusted.
+    "trust_tenant_header": False,
     "protect": {"select": True, "insert": True, "update": True, "delete": True},
     "audit": {"enabled": True, "table_name": "_firewall_audit_log", "retention_days": 90},
     # Empty by default: managed Postgres (Supabase, Neon, RDS) apps often connect
@@ -175,22 +180,28 @@ def detect_engine(connection) -> str:
 # TENANT CONTEXT MANAGER
 # ============================================================================
 
-class TenantContext:
-    """Thread-safe tenant context store."""
+_TENANT_VAR: contextvars.ContextVar = contextvars.ContextVar("db_firewall_tenant", default=None)
 
-    _local = threading.local()
+
+class TenantContext:
+    """Request-scoped tenant store.
+
+    A ContextVar keeps each thread AND each asyncio task separate. threading.local
+    did not: two async requests on one event-loop thread overwrote each other's
+    tenant, and sync endpoints run in a thread pool never saw it at all.
+    """
 
     @classmethod
     def set(cls, tenant_id: str):
-        cls._local.tenant_id = tenant_id
+        _TENANT_VAR.set(tenant_id)
 
     @classmethod
     def get(cls) -> Optional[str]:
-        return getattr(cls._local, 'tenant_id', None)
+        return _TENANT_VAR.get()
 
     @classmethod
     def clear(cls):
-        cls._local.tenant_id = None
+        _TENANT_VAR.set(None)
 
     @classmethod
     def require(cls) -> str:
@@ -1027,32 +1038,70 @@ def tenant_scope(tenant_id: str):
 # FRAMEWORK INTEGRATIONS
 # ============================================================================
 
-def django_middleware_class():
+TENANT_HEADER = "X-Tenant-ID"
+
+
+def _trust_header(trust_tenant_header: Optional[bool]) -> bool:
+    """Explicit argument wins; otherwise the trust_tenant_header config key (default off)."""
+    if trust_tenant_header is not None:
+        return bool(trust_tenant_header)
+    return bool(load_config().get("trust_tenant_header", False))
+
+
+def _request_tenant(verified: Optional[str], headers, trust_header: bool) -> Optional[str]:
+    """Pick the tenant for one web request.
+
+    The verified source (session, JWT claim, auth layer) wins. The X-Tenant-ID
+    header is used only when trusted. The query string is never used. An
+    invalid value returns None, so the request fails closed instead of failing open.
+    """
+    tenant = verified
+    if tenant is None and trust_header:
+        tenant = headers.get(TENANT_HEADER)
+    if tenant is None or tenant == "":
+        return None
+    try:
+        return validate_tenant_id(str(tenant))  # JWT/session ids may be int or UUID
+    except ValueError as e:
+        logger.warning(f"DB Firewall: ignoring invalid tenant id from request: {e}")
+        return None
+
+
+def _django_default_source(request) -> Optional[str]:
+    session = getattr(request, "session", None)
+    return getattr(request, "tenant_id", None) or (session.get("tenant_id") if session else None)
+
+
+def django_middleware_class(tenant_id_source=None, trust_tenant_header: Optional[bool] = None):
     """
     Returns a Django middleware class that sets tenant context per-request.
 
-    Add to MIDDLEWARE in settings.py:
-        'db_firewall.django_middleware_class()'
+    Usage (Django settings take a dotted path, not a call):
+        # myapp/middleware.py
+        TenantMiddleware = django_middleware_class()
+        # settings.py
+        MIDDLEWARE = [..., 'myapp.middleware.TenantMiddleware']
 
-    Expects tenant_id in: request header, JWT claim, or session.
+    tenant_id_source: callable(request) -> tenant id from a verified source.
+        Default: request.tenant_id (set by your auth middleware) or session["tenant_id"].
+    trust_tenant_header: also accept X-Tenant-ID when no verified tenant is
+        found. Only for a gateway that sets it after auth. Default: config key.
     """
+    source = tenant_id_source or _django_default_source
+    trust = _trust_header(trust_tenant_header)
+
     class DBFirewallMiddleware:
         def __init__(self, get_response):
             self.get_response = get_response
 
         def __call__(self, request):
-            # Resolve tenant from request
-            tenant = (
-                request.headers.get("X-Tenant-ID")
-                or getattr(request, 'tenant_id', None)
-                or request.session.get('tenant_id')
-            )
+            tenant = _request_tenant(source(request), request.headers, trust)
             if tenant:
                 set_tenant(tenant)
-
-            response = self.get_response(request)
-            clear_tenant()
-            return response
+            try:
+                return self.get_response(request)
+            finally:
+                clear_tenant()          # runs even when the view raises
 
     return DBFirewallMiddleware
 
@@ -1117,23 +1166,28 @@ def sqlalchemy_event_hooks(engine_instance):
         return statement, parameters
 
 
-def fastapi_middleware(app):
+def fastapi_middleware(app, tenant_id_source=None, trust_tenant_header: Optional[bool] = None):
     """
-    FastAPI middleware that sets tenant context per-request.
+    FastAPI (or Starlette) middleware that sets tenant context per-request.
 
     Usage:
         from db_firewall import fastapi_middleware
-        fastapi_middleware(app)
+        fastapi_middleware(app, tenant_id_source=lambda req: req.state.user.tenant_id)
+
+    tenant_id_source: callable(request) -> tenant id from a verified source.
+        Default: request.state.tenant_id (set by your auth middleware).
+    trust_tenant_header: also accept X-Tenant-ID when no verified tenant is
+        found. Only for a gateway that sets it after auth. Default: config key.
     """
     from starlette.middleware.base import BaseHTTPMiddleware
     from starlette.requests import Request
 
+    source = tenant_id_source or (lambda req: getattr(req.state, "tenant_id", None))
+    trust = _trust_header(trust_tenant_header)
+
     class TenantMiddleware(BaseHTTPMiddleware):
         async def dispatch(self, request: Request, call_next):
-            tenant = (
-                request.headers.get("X-Tenant-ID")
-                or request.query_params.get("tenant_id")
-            )
+            tenant = _request_tenant(source(request), request.headers, trust)
             if tenant:
                 set_tenant(tenant)
             try:
@@ -1145,21 +1199,31 @@ def fastapi_middleware(app):
     app.add_middleware(TenantMiddleware)
 
 
-def flask_hooks(app):
+def _flask_default_source() -> Optional[str]:
+    from flask import g, session
+    return getattr(g, "tenant_id", None) or session.get("tenant_id")
+
+
+def flask_hooks(app, tenant_id_source=None, trust_tenant_header: Optional[bool] = None):
     """
     Flask before/after request hooks for tenant isolation.
 
     Usage:
         from db_firewall import flask_hooks
-        flask_hooks(app)
+        flask_hooks(app, tenant_id_source=lambda: g.tenant_id)
+
+    tenant_id_source: callable() -> tenant id from a verified source.
+        Default: g.tenant_id (set by your auth hook) or session["tenant_id"].
+    trust_tenant_header: also accept X-Tenant-ID when no verified tenant is
+        found. Only for a gateway that sets it after auth. Default: config key.
     """
+    source = tenant_id_source or _flask_default_source
+    trust = _trust_header(trust_tenant_header)
+
     @app.before_request
     def set_tenant_from_request():
         from flask import request, g
-        tenant = (
-            request.headers.get("X-Tenant-ID")
-            or request.args.get("tenant_id")
-        )
+        tenant = _request_tenant(source(), request.headers, trust)
         if tenant:
             set_tenant(tenant)
             g._firewall_tenant = tenant

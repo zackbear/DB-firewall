@@ -136,11 +136,18 @@ In both modes the database-native RLS/VPD policy remains the second layer: the r
 | --- | --- |
 | **Raw DB-API** | `protect(connection)` |
 | **SQLAlchemy** | `sqlalchemy_event_hooks(engine)` |
-| **Django** | Middleware class |
-| **FastAPI** | `fastapi_middleware(app)` |
-| **Flask** | `flask_hooks(app)` |
+| **Django** | `django_middleware_class(tenant_id_source=...)` |
+| **FastAPI** | `fastapi_middleware(app, tenant_id_source=...)` |
+| **Flask** | `flask_hooks(app, tenant_id_source=...)` |
 | **MCP Servers** | `mcp_wrapper.py` stdio proxy |
 | **LangChain** | Wrap the connection before passing to agent |
+
+Web integrations take the tenant from a verified source: `tenant_id_source`, or
+by default `request.tenant_id` / the session (Django), `request.state.tenant_id`
+(FastAPI), `g.tenant_id` / the session (Flask). The `X-Tenant-ID` header is
+ignored unless `trust_tenant_header: true`, because any client can send it.
+`?tenant_id=` is never read. The tenant lives in a `ContextVar`, so concurrent
+async requests and thread-pool endpoints each see their own tenant.
 
 ---
 
