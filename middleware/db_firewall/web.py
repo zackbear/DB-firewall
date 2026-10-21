@@ -1,7 +1,9 @@
 """DB Firewall: Framework integrations: Django, FastAPI, Flask."""
 
 import logging
+import asyncio
 import contextvars
+import sys
 import uuid
 from typing import Optional
 
@@ -86,12 +88,96 @@ class _ScopedStream:
             self._ctx.run(close)
 
 
+class _AsyncScopedStream:
+    """The async twin of _ScopedStream, for StreamingHttpResponse bodies that
+    are async iterators (ASGI). Each step runs as its own task in a private
+    copy of the context that holds the request's tenant, so the body sees that
+    tenant however late it is read, and the caller's context never changes."""
+
+    def __init__(self, tenant: Optional[str], content):
+        self._ctx = contextvars.copy_context()
+        self._ctx.run(_TENANT_VAR.set, tenant)
+        self._it = content.__aiter__()
+
+    def __aiter__(self):
+        return self
+
+    async def _in_ctx(self, make_awaitable):
+        async def step():
+            return await make_awaitable()
+        if sys.version_info >= (3, 11):
+            return await asyncio.create_task(step(), context=self._ctx)
+        # ponytail: <3.11 has no context=; the task copies self._ctx at creation,
+        # so the tenant is visible but contextvar changes made by the body do not
+        # carry to the next step.
+        return await self._ctx.run(asyncio.get_running_loop().create_task, step())
+
+    async def __anext__(self):
+        return await self._in_ctx(self._it.__anext__)
+
+    async def aclose(self):
+        aclose = getattr(self._it, "aclose", None)
+        if aclose is not None:
+            await self._in_ctx(aclose)
+
+
+def _scope_streaming(response, tenant):
+    """Wrap a streaming body (sync or async) so it is read as the request's tenant."""
+    content = getattr(response, "streaming_content", None)
+    if not getattr(response, "streaming", False) or content is None:
+        return response
+    if hasattr(content, "__aiter__"):
+        response.streaming_content = _AsyncScopedStream(tenant, content)
+    else:
+        response.streaming_content = _ScopedStream(tenant, content)
+    return response
+
+
 def _django_default_source(request):
     tenant = getattr(request, "tenant_id", None)
     if tenant is None:
         session = getattr(request, "session", None)
         tenant = session.get("tenant_id") if session is not None else None
     return tenant
+
+
+class _DjangoTenantMiddleware:
+    """Base for django_middleware_class(); the subclass sets _source and _trust."""
+    # Django runs a sync+async capable middleware natively in either mode.
+    sync_capable = True
+    async_capable = True
+
+    def __init__(self, get_response):
+        from asgiref.sync import iscoroutinefunction, markcoroutinefunction
+        self.get_response = get_response
+        self._async = iscoroutinefunction(get_response)
+        if self._async:
+            markcoroutinefunction(self)
+
+    def __call__(self, request):
+        if self._async:
+            return self.__acall__(request)
+        tenant = _request_tenant(self._source(request), request.headers, self._trust)
+        # Enter even when None: hides any tenant left in this context.
+        token = TenantContext.enter(tenant)
+        try:
+            response = self.get_response(request)
+        finally:
+            TenantContext.exit(token)   # runs even when the view raises
+        return _scope_streaming(response, tenant)
+
+    async def __acall__(self, request):
+        from asgiref.sync import iscoroutinefunction, sync_to_async
+        # A sync source may touch the session (a database read): run it off the event loop.
+        verified = (await self._source(request) if iscoroutinefunction(self._source)
+                    else await sync_to_async(self._source)(request))
+        tenant = _request_tenant(verified, request.headers, self._trust)
+        token = TenantContext.enter(tenant)
+        try:
+            response = await self.get_response(request)
+        finally:
+            TenantContext.exit(token)
+        return _scope_streaming(response, tenant)
 
 
 def django_middleware_class(tenant_id_source=None, trust_tenant_header: Optional[bool] = None):
@@ -112,25 +198,8 @@ def django_middleware_class(tenant_id_source=None, trust_tenant_header: Optional
     source = tenant_id_source or _django_default_source
     trust = _trust_header(trust_tenant_header)
 
-    class DBFirewallMiddleware:
-        def __init__(self, get_response):
-            self.get_response = get_response
-
-        def __call__(self, request):
-            tenant = _request_tenant(source(request), request.headers, trust)
-            # Enter even when None: hides any tenant left in this context.
-            token = TenantContext.enter(tenant)
-            try:
-                response = self.get_response(request)
-            finally:
-                TenantContext.exit(token)   # runs even when the view raises
-            content = getattr(response, "streaming_content", None)
-            if getattr(response, "streaming", False) and content is not None \
-                    and not hasattr(content, "__aiter__"):  # async bodies: [Unverified], not wrapped
-                response.streaming_content = _ScopedStream(tenant, content)
-            return response
-
-    return DBFirewallMiddleware
+    return type("DBFirewallMiddleware", (_DjangoTenantMiddleware,),
+                {"_source": staticmethod(source), "_trust": trust})
 
 
 def fastapi_middleware(app, tenant_id_source=None, trust_tenant_header: Optional[bool] = None):
