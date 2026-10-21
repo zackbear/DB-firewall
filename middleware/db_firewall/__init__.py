@@ -74,16 +74,23 @@ class _Package(types.ModuleType):
                 (old is not _MISSING and m.__dict__.get(name, _MISSING) is old)]
 
     def __setattr__(self, name, value):
-        for mod in self._holders(name):
+        # After a delete, restore to every module that held the name, not just the owner.
+        for mod in _DELETED.pop(name, None) or self._holders(name):
             setattr(mod, name, value)
         if name not in _LIVE:
             super().__setattr__(name, value)
 
     def __delattr__(self, name):
-        for mod in self._holders(name):
+        holders = self._holders(name)
+        for mod in holders:
             delattr(mod, name)
+        if holders:
+            _DELETED[name] = holders
         if name not in _LIVE:
             super().__delattr__(name)
+
+
+_DELETED = {}       # name -> modules it was deleted from, for the undo
 
 
 sys.modules[__name__].__class__ = _Package

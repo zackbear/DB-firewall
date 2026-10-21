@@ -59,3 +59,11 @@ def test_every_global_name_is_live():
              for node in ast.walk(ast.parse(inspect.getsource(mod)))
              if isinstance(node, ast.Global) for n in node.names}
     assert names == db_firewall._LIVE
+
+
+def test_delete_and_undo_restores_importers(monkeypatch):
+    real = db_firewall.load_config
+    with monkeypatch.context() as m:
+        m.delattr(db_firewall, "load_config")
+        assert not hasattr(wrappers, "load_config")
+    assert wrappers.load_config is web.load_config is sqlalchemy_hooks.load_config is real
