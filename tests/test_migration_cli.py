@@ -56,9 +56,10 @@ def test_engine_without_migration_is_a_noop():
 
 
 def _cli(*args):
-    path = os.path.join(os.path.dirname(__file__), '..', 'middleware', 'db_firewall.py')
+    root = os.path.join(os.path.dirname(__file__), '..')
     env = {k: v for k, v in os.environ.items() if not k.startswith("DB_FIREWALL_")}
-    return subprocess.run([sys.executable, path, *args], capture_output=True, timeout=30, env=env)
+    return subprocess.run([sys.executable, "-m", "middleware.db_firewall", *args],
+                          cwd=root, capture_output=True, timeout=30, env=env)
 
 
 def test_cli_info_prints_config():

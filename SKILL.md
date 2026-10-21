@@ -59,7 +59,7 @@ Select based on detected database engine:
 
 ## Step 3: Integrate the Middleware
 
-Read `middleware/db_firewall.py` before integrating — it contains the full API surface.
+Read `middleware/db_firewall/__init__.py` and `middleware/db_firewall/wrappers.py` before integrating: the package re-exports the full API surface (`protect`, `tenant_scope`, the framework hooks), and `wrappers.py` holds `protect()`.
 
 Select the integration pattern for the detected framework:
 

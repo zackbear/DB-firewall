@@ -230,7 +230,7 @@ What the wrapper does with each line from the agent:
 > **Upgrading:** earlier versions rewrote only the top-level `query`, `sql`,
 > `statement`, `command` and `code` arguments, passed non-JSON lines through
 > unchanged, and stopped proxying after the first refused query. The
-> `migrate` and `check` commands of `middleware/db_firewall.py` did nothing
+> `migrate` and `check` commands of the `db_firewall` CLI did nothing
 > and are removed: apply migrations with `psql`/`mysql`/`sqlcmd` or
 > `run_migration(conn)`, and audit with `hooks/scanner.py`. `run_migration()`
 > now finds `migrations/` and raises `FileNotFoundError` instead of logging.
@@ -367,8 +367,11 @@ db-firewall/
 │   ├── 003_sqlserver.sql         # SQL Server security policies
 │   └── 004_oracle.sql            # Oracle VPD (production-hardened)
 ├── middleware/
-│   ├── db_firewall.py            # Universal Python middleware (DB-agnostic)
-│   └── sql_rewriter.py           # sqlglot AST rewriter (scopes every table reference)
+│   ├── db_firewall/              # Universal Python middleware (DB-agnostic), one module per concern:
+│   │                             #   config, engines, context, introspection, rewrite,
+│   │                             #   db_context, wrappers, web, sqlalchemy_hooks, migrate
+│   └── sql_rewriter/             # sqlglot AST rewriter (scopes every table reference):
+│                                 #   __init__ (rewrite), lexing, astutil, writes
 ├── hooks/
 │   ├── mcp_wrapper.py            # MCP server stdio proxy with SQL rewriting
 │   └── scanner.py                # CI/CD security scanner
