@@ -29,6 +29,7 @@ import db_firewall as fw  # noqa: E402
 from db_firewall import protect, rewrite_query, TenantContext, validate_tenant_id  # noqa: E402
 
 APP_DSN = make_conninfo(DSN, user="dbfw_app")
+MIGRATION = os.path.join(os.path.dirname(__file__), '..', 'migrations', '001_postgresql.sql')
 T = "mw_orders"            # RLS OFF: rows 1,2 → A; row 3 → B ('TRAP')
 MIXED = '"DBFW_Mixed"'     # quoted mixed-case name
 ALIAS = "mw_alias"         # (label, tenant_id): B's row carries label 'A'
@@ -43,6 +44,10 @@ def schema():
         a.execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='dbfw_app') "
                   "THEN CREATE ROLE dbfw_app LOGIN; END IF; END $$")
         a.execute(f"DROP TABLE IF EXISTS {T}, {MIXED}, {ALIAS}")
+        # The fixture needs _firewall_tenant_map. Apply the migration before the
+        # tables exist, so its RLS loop leaves these RLS-off tables alone. A fresh
+        # database (CI) has nothing until this runs.
+        a.execute(open(MIGRATION).read())
         a.execute(f"CREATE TABLE {T} (id int primary key, tenant_id text not null, note text)")
         a.execute(f"INSERT INTO {T} VALUES (1,'A','a1'),(2,'A','a2'),(3,'B','TRAP')")
         a.execute(f"CREATE TABLE {MIXED} (id int, tenant_id text, note text)")
