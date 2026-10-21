@@ -92,12 +92,15 @@ class TestScoping:
         msg = intercept_sql_in_tool_call(_call({}, sql="SELECT * FROM orders"), "A", cfg)
         assert msg["params"]["sql"] == SCOPED
 
-    def test_sql_in_object_key_refused(self, cfg):
+    @pytest.mark.parametrize("key", ["SELECT * FROM orders", "SELECT id FROM orders",
+                                     "DELETE[orders]", "UPDATE[orders]SET[a]=1", "TABLE/**/orders"])
+    def test_sql_in_object_key_refused(self, cfg, key):
         with pytest.raises(PermissionError):
-            intercept_sql_in_tool_call(_call({"SELECT * FROM orders": 1}), "A", cfg)
+            intercept_sql_in_tool_call(_call({key: 1}), "A", cfg)
 
     @pytest.mark.parametrize("args", [{"table": "orders"}, {"values": [1]}, {"set": {"a": 1}},
-                                      {"check": True}, {"start": 1, "end": 5}, {"desc": "x"}])
+                                      {"check": True}, {"start": 1, "end": 5}, {"desc": "x"},
+                                      {"end-date": "2026-10-21"}, {"set-cookie": "a"}])
     def test_keyword_named_keys_pass(self, cfg, args):
         assert intercept_sql_in_tool_call(_call(dict(args)), "A", cfg)["params"]["arguments"] == args
 

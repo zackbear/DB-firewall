@@ -58,7 +58,7 @@ SQL_KEYWORDS = frozenset("""
 _LEADING_NOISE = re.compile(r"(?:\s+|--[^\n]*(?:\n|$)|#[^\n]*(?:\n|$)|/\*.*?\*/|[;(])*", re.S)
 _FIRST_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
 _LABEL = re.compile(r"\s*:(?!:)")
-_KEY_SQL_CHARS = re.compile(r"[\s;(),'\"`*#-]")
+_KEY_SQL_CHARS = re.compile(r"[\s;(),'\"`*#\[\]=/]|--")
 _ANY_KEYWORD = re.compile(r"\b(?:" + "|".join(sorted(SQL_KEYWORDS)) + r")\b", re.I)
 
 
@@ -91,7 +91,7 @@ def _scope(value, tenant_id: str, config: dict):
     if isinstance(value, dict):
         for k in value:
             # Keys are not rewritten, so a key that could be a statement is refused.
-            # A bare identifier ("table", "values") cannot name and read a table.
+            # A bare identifier ("table", "values", "end-date") cannot name and read a table.
             if _KEY_SQL_CHARS.search(k) and looks_like_sql(k):
                 raise PermissionError(f"DB Firewall: SQL in an object key: {k[:80]!r}")
         return {k: _scope(v, tenant_id, config) for k, v in value.items()}
