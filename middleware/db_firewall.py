@@ -491,7 +491,6 @@ def _is_excluded_table(table: str, excluded: List[str]) -> bool:
     return False
 
 
-# Backslash: MySQL treats \' as an escape, so 'A\' would swallow the closing quote.
 # Backslash: MySQL treats \' as an escape, so a tenant ending in \ would swallow
 # the closing quote of the injected literal.
 _BAD_TENANT_CHARS = ("\x00", "\n", "\r", "\\")
@@ -996,8 +995,8 @@ def protect(connection, tenant_id: Optional[str] = None,
         connection: Any DB-API 2.0 connection (psycopg2, mysql-connector, etc.)
         tenant_id:  Explicit tenant ID. If None, resolves from:
                     1. The request's TenantContext
-                    2. DB user mapping table
-                    3. TENANT_ID environment variable
+                    2. TENANT_ID environment variable
+                    3. DB user mapping table (_firewall_tenant_map)
         config:     Override configuration dict. If None, load_config():
                     DB_FIREWALL_CONFIG, else defaults.
 
