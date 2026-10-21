@@ -45,7 +45,7 @@ def sqlalchemy_event_hooks(engine_instance, config: Optional[dict] = None):
         from db_firewall import sqlalchemy_event_hooks
 
         engine = create_engine(...)
-        sqlalchemy_event_hooks(engine)   # config read once here, not per query
+        sqlalchemy_event_hooks(engine)   # reads config once; pass config= to override
     """
     from sqlalchemy import event
     if config is None:

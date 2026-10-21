@@ -33,3 +33,29 @@ def test_both_import_paths_expose_the_api():
     for name in ("protect", "rewrite_query", "load_config", "tenant_scope",
                  "django_middleware_class", "sqlalchemy_event_hooks", "run_migration"):
         assert callable(getattr(pkg, name)) and callable(getattr(db_firewall, name))
+
+
+def test_log_once_flags_read_live_and_restore(monkeypatch):
+    web._warned_untrusted_header = True               # the code sets it via `global`
+    assert db_firewall._warned_untrusted_header is True
+    with monkeypatch.context() as m:
+        m.setattr(db_firewall, "_warned_untrusted_header", False)
+        assert web._warned_untrusted_header is False
+    assert web._warned_untrusted_header is True        # undo restores the live value
+    web._warned_untrusted_header = False
+
+
+def test_delete_reaches_owner(monkeypatch):
+    with monkeypatch.context() as m:
+        m.delattr(db_firewall, "TABLE_CACHE_TTL")
+        assert not hasattr(introspection, "TABLE_CACHE_TTL")
+    assert introspection.TABLE_CACHE_TTL == db_firewall.TABLE_CACHE_TTL
+
+
+def test_every_global_name_is_live():
+    import ast
+    import inspect
+    names = {n for mod in db_firewall._SUBMODULES
+             for node in ast.walk(ast.parse(inspect.getsource(mod)))
+             if isinstance(node, ast.Global) for n in node.names}
+    assert names == db_firewall._LIVE

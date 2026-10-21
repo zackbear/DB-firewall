@@ -1,4 +1,4 @@
-# Core middleware (middleware/db_firewall.py). Database drivers are yours to pick.
+# Core middleware (middleware/db_firewall/). Database drivers are yours to pick.
 sqlglot>=25        # AST query rewriter (default `rewriter: "ast"`); set rewriter: "regex" to run without it
 pyyaml>=6.0        # optional: .db-firewall.yaml config (JSON works without it)
 

@@ -231,7 +231,8 @@ What the wrapper does with each line from the agent:
 > `statement`, `command` and `code` arguments, passed non-JSON lines through
 > unchanged, and stopped proxying after the first refused query. The
 > `migrate` and `check` commands of the `db_firewall` CLI did nothing
-> and are removed: apply migrations with `psql`/`mysql`/`sqlcmd` or
+> and are removed (`python -m middleware.db_firewall info` prints the
+> active config): apply migrations with `psql`/`mysql`/`sqlcmd` or
 > `run_migration(conn)`, and audit with `hooks/scanner.py`. `run_migration()`
 > now finds `migrations/` and raises `FileNotFoundError` instead of logging.
 > The PostgreSQL scanner failed on every run (a literal `%` in a parameterised

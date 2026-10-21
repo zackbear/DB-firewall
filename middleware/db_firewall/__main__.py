@@ -5,7 +5,7 @@ import json
 
 from .config import load_config
 
-parser = argparse.ArgumentParser(description="DB Firewall CLI")
+parser = argparse.ArgumentParser(prog="python -m middleware.db_firewall", description="DB Firewall CLI")
 # ponytail: "info" only. Apply migrations with psql/mysql/sqlcmd (README)
 # or run_migration(conn); audit coverage with hooks/scanner.py.
 parser.add_argument("command", choices=["info"])

@@ -46,20 +46,44 @@ del _mod, _name, _value
 
 _MISSING = object()
 
+# Names a submodule rebinds with `global` at run time (the log-once flags).
+# They are not copied onto the package, so reads stay live (module __getattr__).
+# tests/test_package_layout.py fails if a new `global` name is missing here.
+_LIVE = {"_warned_untrusted_header", "_warned_orphan_config"}
+for _name in _LIVE:
+    globals().pop(_name, None)
+
+
+def __getattr__(name):
+    if name in _LIVE:
+        return getattr(_OWNER[name], name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 class _Package(types.ModuleType):
-    """Setting db_firewall.X (TABLE_CACHE_TTL, DEFAULT_CONFIG, a monkeypatch)
-    reaches the module that owns X and every module that imported the same
-    object, so the setting takes effect as it did in the single-file module."""
+    """Setting or deleting db_firewall.X (TABLE_CACHE_TTL, DEFAULT_CONFIG, a
+    monkeypatch) reaches the module that owns X and every module that imported
+    the same object, so it takes effect as it did in the single-file module."""
+
+    def _holders(self, name):
+        owner = _OWNER.get(name)
+        if owner is None:
+            return []
+        old = owner.__dict__.get(name, _MISSING)
+        return [m for m in _SUBMODULES if m is owner or
+                (old is not _MISSING and m.__dict__.get(name, _MISSING) is old)]
 
     def __setattr__(self, name, value):
-        owner = _OWNER.get(name)
-        if owner is not None:
-            old = owner.__dict__.get(name, _MISSING)
-            for mod in _SUBMODULES:
-                if mod is owner or (old is not _MISSING and mod.__dict__.get(name, _MISSING) is old):
-                    setattr(mod, name, value)
-        super().__setattr__(name, value)
+        for mod in self._holders(name):
+            setattr(mod, name, value)
+        if name not in _LIVE:
+            super().__setattr__(name, value)
+
+    def __delattr__(self, name):
+        for mod in self._holders(name):
+            delattr(mod, name)
+        if name not in _LIVE:
+            super().__delattr__(name)
 
 
 sys.modules[__name__].__class__ = _Package
