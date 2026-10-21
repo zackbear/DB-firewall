@@ -6,3 +6,4 @@ pyyaml>=6.0        # optional: .db-firewall.yaml config (JSON works without it)
 pytest>=7
 psycopg[binary]>=3.1   # tests/test_pool_leak.py (opt-in via DBFW_PG_DSN)
 psycopg_pool>=3.1
+django>=4.2          # tests/test_django_asgi.py (real Django, WSGI and ASGI clients)

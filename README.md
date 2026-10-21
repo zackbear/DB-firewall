@@ -157,10 +157,22 @@ that tenant, or none, and restores the previous context when it ends.
   `contextvars.copy_context().run(...)`.
 - **Flask:** call `flask_hooks(app)` after registering your auth `before_request`
   hook, on the app rather than a blueprint.
-- **Streaming responses:** Django streaming bodies run as the request's tenant.
+- **Django under ASGI:** the middleware is sync- and async-capable, so Django runs it
+  natively under WSGI and ASGI. Under ASGI a sync `tenant_id_source` runs through
+  `sync_to_async` (safe for database-backed sessions); an `async def` source is awaited.
+  An `async def` source needs async mode: ASGI, with only async-capable middleware after
+  this one. Otherwise Django refuses to start (`ImproperlyConfigured`).
+- **Streaming responses:** Django streaming bodies, sync or async (ASGI), run as the
+  request's tenant, even though they are read after the middleware returns. An async
+  body runs in one task whose context holds the tenant, so timeouts held across
+  chunks work, and its cleanup (`finally`) runs as that tenant even when the client
+  disconnects mid-stream or the response is only garbage-collected.
+  Put middleware that wraps streaming bodies, such as `GZipMiddleware`, above DB
+  Firewall in `MIDDLEWARE` (Django's docs already place GZip near the top). If one sits
+  below it and the server's send fails mid-stream, that stream's task stays pending and
+  its cleanup does not run. No other tenant's code is affected.
   Flask runs teardown before a streaming body is read, so a Flask generator must
   open its own `tenant_scope(tenant)` or use `protect(conn, tenant_id=...)`.
-  Django async streaming bodies under ASGI are not covered yet.
 - **Outside requests:** prefer `tenant_scope(...)` or `protect(conn, tenant_id=...)`
   over a bare `set_tenant()`, which stays set for the rest of that thread or task.
 - **`fail_mode: open`:** a request with no verified tenant runs unscoped. Use
