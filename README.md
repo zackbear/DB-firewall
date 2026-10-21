@@ -218,6 +218,26 @@ Wrap any MCP database server to auto-inject tenant isolation:
 }
 ```
 
+What the wrapper does with each line from the agent:
+
+- `tools/call`: every string that looks like SQL is scoped to the tenant, under any argument name and at any depth (nested objects, lists). A string counts as SQL when its first word is a SQL statement keyword, or when it holds a comment marker (`/*`, `--`, `#`) and any keyword.
+- SQL the rewriter cannot scope (DDL, multiple statements, `COPY`, `CALL`, ...) gets a JSON-RPC error and never reaches the server.
+- A line that is not a JSON object or array is dropped, not passed through.
+- SQL in an object key is refused. A leading T-SQL label (`lbl: SELECT ...`) or a `sp_`/`xp_` procedure name counts as SQL.
+- Limit: prose that starts with a keyword ("Update the report") is treated as SQL, so it is rewritten or refused. A bare SQL Server procedure name without `EXEC` or a `sp_`/`xp_` prefix is not caught: rely on row-level security for those.
+- Defence in depth: run the migrations and give the wrapped server a role without `BYPASSRLS`, so row-level security still blocks anything a string check misses.
+
+> **Upgrading:** earlier versions rewrote only the top-level `query`, `sql`,
+> `statement`, `command` and `code` arguments, passed non-JSON lines through
+> unchanged, and stopped proxying after the first refused query. The
+> `migrate` and `check` commands of `middleware/db_firewall.py` did nothing
+> and are removed: apply migrations with `psql`/`mysql`/`sqlcmd` or
+> `run_migration(conn)`, and audit with `hooks/scanner.py`. `run_migration()`
+> now finds `migrations/` and raises `FileNotFoundError` instead of logging.
+> The PostgreSQL scanner failed on every run (a literal `%` in a parameterised
+> query) and, had it run, accepted unforced RLS and a single policy. It now
+> uses psycopg 3 when installed, else psycopg2.
+
 ---
 
 ## CI/CD Security Gate
@@ -237,7 +257,7 @@ db-security-check:
 RUN python -m hooks.scanner --dsn $DATABASE_URL --strict
 ```
 
-The scanner returns exit code 1 if ANY table with a `tenant_id` column is missing RLS/VPD protection.
+The scanner returns exit code 1 if ANY table with a `tenant_id` column is missing RLS/VPD protection. On PostgreSQL a table counts as protected only when row-level security is enabled AND forced (table owners bypass unforced RLS) and all four firewall policies (select, insert, update, delete) exist on that exact `public.<table>`, with no other permissive policy (PostgreSQL ORs permissive policies, so one extra `USING (true)` opens every row). The JSON report lists `missing_policies`, `extra_permissive_policies` and `rls_forced`.
 
 ---
 
