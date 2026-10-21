@@ -30,9 +30,9 @@ Assess these before implementing — they determine which layers you need:
 - **NEVER hardcode bypass roles** — `excluded_users` and the `_firewall_bypass_roles` table are empty by default; on Supabase/Neon/RDS the app connects as `postgres`, so a built-in `postgres` bypass disables every policy. Opt roles in explicitly, and never run the agent as the table owner, a superuser or a `BYPASSRLS` role
 - **NEVER assume policy creation equals enforcement in PostgreSQL** — `CREATE POLICY` alone is insufficient; you must also run `ALTER TABLE your_table ENABLE ROW LEVEL SECURITY` separately, or the policy exists but silently does nothing
 
-## Step 1: Add Config to Project Root
+## Step 1: Add Config and Point to It
 
-Copy `config/firewall.yaml` into the project root. Required customizations:
+Copy `config/firewall.yaml` to `.db-firewall.yaml` in the project, then set `DB_FIREWALL_CONFIG` to its full path (or pass `load_config(project_root=...)`). The firewall never searches the current or home folder. With no path set, it runs on built-in defaults. Required customizations:
 
 | Field | Action |
 |-------|--------|
