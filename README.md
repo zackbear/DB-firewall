@@ -167,6 +167,10 @@ that tenant, or none, and restores the previous context when it ends.
   body runs in one task whose context holds the tenant, so timeouts held across
   chunks work, and its cleanup (`finally`) runs as that tenant even when the client
   disconnects mid-stream or the response is only garbage-collected.
+  Put middleware that wraps streaming bodies, such as `GZipMiddleware`, above DB
+  Firewall in `MIDDLEWARE` (Django's docs already place GZip near the top). If one sits
+  below it and the server's send fails mid-stream, that stream's task stays pending and
+  its cleanup does not run. No other tenant's code is affected.
   Flask runs teardown before a streaming body is read, so a Flask generator must
   open its own `tenant_scope(tenant)` or use `protect(conn, tenant_id=...)`.
 - **Outside requests:** prefer `tenant_scope(...)` or `protect(conn, tenant_id=...)`

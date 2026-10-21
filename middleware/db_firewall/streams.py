@@ -61,6 +61,25 @@ async def _pump(it, requests: "asyncio.Queue", replies: "asyncio.Queue"):
             await aclose()
 
 
+def _cancel(task) -> None:
+    """Cancel the pump from any thread: Django calls response.close() in a
+    sync_to_async worker, and garbage collection can run anywhere."""
+    loop = task.get_loop()
+    if task.done() or loop.is_closed():
+        return
+    try:
+        running = asyncio.get_running_loop()
+    except RuntimeError:
+        running = None
+    if running is loop:
+        task.cancel()
+    else:
+        try:
+            loop.call_soon_threadsafe(task.cancel)
+        except RuntimeError:            # the loop closed in the meantime
+            pass
+
+
 class _AsyncScopedStream:
     """The async twin of _ScopedStream, for StreamingHttpResponse bodies that
     are async iterators (ASGI). The whole body runs in ONE task whose context
@@ -89,7 +108,7 @@ class _AsyncScopedStream:
             self._task = self._ctx.run(loop.create_task, coro)
         _PUMPS.add(self._task)
         self._task.add_done_callback(_PUMPS.discard)
-        weakref.finalize(self, self._task.cancel)
+        weakref.finalize(self, _cancel, self._task)
 
     async def __anext__(self):
         if self._closed:
@@ -108,7 +127,7 @@ class _AsyncScopedStream:
     def close(self):
         self._closed = True
         if self._task is not None:
-            self._task.cancel()
+            _cancel(self._task)
 
     async def aclose(self):
         self.close()

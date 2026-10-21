@@ -243,7 +243,7 @@ def test_async_tenant_cleared_when_view_raises():
 
 
 
-async def _asgi_call(app, tenant, disconnect_after=None):
+async def _asgi_call(app, tenant, disconnect_after=None, fail_send_after=None, gzip=False):
     """Drive a real ASGI request. With disconnect_after=n, the client goes away
     after n body chunks, as a browser tab closed mid-stream."""
     chunks, gone = [], asyncio.Event()
@@ -258,15 +258,19 @@ async def _asgi_call(app, tenant, disconnect_after=None):
     async def send(message):
         await asyncio.sleep(0.002)          # a slow client: the body waits at its yield
         if message["type"] == "http.response.body" and message.get("body"):
+            if fail_send_after is not None and len(chunks) >= fail_send_after:
+                raise OSError("connection reset")   # the server's send() fails
             chunks.append(message["body"])
             if disconnect_after is not None and len(chunks) >= disconnect_after:
                 gone.set()
-    path_ = "/disconnect-stream" if disconnect_after is not None else "/async"
+    streaming = disconnect_after is not None or fail_send_after is not None
+    path_ = "/disconnect-stream" if streaming else "/async"
     scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
              "method": "GET", "scheme": "http", "path": path_, "raw_path": path_.encode(),
              "query_string": b"", "root_path": "", "server": ("test", 80),
              "client": ("127.0.0.1", 1),
-             "headers": [(b"host", b"test"), (b"x-test-tenant", tenant.encode())]}
+             "headers": [(b"host", b"test"), (b"x-test-tenant", tenant.encode())]
+             + ([(b"accept-encoding", b"gzip")] if gzip else [])}
     await app(scope, receive, send)
     return b"".join(chunks).decode()
 
@@ -305,6 +309,7 @@ def test_dropped_stream_cleans_up_as_request_tenant():
             seen.append(get_tenant())
 
     async def run():
+        from db_firewall.streams import _PUMPS
         stream = _AsyncScopedStream("A", body())
         await stream.__anext__()
         set_tenant("OTHER")
@@ -312,8 +317,8 @@ def test_dropped_stream_cleans_up_as_request_tenant():
         gc.collect()
         for _ in range(5):
             await asyncio.sleep(0)
-    asyncio.run(run())
-    assert seen == ["A"]
+        return list(seen), len(_PUMPS)      # checked before asyncio.run cancels leftovers
+    assert asyncio.run(run()) == (["A"], 0)
 
 
 def test_timeout_held_across_steps_still_fires():
@@ -377,3 +382,80 @@ def test_async_source_in_sync_mode_is_refused():
         return "S"
     with pytest.raises(ImproperlyConfigured):
         django_middleware_class(tenant_id_source=source)(lambda request: HttpResponse())
+
+
+
+def _settle_and_count():
+    """GC and let cancelled pumps finish; return (cleanup tenants, pending pumps)."""
+    import gc
+    from db_firewall.streams import _PUMPS
+
+    async def settle():
+        for _ in range(20):
+            gc.collect()
+            await asyncio.sleep(0.01)
+        return list(CLEANUP), len(_PUMPS)
+    return settle
+
+
+@pytest.mark.parametrize("middleware", [
+    [f"{__name__}.TenantMiddleware"],
+    # Recommended order with a streaming-wrapping middleware: GZip first (outer).
+    ["django.middleware.gzip.GZipMiddleware", f"{__name__}.TenantMiddleware"],
+])
+def test_failed_send_cleans_up_without_leaking(middleware):
+    from django.core.asgi import get_asgi_application
+    from django.test import override_settings
+    CLEANUP.clear()
+    settle = _settle_and_count()
+
+    async def run():
+        with override_settings(MIDDLEWARE=middleware):
+            app = get_asgi_application()
+        set_tenant("OTHER")
+        for _ in range(5):
+            with pytest.raises(OSError):
+                await _asgi_call(app, "A", fail_send_after=2, gzip=True)
+        return await settle()
+    assert asyncio.run(run()) == (["A"] * 5, 0)
+
+
+def test_reader_waiting_during_aclose_does_not_hang():
+    from db_firewall.streams import _AsyncScopedStream
+
+    async def body():
+        yield 1
+        await asyncio.sleep(10)              # the reader waits on this step
+        yield 2
+
+    async def run():
+        stream = _AsyncScopedStream("A", body())
+        assert await stream.__anext__() == 1
+        reader = asyncio.ensure_future(stream.__anext__())
+        await asyncio.sleep(0.01)
+        await stream.aclose()
+        with pytest.raises(StopAsyncIteration):
+            await asyncio.wait_for(reader, 1)
+    asyncio.run(run())
+
+
+def test_close_from_another_thread_runs_cleanup_as_tenant():
+    from db_firewall.streams import _AsyncScopedStream
+    seen = []
+
+    async def body():
+        try:
+            yield 1
+            yield 2
+        finally:
+            seen.append(get_tenant())
+
+    async def run():
+        asyncio.get_running_loop().set_debug(True)   # debug mode rejects cross-thread cancel()
+        stream = _AsyncScopedStream("A", body())
+        await stream.__anext__()
+        await asyncio.to_thread(stream.close)       # as Django does via sync_to_async
+        for _ in range(10):
+            await asyncio.sleep(0.01)
+        return list(seen)
+    assert asyncio.run(run()) == ["A"]
