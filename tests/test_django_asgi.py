@@ -58,8 +58,41 @@ async def async_stream(request):
     return StreamingHttpResponse(body())
 
 
+CLEANUP = []        # tenant seen by each disconnect-stream cleanup
+
+
+async def disconnect_stream(request):
+    async def body():
+        try:
+            for _ in range(1000):
+                yield f"{get_tenant()},"     # suspended here while the server sends
+        finally:
+            CLEANUP.append(get_tenant())
+    return StreamingHttpResponse(body())
+
+
+async def timeout_stream(request):
+    async def body():
+        try:
+            async with asyncio.timeout(0.05):
+                yield "start,"
+                await asyncio.sleep(5)
+        except TimeoutError:
+            yield "timed-out,"
+    return StreamingHttpResponse(body())
+
+
+async def failing_stream(request):
+    async def body():
+        yield "one,"
+        raise ValueError("body failed")
+    return StreamingHttpResponse(body())
+
+
 urlpatterns = [path("sync", sync_view), path("async", async_view),
-               path("sync-stream", sync_stream), path("async-stream", async_stream)]
+               path("sync-stream", sync_stream), path("async-stream", async_stream),
+               path("disconnect-stream", disconnect_stream),
+               path("timeout-stream", timeout_stream), path("failing-stream", failing_stream)]
 
 
 def _body(response):
@@ -121,7 +154,7 @@ def test_concurrent_async_streams_keep_own_tenant():
 
 def test_async_stream_wrapper_runs_in_request_context():
     """Unit level: the body is read after the middleware returned, in another task."""
-    from db_firewall.web import _AsyncScopedStream
+    from db_firewall.streams import _AsyncScopedStream
 
     async def body():
         for _ in range(2):
@@ -137,7 +170,7 @@ def test_async_stream_wrapper_runs_in_request_context():
 
 
 def test_async_stream_aclose_closes_generator():
-    from db_firewall.web import _AsyncScopedStream
+    from db_firewall.streams import _AsyncScopedStream
     closed = []
 
     async def body():
@@ -167,14 +200,14 @@ def test_asgi_runs_middleware_without_adaptation(caplog):
 
 def test_async_stream_before_311_still_sees_tenant(monkeypatch):
     from types import SimpleNamespace
-    from db_firewall import web
-    monkeypatch.setattr(web, "sys", SimpleNamespace(version_info=(3, 10)))
+    from db_firewall import streams
+    monkeypatch.setattr(streams, "sys", SimpleNamespace(version_info=(3, 10)))
 
     async def body():
         yield get_tenant()
 
     async def run():
-        return [x async for x in web._AsyncScopedStream("A", body())]
+        return [x async for x in streams._AsyncScopedStream("A", body())]
     assert asyncio.run(run()) == ["A"]
 
 
@@ -207,3 +240,140 @@ def test_async_tenant_cleared_when_view_raises():
             await mw(get_response)(AsyncRequestFactory().get("/"))
         return get_tenant()
     assert asyncio.run(run()) == "Z"
+
+
+
+async def _asgi_call(app, tenant, disconnect_after=None):
+    """Drive a real ASGI request. With disconnect_after=n, the client goes away
+    after n body chunks, as a browser tab closed mid-stream."""
+    chunks, gone = [], asyncio.Event()
+
+    async def receive():
+        if not hasattr(receive, "sent"):
+            receive.sent = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        await gone.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        await asyncio.sleep(0.002)          # a slow client: the body waits at its yield
+        if message["type"] == "http.response.body" and message.get("body"):
+            chunks.append(message["body"])
+            if disconnect_after is not None and len(chunks) >= disconnect_after:
+                gone.set()
+    path_ = "/disconnect-stream" if disconnect_after is not None else "/async"
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+             "method": "GET", "scheme": "http", "path": path_, "raw_path": path_.encode(),
+             "query_string": b"", "root_path": "", "server": ("test", 80),
+             "client": ("127.0.0.1", 1),
+             "headers": [(b"host", b"test"), (b"x-test-tenant", tenant.encode())]}
+    await app(scope, receive, send)
+    return b"".join(chunks).decode()
+
+
+def test_disconnect_cleanup_runs_as_request_tenant_under_load():
+    import gc
+    from django.core.asgi import get_asgi_application
+    app = get_asgi_application()
+    CLEANUP.clear()
+
+    async def run():
+        set_tenant("OTHER")
+        streams = [_asgi_call(app, "A", disconnect_after=2) for _ in range(30)]
+        others = [_asgi_call(app, "B") for _ in range(150)]
+        out = await asyncio.gather(*streams, *others)
+        for _ in range(20):                  # let cancelled bodies finish their cleanup
+            gc.collect()
+            await asyncio.sleep(0.01)
+        return out[:30], out[30:]
+    streamed, plain = asyncio.run(run())
+    assert all(body.startswith("A,A,") for body in streamed)
+    assert set(plain) == {"B"}
+    assert CLEANUP == ["A"] * 30
+
+
+def test_dropped_stream_cleans_up_as_request_tenant():
+    import gc
+    from db_firewall.streams import _AsyncScopedStream
+    seen = []
+
+    async def body():
+        try:
+            yield 1
+            yield 2
+        finally:
+            seen.append(get_tenant())
+
+    async def run():
+        stream = _AsyncScopedStream("A", body())
+        await stream.__anext__()
+        set_tenant("OTHER")
+        del stream                           # never closed: garbage collection must close it
+        gc.collect()
+        for _ in range(5):
+            await asyncio.sleep(0)
+    asyncio.run(run())
+    assert seen == ["A"]
+
+
+def test_timeout_held_across_steps_still_fires():
+    async def run():
+        return await _abody(await AsyncClient().get("/timeout-stream",
+                                                     headers={"X-Test-Tenant": "A"}))
+    assert asyncio.run(run()) == "start,timed-out,"
+
+
+def test_body_error_reaches_the_reader():
+    from db_firewall.streams import _AsyncScopedStream
+
+    async def body():
+        yield "one"
+        raise ValueError("body failed")
+
+    async def run():
+        got = []
+        with pytest.raises(ValueError, match="body failed"):
+            async for x in _AsyncScopedStream("A", body()):
+                got.append(x)
+        return got
+    assert asyncio.run(run()) == ["one"]
+
+
+def test_db_backed_source_runs_off_the_event_loop():
+    from django.utils.asyncio import async_unsafe
+
+    @async_unsafe
+    def source(request):                     # like a database-backed session read
+        return "S"
+    mw = django_middleware_class(tenant_id_source=source)
+
+    async def get_response(request):
+        return HttpResponse(str(get_tenant()))
+
+    async def run():
+        from django.test import AsyncRequestFactory
+        return (await mw(get_response)(AsyncRequestFactory().get("/"))).content.decode()
+    assert asyncio.run(run()) == "S"
+
+
+def test_asgi_no_tenant_hides_ambient_tenant():
+    mw = django_middleware_class(tenant_id_source=lambda r: None)
+
+    async def get_response(request):
+        return HttpResponse(str(get_tenant()))
+
+    async def run():
+        from django.test import AsyncRequestFactory
+        set_tenant("Z")
+        body = (await mw(get_response)(AsyncRequestFactory().get("/"))).content.decode()
+        return body, get_tenant()
+    assert asyncio.run(run()) == ("None", "Z")
+
+
+def test_async_source_in_sync_mode_is_refused():
+    from django.core.exceptions import ImproperlyConfigured
+
+    async def source(request):
+        return "S"
+    with pytest.raises(ImproperlyConfigured):
+        django_middleware_class(tenant_id_source=source)(lambda request: HttpResponse())

@@ -1,15 +1,13 @@
 """DB Firewall: Framework integrations: Django, FastAPI, Flask."""
 
 import logging
-import asyncio
-import contextvars
-import sys
 import uuid
 from typing import Optional
 
-from .context import TenantContext, _TENANT_VAR
+from .context import TenantContext
 from .config import load_config
 from .rewrite import validate_tenant_id
+from .streams import _scope_streaming
 
 logger = logging.getLogger("db_firewall")
 
@@ -64,75 +62,6 @@ def _request_tenant(verified, headers, trust_header: bool) -> Optional[str]:
         return None
 
 
-class _ScopedStream:
-    """Iterate a streaming body as the request's tenant, inside a private copy
-    of the context. A WSGI server reads the body after the middleware has
-    returned. The caller's context is never changed, so a body read late, read
-    in pieces, finalized by the garbage collector, or interleaved with another
-    stream cannot set a tenant in some other request."""
-
-    def __init__(self, tenant: Optional[str], content):
-        self._ctx = contextvars.copy_context()
-        self._ctx.run(_TENANT_VAR.set, tenant)
-        self._it = iter(content)
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        return self._ctx.run(next, self._it)
-
-    def close(self):                    # Django calls this when the response closes
-        close = getattr(self._it, "close", None)
-        if close is not None:
-            self._ctx.run(close)
-
-
-class _AsyncScopedStream:
-    """The async twin of _ScopedStream, for StreamingHttpResponse bodies that
-    are async iterators (ASGI). Each step runs as its own task in a private
-    copy of the context that holds the request's tenant, so the body sees that
-    tenant however late it is read, and the caller's context never changes."""
-
-    def __init__(self, tenant: Optional[str], content):
-        self._ctx = contextvars.copy_context()
-        self._ctx.run(_TENANT_VAR.set, tenant)
-        self._it = content.__aiter__()
-
-    def __aiter__(self):
-        return self
-
-    async def _in_ctx(self, make_awaitable):
-        async def step():
-            return await make_awaitable()
-        if sys.version_info >= (3, 11):
-            return await asyncio.create_task(step(), context=self._ctx)
-        # ponytail: <3.11 has no context=; the task copies self._ctx at creation,
-        # so the tenant is visible but contextvar changes made by the body do not
-        # carry to the next step.
-        return await self._ctx.run(asyncio.get_running_loop().create_task, step())
-
-    async def __anext__(self):
-        return await self._in_ctx(self._it.__anext__)
-
-    async def aclose(self):
-        aclose = getattr(self._it, "aclose", None)
-        if aclose is not None:
-            await self._in_ctx(aclose)
-
-
-def _scope_streaming(response, tenant):
-    """Wrap a streaming body (sync or async) so it is read as the request's tenant."""
-    content = getattr(response, "streaming_content", None)
-    if not getattr(response, "streaming", False) or content is None:
-        return response
-    if hasattr(content, "__aiter__"):
-        response.streaming_content = _AsyncScopedStream(tenant, content)
-    else:
-        response.streaming_content = _ScopedStream(tenant, content)
-    return response
-
-
 def _django_default_source(request):
     tenant = getattr(request, "tenant_id", None)
     if tenant is None:
@@ -153,6 +82,11 @@ class _DjangoTenantMiddleware:
         self._async = iscoroutinefunction(get_response)
         if self._async:
             markcoroutinefunction(self)
+        elif iscoroutinefunction(self._source):
+            from django.core.exceptions import ImproperlyConfigured
+            raise ImproperlyConfigured(
+                "DB Firewall: an async tenant_id_source needs the middleware to run in "
+                "async mode (ASGI, with only async-capable middleware after it).")
 
     def __call__(self, request):
         if self._async:

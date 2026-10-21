@@ -160,11 +160,13 @@ that tenant, or none, and restores the previous context when it ends.
 - **Django under ASGI:** the middleware is sync- and async-capable, so Django runs it
   natively under WSGI and ASGI. Under ASGI a sync `tenant_id_source` runs through
   `sync_to_async` (safe for database-backed sessions); an `async def` source is awaited.
-  An `async def` source needs ASGI.
+  An `async def` source needs async mode: ASGI, with only async-capable middleware after
+  this one. Otherwise Django refuses to start (`ImproperlyConfigured`).
 - **Streaming responses:** Django streaming bodies, sync or async (ASGI), run as the
   request's tenant, even though they are read after the middleware returns. An async
-  body runs each step in a private context that holds the tenant (Python 3.11+ keeps
-  context changes across steps; 3.10 and older see the tenant only).
+  body runs in one task whose context holds the tenant, so timeouts held across
+  chunks work, and its cleanup (`finally`) runs as that tenant even when the client
+  disconnects mid-stream or the response is only garbage-collected.
   Flask runs teardown before a streaming body is read, so a Flask generator must
   open its own `tenant_scope(tenant)` or use `protect(conn, tenant_id=...)`.
 - **Outside requests:** prefer `tenant_scope(...)` or `protect(conn, tenant_id=...)`
