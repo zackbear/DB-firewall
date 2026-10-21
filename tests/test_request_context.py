@@ -207,9 +207,7 @@ class TestDjango:
 
     def test_trust_from_config_file(self, tmp_path, monkeypatch):
         (tmp_path / ".db-firewall.json").write_text('{"trust_tenant_header": true}')
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv("HOME", str(tmp_path))
-        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.setenv("DB_FIREWALL_CONFIG", str(tmp_path / ".db-firewall.json"))
         assert _run_django(_django_request(headers={HEADER: "B"})) == "B"
 
     def test_streaming_body_runs_as_request_tenant(self):
@@ -259,9 +257,7 @@ class TestDjango:
 
     def test_fail_open_logged_at_setup(self, caplog, tmp_path, monkeypatch):
         (tmp_path / ".db-firewall.json").write_text('{"fail_mode": "open"}')
-        monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv("HOME", str(tmp_path))
-        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+        monkeypatch.setenv("DB_FIREWALL_CONFIG", str(tmp_path / ".db-firewall.json"))
         with caplog.at_level(logging.WARNING, logger="db_firewall"):
             django_middleware_class()
         assert "fail_mode=open" in caplog.text

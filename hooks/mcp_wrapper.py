@@ -118,7 +118,7 @@ if __name__ == "__main__":
         description="DB Firewall MCP Wrapper — Intercepts SQL in MCP tool calls"
     )
     parser.add_argument("--tenant", required=True, help="Tenant ID to enforce")
-    parser.add_argument("--config", help="Path to .db-firewall.yaml")
+    parser.add_argument("--config", help="Config file or folder (default: DB_FIREWALL_CONFIG)")
     parser.add_argument(
         "child_command", nargs=argparse.REMAINDER,
         help="The real MCP server command (after --)"
