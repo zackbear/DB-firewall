@@ -15,13 +15,16 @@ version: "1.0"
 # ----------------------------------------------------------------------------
 # TENANT COLUMN — The column name used across all protected tables.
 # If a table has this column, it gets auto-protected.
+# Env override: DB_FIREWALL_TENANT_COLUMN
 # ----------------------------------------------------------------------------
 tenant_column: "tenant_id"
 
 # ----------------------------------------------------------------------------
 # FAIL MODE — What happens when no tenant context is set?
-#   "closed" → 0 rows returned (RECOMMENDED for production)
-#   "open"   → all rows returned (development/testing only)
+#   "closed" → the middleware refuses queries on protected tables
+#              (PermissionError); the RLS layer returns 0 rows (RECOMMENDED)
+#   "open"   → queries run unscoped by the middleware (development/testing only)
+# Env override: DB_FIREWALL_FAIL_MODE
 # ----------------------------------------------------------------------------
 fail_mode: "closed"
 
@@ -63,7 +66,10 @@ protect:
   delete: true    # Prevents deleting rows across tenants
 
 # ----------------------------------------------------------------------------
-# AUDIT — Log every tenant context assignment
+# AUDIT — NOT read by the Python middleware (reserved). The migrations create
+# _firewall_audit_log; on PostgreSQL, _firewall_set_tenant() writes a row per
+# assignment. The middleware sets context directly and writes no audit row.
+# Purge with: SELECT _firewall_purge_audit(90);
 # ----------------------------------------------------------------------------
 audit:
   enabled: true
@@ -72,33 +78,19 @@ audit:
   log_queries: false    # Set true to log actual SQL (careful: PII risk)
 
 # ----------------------------------------------------------------------------
-# TENANT RESOLUTION — How is the current tenant determined?
-# Evaluated in order. First match wins.
+# TENANT RESOLUTION — fixed order, not configurable. protect(conn) without
+# tenant_id= uses the first of:
+#   1. the request's tenant (web integrations, tenant_scope(), set_tenant())
+#   2. the TENANT_ID environment variable, when set
+#   3. _firewall_tenant_map: the active row for the current DB user
+#      (PostgreSQL, MySQL, SQL Server)
+# Nothing found: no tenant, so fail_mode decides. Pass tenant_id= to be explicit.
 # ----------------------------------------------------------------------------
-resolution:
-  # 1. From database user mapping table
-  - source: "db_user_map"
-    table: "_firewall_tenant_map"
-    enabled: true
-
-  # 2. From application context / session variable
-  - source: "session_var"
-    variable: "app.current_tenant"
-    enabled: true
-
-  # 3. From connection string parameter
-  - source: "connection_param"
-    param_name: "tenant_id"
-    enabled: true
-
-  # 4. From environment variable
-  - source: "env_var"
-    variable: "TENANT_ID"
-    enabled: false    # Enable for single-tenant deployments
 
 # ----------------------------------------------------------------------------
-# EXCLUDED USERS — DB users/roles that bypass middleware tenant filtering.
-# EMPTY BY DEFAULT. On managed Postgres (Supabase, Neon, RDS) the application
+# EXCLUDED USERS — NOT read by the Python middleware yet (reserved): a listed
+# role is still filtered by the middleware. To bypass it, use an unwrapped
+# connection. EMPTY BY DEFAULT. On managed Postgres (Supabase, Neon, RDS) the application
 # often connects as "postgres"; a built-in bypass list would disable the
 # firewall for the app itself. Add roles deliberately, e.g. "_migrator".
 # The DB-native layer has its own opt-in list: the _firewall_bypass_roles
@@ -122,7 +114,8 @@ excluded_tables:
   - "feature_flags"
 
 # ----------------------------------------------------------------------------
-# DATABASE-SPECIFIC OVERRIDES (optional)
+# DATABASE-SPECIFIC OVERRIDES — NOT read by the Python middleware (reserved).
+# Each migration script sets up its own engine; the schema is fixed there.
 # ----------------------------------------------------------------------------
 engines:
   postgresql:

@@ -9,6 +9,10 @@ Enforces tenant isolation at the database level so AI agents, MCP servers, and L
 
 ## Before You Start
 
+Upgrading an existing integration? Read `CHANGELOG.md` first: the config path, the `X-Tenant-ID` header, `protect()` tenant inheritance and the CLI changed in the 2026-10-20 batch.
+
+Imports: there is no pip package. Add the checkout's `middleware/` folder to `PYTHONPATH` (then `from db_firewall import ...`), or import `middleware.db_firewall` from the repo root.
+
 Assess these before implementing — they determine which layers you need:
 
 | Question | If Yes | If No |
@@ -38,7 +42,7 @@ Copy `config/firewall.yaml` to `.db-firewall.yaml` in the project, then set `DB_
 |-------|--------|
 | `tenant_column` | Match the project's actual column name (e.g. `org_id`, `company_id`) |
 | `excluded_tables` | Add migration/audit/config tables that are legitimately cross-tenant |
-| `excluded_users` | Leave empty unless a specific role (e.g. `_migrator`) must bypass; mirror it in `_firewall_bypass_roles` |
+| `excluded_users` | Leave empty. Reserved: the middleware does not read it yet. For a role that must bypass (e.g. `_migrator`), add it to `_firewall_bypass_roles` and give it a connection you do not wrap with `protect()` |
 | `fail_mode` | **ALWAYS set to `closed` for production** — `open` is for local dev only |
 
 ## Step 2: Run the Database Migration
@@ -79,6 +83,8 @@ TenantMiddleware = django_middleware_class()   # default: request.tenant_id or s
 MIDDLEWARE = [..., 'myapp.middleware.TenantMiddleware']
 ```
 
+Works under WSGI and ASGI (sync- and async-capable). Under ASGI a sync `tenant_id_source` runs via `sync_to_async`; an `async def` source needs async mode, or Django refuses to start. Streaming bodies run as the request's tenant. Place body-wrapping middleware such as `GZipMiddleware` **above** this one in `MIDDLEWARE`.
+
 **FastAPI:**
 ```python
 from db_firewall import fastapi_middleware
@@ -115,6 +121,8 @@ sqlalchemy_event_hooks(engine)
 }
 ```
 
+Run it from the repo root. It scopes every SQL-looking string in a `tools/call` (any argument, any depth), answers SQL it cannot scope with a JSON-RPC error, and drops non-JSON lines. Detection is by first keyword, so still give the wrapped server a role without `BYPASSRLS` and run the migration: RLS is the backstop.
+
 ## Step 4: Add CI/CD Scanner
 
 **MANDATORY for production deployments.** Add to the deployment pipeline:
@@ -124,18 +132,13 @@ sqlalchemy_event_hooks(engine)
   run: python -m hooks.scanner --dsn $DATABASE_URL --strict
 ```
 
-The scanner detects tables without RLS policies applied. `--strict` fails the build on any unprotected table. Run `hooks/scanner.py` locally first to review output before adding to CI.
+Run it from the repo root. It reads the schema (empty tables included) and lists every table with the tenant column. On PostgreSQL a table passes only when RLS is enabled AND forced, all four firewall policies (`_sel`, `_ins`, `_upd`, `_del`) exist on that exact `public.<table>`, and no other permissive policy exists. `--strict` fails the build on any unprotected table; `--json` shows `rls_forced`, `missing_policies` and `extra_permissive_policies`. Run it locally first to review the output before adding it to CI.
 
 ## Step 5: Seed Tenant Mappings
 
-The migration files create `_firewall_tenant_map` automatically. For greenfield projects without a migration run yet:
+The migration files create `_firewall_tenant_map` automatically: run the migration rather than creating it by hand. `protect()` only reads rows with `is_active` true, so a hand-made table without that column resolves no tenant. Seed it after the migration:
 
 ```sql
-CREATE TABLE IF NOT EXISTS _firewall_tenant_map (
-  db_user  TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL
-);
-
 INSERT INTO _firewall_tenant_map (db_user, tenant_id) VALUES ('mcp_service', 'TENANT_A');
 INSERT INTO _firewall_tenant_map (db_user, tenant_id) VALUES ('ai_agent_svc', 'TENANT_B');
 ```
@@ -153,7 +156,8 @@ One row per DB user. Never share a DB user between tenants.
 | All rows visible although policies exist | Role listed in `_firewall_bypass_roles`, or app connects as owner/superuser/`BYPASSRLS` | Remove the row; connect the app as an unprivileged role |
 | Middleware filtering but raw SQL queries bypass it | Raw SQL not routed through middleware connection wrapper | Add `protect()` to all connection acquisition paths; use DB-level RLS as primary layer |
 | INSERT rows have NULL tenant_id despite firewall | Policy only filters SELECT; INSERT policy is missing | Add a separate `WITH CHECK` policy or use a trigger to stamp tenant_id on INSERT |
-| CI scanner passes but new table leaks data | Scanner only checks tables with existing rows (empty tables skipped) | Run `--strict --include-empty` to check schema-only tables |
+| Scanner fails a table you protected by hand | RLS not forced, a firewall policy missing, or an extra permissive policy (PostgreSQL ORs them) | Run `--json`; fix what `rls_forced`, `missing_policies` or `extra_permissive_policies` shows, or re-run the migration |
+| A new table in another schema is not reported | The scanner and the PostgreSQL migration cover `public` only | Keep tenant tables in `public`, or protect other schemas by hand |
 
 ## NoSQL Stores (MongoDB, Redis, Firestore, Convex)
 
