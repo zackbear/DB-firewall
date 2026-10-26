@@ -22,8 +22,8 @@ def _set_context_postgres(connection, tenant_id: str):
         raise RuntimeError(
             "DB Firewall: PostgreSQL tenant context is transaction-local and "
             "cannot be set on an autocommit connection. Disable autocommit "
-            "(connection.autocommit = False) or use tenant_scope() with "
-            "middleware-only enforcement."
+            "(connection.autocommit = False). Only fail_mode: open falls back "
+            "to middleware-only enforcement, with a warning."
         )
     cursor = connection.cursor()
     cursor.execute("SELECT set_config('app.current_tenant', %s, true)", (tenant_id,))

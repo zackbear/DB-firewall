@@ -20,8 +20,9 @@ export PYTHONPATH="$PWD/middleware:$PYTHONPATH"   # no pip package yet: import f
 ```
 
 > **Upgrading from an earlier version?** Read [CHANGELOG.md](CHANGELOG.md) first.
-> Four changes can stop requests or leave tables unscoped until you change your
-> setup: the config path, the `X-Tenant-ID` header, `protect()` and the CLI.
+> Four changes can break an existing setup: the config path, the `X-Tenant-ID`
+> header and `protect()` can refuse queries or leave tables unscoped; the CLI
+> change breaks scripts that call the removed commands.
 
 ### 2. Run the migration for your database
 
@@ -249,7 +250,7 @@ db-security-check:
 RUN python -m hooks.scanner --dsn $DATABASE_URL --strict
 ```
 
-With `--strict` the scanner returns exit code 1 if ANY table with the tenant column is missing RLS/VPD protection. It reads the schema, not the rows, so empty tables are checked too. On PostgreSQL a table counts as protected only when row-level security is enabled AND forced (table owners bypass unforced RLS) and all four firewall policies (select, insert, update, delete) exist on that exact `public.<table>`, with no other permissive policy (PostgreSQL ORs permissive policies, so one extra `USING (true)` opens every row). The JSON report lists `missing_policies`, `extra_permissive_policies` and `rls_forced`.
+With `--strict` the scanner returns exit code 1 if ANY non-excluded table with the tenant column is missing protection: PostgreSQL RLS, MySQL views + triggers, or a SQL Server security policy named `firewall_rls_<table>`. Oracle VPD is not checked (an Oracle DSN is refused), and on SQLite every such table is reported unprotected. It reads the schema, not the rows, so empty tables are checked too. On PostgreSQL a table counts as protected only when row-level security is enabled AND forced (table owners bypass unforced RLS) and all four firewall policies (select, insert, update, delete) exist on that exact `public.<table>`, with no other permissive policy (PostgreSQL ORs permissive policies, so one extra `USING (true)` opens every row). The JSON report lists `missing_policies`, `extra_permissive_policies` and `rls_forced`.
 
 ---
 
@@ -336,7 +337,7 @@ A failure to set the DB-side context raises when `fail_mode: closed` (the defaul
 | **Fail closed** | No tenant context: the middleware refuses queries on protected tables (`PermissionError`) and RLS returns 0 rows. Never defaults to "show all". |
 | **Defense in depth** | Middleware + database-native RLS/VPD. Two independent layers. |
 | **Full DML protection** | SELECT, INSERT, UPDATE, AND DELETE are all filtered — every table reference, in every CTE, branch and subquery. |
-| **Audit trail** | The migrations create `_firewall_audit_log`. On PostgreSQL, `_firewall_set_tenant()` logs each assignment with client address and time. The Python middleware sets the context directly and does not write this log yet; the `audit:` config keys are not read by it. |
+| **Audit trail** | The PostgreSQL, MySQL and SQL Server migrations create `_firewall_audit_log` (Oracle: `VPD_AUDIT_LOG`), and their `_firewall_set_tenant` logs each assignment. The Python middleware sets the context directly and does not write this log yet; the `audit:` config keys are not read by it. |
 | **Zero trust the agent** | The AI doesn't know about tenancy. The database enforces it. |
 | **Connection pool safe** | Postgres context is transaction-local; every engine is cleared on `release()`/`pool_checkin`. See "Connection pooling". |
 
@@ -351,7 +352,7 @@ db-firewall/
 ├── config/
 │   └── firewall.yaml             # Default configuration + documentation
 ├── migrations/
-│   ├── 001_postgresql.sql        # PostgreSQL native RLS (auto-applies to all tables)
+│   ├── 001_postgresql.sql        # PostgreSQL native RLS (auto-applies to public tables with a tenant_id column)
 │   ├── 002_mysql.sql             # MySQL secure views + triggers
 │   ├── 003_sqlserver.sql         # SQL Server security policies
 │   └── 004_oracle.sql            # Oracle VPD (production-hardened)
@@ -395,7 +396,7 @@ as a superuser. CI does the same with a `postgres:16` service and fails below
 | `test_sqlalchemy_hook.py` | SQLAlchemy hook swaps the statement (sqlite) |
 | `test_mcp_wrapper.py`, `test_migration_cli.py` | MCP stdio proxy; `run_migration()` and the CLI |
 | `test_gate_live.py`, `test_pool_leak.py`, `test_scanner_live.py` | live PostgreSQL: middleware vs RLS, pool leaks, scanner (opt-in: `DBFW_PG_DSN`) |
-| `test_adapters_*.py` | MongoDB (mongomock), Redis (live server), Firestore (fake client) |
+| `test_adapters_*.py` | MongoDB (mongomock), Redis (skipped unless `redis` is installed and a server runs at `REDIS_URL`, default `localhost:6390`; not run in CI), Firestore (fake client) |
 
 ---
 

@@ -14,7 +14,9 @@ version: "1.0"
 
 # ----------------------------------------------------------------------------
 # TENANT COLUMN — The column name used across all protected tables.
-# If a table has this column, it gets auto-protected.
+# If a table has this column, the middleware protects it. The migrations only
+# protect tables with a column named tenant_id: with another tenant_column, set
+# up the database layer (RLS / views / policies) by hand.
 # Env override: DB_FIREWALL_TENANT_COLUMN
 # ----------------------------------------------------------------------------
 tenant_column: "tenant_id"
@@ -66,15 +68,16 @@ protect:
   delete: true    # Prevents deleting rows across tenants
 
 # ----------------------------------------------------------------------------
-# AUDIT — NOT read by the Python middleware (reserved). The migrations create
-# _firewall_audit_log; on PostgreSQL, _firewall_set_tenant() writes a row per
-# assignment. The middleware sets context directly and writes no audit row.
-# Purge with: SELECT _firewall_purge_audit(90);
+# AUDIT — NOT read by the Python middleware (reserved). The PostgreSQL, MySQL
+# and SQL Server migrations create _firewall_audit_log (Oracle: VPD_AUDIT_LOG),
+# and their _firewall_set_tenant writes a row per assignment. The middleware
+# sets context directly and writes no audit row.
+# Purge (PostgreSQL only): SELECT _firewall_purge_audit(90);
 # ----------------------------------------------------------------------------
 audit:
   enabled: true
   table_name: "_firewall_audit_log"
-  retention_days: 90    # Auto-purge old audit records
+  retention_days: 90    # reserved, not read
   log_queries: false    # Set true to log actual SQL (careful: PII risk)
 
 # ----------------------------------------------------------------------------

@@ -31,7 +31,7 @@ Assess these before implementing — they determine which layers you need:
 - **NEVER share a DB user across tenants** — the `_firewall_tenant_map` must map one DB user per tenant; shared credentials make audit logs meaningless and break per-tenant revocation
 - **NEVER skip the CI scanner** — new tables added without RLS policies are silent cross-tenant leaks; the scanner is the only automated check that catches them before production
 - **NEVER use `SET` instead of `SET LOCAL` for tenant context in transactions** — `SET` persists across transaction boundaries in connection pools; a pooled connection reused by another tenant inherits the previous tenant's context. The middleware uses `set_config(..., true)` (transaction-local), so it refuses autocommit connections; release wrapped connections via `release()`/`close()` and hook `pool_checkin` into the pool
-- **NEVER hardcode bypass roles** — `excluded_users` and the `_firewall_bypass_roles` table are empty by default; on Supabase/Neon/RDS the app connects as `postgres`, so a built-in `postgres` bypass disables every policy. Opt roles in explicitly, and never run the agent as the table owner, a superuser or a `BYPASSRLS` role
+- **NEVER hardcode bypass roles** — the `_firewall_bypass_roles` table is empty by default (`excluded_users` is reserved and not read); on Supabase/Neon/RDS the app connects as `postgres`, so a built-in `postgres` bypass disables every policy. Opt roles in explicitly, and never run the agent as the table owner, a superuser or a `BYPASSRLS` role
 - **NEVER assume policy creation equals enforcement in PostgreSQL** — `CREATE POLICY` alone is insufficient; you must also run `ALTER TABLE your_table ENABLE ROW LEVEL SECURITY` separately, or the policy exists but silently does nothing
 
 ## Step 1: Add Config and Point to It
@@ -40,7 +40,7 @@ Copy `config/firewall.yaml` to `.db-firewall.yaml` in the project, then set `DB_
 
 | Field | Action |
 |-------|--------|
-| `tenant_column` | Match the project's actual column name (e.g. `org_id`, `company_id`) |
+| `tenant_column` | Match the project's actual column name (e.g. `org_id`, `company_id`). The migrations only protect columns named `tenant_id`: with another name, set up the database layer by hand |
 | `excluded_tables` | Add migration/audit/config tables that are legitimately cross-tenant |
 | `excluded_users` | Leave empty. Reserved: the middleware does not read it yet. For a role that must bypass (e.g. `_migrator`), add it to `_firewall_bypass_roles` and give it a connection you do not wrap with `protect()` |
 | `fail_mode` | **ALWAYS set to `closed` for production** — `open` is for local dev only |
@@ -132,7 +132,7 @@ Run it from the repo root. It scopes every SQL-looking string in a `tools/call` 
   run: python -m hooks.scanner --dsn $DATABASE_URL --strict
 ```
 
-Run it from the repo root. It reads the schema (empty tables included) and lists every table with the tenant column. On PostgreSQL a table passes only when RLS is enabled AND forced, all four firewall policies (`_sel`, `_ins`, `_upd`, `_del`) exist on that exact `public.<table>`, and no other permissive policy exists. `--strict` fails the build on any unprotected table; `--json` shows `rls_forced`, `missing_policies` and `extra_permissive_policies`. Run it locally first to review the output before adding it to CI.
+Run it from the repo root. It reads the schema (empty tables included) and lists every non-excluded table with the tenant column (PostgreSQL: `public`; MySQL: the current database). Oracle is not checked. On PostgreSQL a table passes only when RLS is enabled AND forced, all four firewall policies (`_sel`, `_ins`, `_upd`, `_del`) exist on that exact `public.<table>`, and no other permissive policy exists. `--strict` fails the build on any unprotected table; `--json` shows `rls_forced`, `missing_policies` and `extra_permissive_policies`. Run it locally first to review the output before adding it to CI.
 
 ## Step 5: Seed Tenant Mappings
 
@@ -152,12 +152,12 @@ One row per DB user. Never share a DB user between tenants.
 | RLS not firing; all rows returned | DB user is a superuser or has `BYPASSRLS` attribute | Create an unprivileged role; never use superuser for agent connections |
 | RLS not firing; policy exists | `ENABLE ROW LEVEL SECURITY` was not run on the table | `ALTER TABLE your_table ENABLE ROW LEVEL SECURITY` |
 | Tenant context bleeds between requests | Using `SET` instead of `SET LOCAL` for context variable, or connection returned to pool without `release()` | Use `set_config(..., true)`/`SET LOCAL`; call `release()` on the wrapper; add `pool_checkin` as the pool reset hook |
-| `RuntimeError: ... autocommit` from `protect()` on Postgres | Transaction-local context needs an open transaction | `connection.autocommit = False`, or use `tenant_scope()` with middleware-only enforcement |
+| `RuntimeError: ... autocommit` from `protect()` on Postgres | Transaction-local context needs an open transaction | `connection.autocommit = False` (with `fail_mode: closed` there is no other way) |
 | All rows visible although policies exist | Role listed in `_firewall_bypass_roles`, or app connects as owner/superuser/`BYPASSRLS` | Remove the row; connect the app as an unprivileged role |
 | Middleware filtering but raw SQL queries bypass it | Raw SQL not routed through middleware connection wrapper | Add `protect()` to all connection acquisition paths; use DB-level RLS as primary layer |
 | INSERT rows have NULL tenant_id despite firewall | Policy only filters SELECT; INSERT policy is missing | Add a separate `WITH CHECK` policy or use a trigger to stamp tenant_id on INSERT |
 | Scanner fails a table you protected by hand | RLS not forced, a firewall policy missing, or an extra permissive policy (PostgreSQL ORs them) | Run `--json`; fix what `rls_forced`, `missing_policies` or `extra_permissive_policies` shows, or re-run the migration |
-| A new table in another schema is not reported | The scanner and the PostgreSQL migration cover `public` only | Keep tenant tables in `public`, or protect other schemas by hand |
+| PostgreSQL: a new table in another schema is not reported | The PostgreSQL scanner and migration cover `public` only | Keep tenant tables in `public`, or protect other schemas by hand |
 
 ## NoSQL Stores (MongoDB, Redis, Firestore, Convex)
 

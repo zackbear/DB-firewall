@@ -2,8 +2,10 @@
 
 ## 2026-10-20: security and structure batch (PRs #4 to #9)
 
-Read **Upgrading** first: four of these changes can stop requests or leave
-tables unscoped until you change your setup.
+Read **Upgrading** first: four of these changes can break an existing setup.
+The config path, the `X-Tenant-ID` header and `protect()` can refuse queries or
+leave tables unscoped until you change your setup; the CLI change breaks
+scripts that call the removed commands.
 
 ### Upgrading
 
@@ -18,12 +20,13 @@ tables unscoped until you change your setup.
    (or `?tenant_id=` on FastAPI and Flask) from every request. Pass
    `tenant_id_source=...`, or set `trust_tenant_header: true` behind a gateway
    that authenticates the caller and overwrites the header. Until then, such
-   requests have no tenant: refused with `fail_mode: closed`, unscoped with
-   `open`. The first ignored header is logged as a warning.
+   requests have no tenant: their queries on protected tables are refused under
+   `fail_mode: closed` and run unscoped under `open`. The first ignored header is logged as a warning.
 3. **`protect()` and the shared tenant (#4).** `protect(conn, tenant_id="A")`
    no longer sets the shared request tenant, so a later `protect(other_conn)`
    without a tenant does not inherit "A". It falls back to the `TENANT_ID`
-   environment variable, then `_firewall_tenant_map`, then fails closed. Pass
+   environment variable, then `_firewall_tenant_map`, then no tenant: queries on
+   protected tables are refused under `fail_mode: closed`, unscoped under `open`. Pass
    `tenant_id=` to every `protect()` call, or wrap the work in `tenant_scope("A")`.
 4. **CLI (#6, #8).** The `migrate` and `check` commands did nothing and are
    removed. `python -m middleware.db_firewall info` prints the active config.
@@ -39,8 +42,8 @@ Also changed:
   nothing (#6).
 - The MCP wrapper refuses SQL it cannot scope with a JSON-RPC error and drops
   lines that are not JSON. Before, it passed them through or stopped (#6).
-- Under ASGI, an `async def` `tenant_id_source` used where the middleware runs
-  in sync mode raises `ImproperlyConfigured` at startup (#9).
+- An `async def` `tenant_id_source` in sync mode (WSGI, or ASGI with sync-only
+  middleware after this one) raises `ImproperlyConfigured` at startup (#9).
 
 ### Fixed
 
