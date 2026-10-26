@@ -50,7 +50,12 @@ def migrated():
     cur = c.cursor()
     cur.execute("DROP USER IF EXISTS 'dbfw_app'@'%'")
     cur.execute(f"CREATE USER 'dbfw_app'@'%' IDENTIFIED BY '{APP_PW}'")
-    cur.execute(f"GRANT SELECT ON `{U.path.lstrip('/')}`.`v_orders` TO 'dbfw_app'@'%'")
+    db = U.path.lstrip('/')
+    # Exactly the README grant recipe.
+    cur.execute(f"GRANT SELECT ON `{db}`.`v_orders` TO 'dbfw_app'@'%'")
+    cur.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON `{db}`.`orders` TO 'dbfw_app'@'%'")
+    cur.execute(f"GRANT INSERT ON `{db}`.`_firewall_audit_log` TO 'dbfw_app'@'%'")
+    cur.execute(f"GRANT EXECUTE ON PROCEDURE `{db}`.`_firewall_init_connection` TO 'dbfw_app'@'%'")
     cur.execute("DELETE FROM _firewall_tenant_map")
     # Only the app user is mapped: a mapped user gets its tenant from the map
     # even with no session tenant, which the fail-closed tests rule out.
@@ -142,6 +147,25 @@ def test_middleware_refuses_setting_the_variable(conn, cfg):
     cur = conn.cursor()
     cur.execute("SELECT _firewall_is_bypass(), @_fw_tenant_id")
     assert cur.fetchone() == (0, "A")
+
+
+def test_readme_grants_are_enough_for_the_app(cfg):
+    cfg["audit"]["enabled"] = True
+    app = _connect("dbfw_app", APP_PW)
+    try:
+        app.cursor().execute("CALL _firewall_init_connection()")      # pool hook: map -> B
+        pc = protect(app, tenant_id="B", config=cfg)                   # audit row as the app
+        cur = pc.cursor()
+        cur.execute("UPDATE orders SET id = id WHERE id = 2")
+        assert cur.rowcount == 1
+        cur.execute("DELETE FROM orders WHERE id = 1")                 # A's row: scoped away
+        assert cur.rowcount == 0
+        assert _ids(app.cursor()) == [2]                               # raw read through the view
+        with pytest.raises(pymysql.err.OperationalError):
+            app.cursor().execute("CALL _firewall_apply_all()")         # no EXECUTE on it
+    finally:
+        app.rollback()
+        app.close()
 
 
 def test_trigger_blocks_null_tenant_insert(conn, cfg):
