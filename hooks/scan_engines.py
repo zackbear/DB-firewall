@@ -8,7 +8,7 @@ import sys
 from typing import Dict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from middleware.db_firewall import DBEngine, _is_excluded_table, engine_options  # noqa: E402
+from middleware.db_firewall import DBEngine, _is_excluded_table, engine_options, placeholder  # noqa: E402
 
 # Exact schema.table match (pg_class + pg_namespace), so a same-named table
 # elsewhere cannot vouch for this one. Protected = RLS enabled AND forced
@@ -60,7 +60,7 @@ _SQLSERVER_TABLES = """
     FROM INFORMATION_SCHEMA.COLUMNS c
     JOIN INFORMATION_SCHEMA.TABLES t
         ON c.TABLE_SCHEMA = t.TABLE_SCHEMA AND c.TABLE_NAME = t.TABLE_NAME
-    WHERE c.COLUMN_NAME = ?
+    WHERE c.COLUMN_NAME = {ph}
         AND t.TABLE_TYPE = 'BASE TABLE'
     ORDER BY c.TABLE_NAME
 """
@@ -123,11 +123,12 @@ def _scan_mysql(cursor, tenant_col, excluded, opts) -> Dict[str, dict]:
 def _scan_sqlserver(cursor, tenant_col, excluded, opts) -> Dict[str, dict]:
     """Protected = a security policy named firewall_rls_<table> exists."""
     results = {}
-    cursor.execute(_SQLSERVER_TABLES, (tenant_col,))
+    ph = placeholder(cursor)                # pyodbc "?", pymssql "%s"
+    cursor.execute(_SQLSERVER_TABLES.format(ph=ph), (tenant_col,))
     for (table,) in cursor.fetchall():
         if _is_excluded_table(table, excluded):
             continue
-        cursor.execute("SELECT 1 FROM sys.security_policies WHERE name = ?",
+        cursor.execute(f"SELECT 1 FROM sys.security_policies WHERE name = {ph}",
                        (f"firewall_rls_{table}",))
         has_policy = cursor.fetchone() is not None
         results[table] = {"has_tenant_col": True, "has_rls_policy": has_policy,

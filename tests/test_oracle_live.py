@@ -3,12 +3,12 @@ Live Oracle (Oracle Database Free 23ai) tests: VPD migration with a custom
 tenant column, the Python middleware's Oracle paths, and the scanner.
 
 Opt-in. Set DBFW_ORA_DSN=user/password@host:port/service for the schema owner
-the migration was run for, after tests/oracle_setup.sql and the migration:
+the migration was run for, after tests/live_setup/oracle_before.sql and the migration:
 
-    sqlplus app/pw@//localhost:1521/FREEPDB1 @tests/oracle_setup.sql
+    sqlplus app/pw@//localhost:1521/FREEPDB1 @tests/live_setup/oracle_before.sql
     sqlplus system/pw@//localhost:1521/FREEPDB1 @migrations/004_oracle.sql
       (with SCHEMA_OWNER = that user and TENANT_COLUMN = 'ORG_ID')
-    sqlplus app/pw@//localhost:1521/FREEPDB1 @tests/oracle_after_migration.sql
+    sqlplus app/pw@//localhost:1521/FREEPDB1 @tests/live_setup/oracle_after.sql
 """
 
 import copy

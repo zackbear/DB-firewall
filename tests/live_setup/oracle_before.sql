@@ -1,5 +1,5 @@
 -- Test data for tests/test_oracle_live.py. Run as the schema owner BEFORE the
--- migration; tests/oracle_after_migration.sql runs after it.
+-- migration; tests/live_setup/oracle_after.sql runs after it.
 BEGIN
   FOR t IN (SELECT table_name FROM user_tables
             WHERE table_name IN ('ORDERS', 'PLAIN', 'NOTES', 'LATE_TABLE',
