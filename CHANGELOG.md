@@ -16,7 +16,9 @@
   server (see Fixed). `source migrations/002_mysql.sql` no longer applies the
   views and triggers by itself: run `CALL _firewall_apply_all()` and pipe its
   output to `mysql` (README "Run the migration"), or use `run_migration(conn)`.
-  It drops and re-creates the firewall routines and triggers.
+  It drops and re-creates the firewall routines and triggers, and MySQL drops
+  routine grants with the routine: re-grant `EXECUTE` on
+  `_firewall_init_connection` after each run.
 - **`run_migration()`** runs MySQL (it parses `DELIMITER`) and refuses Oracle
   with `NotImplementedError` (SQL*Plus `DEFINE`). Before, it sent both scripts
   to the driver, which cannot run them.

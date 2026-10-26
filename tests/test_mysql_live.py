@@ -151,6 +151,10 @@ def test_middleware_refuses_setting_the_variable(conn, cfg):
 
 def test_readme_grants_are_enough_for_the_app(cfg):
     cfg["audit"]["enabled"] = True
+    admin = _connect()                     # a migration re-run drops routine grants: grant again
+    admin.cursor().execute(f"GRANT EXECUTE ON PROCEDURE `{U.path.lstrip('/')}`."
+                           "`_firewall_init_connection` TO 'dbfw_app'@'%'")
+    admin.close()
     app = _connect("dbfw_app", APP_PW)
     try:
         app.cursor().execute("CALL _firewall_init_connection()")      # pool hook: map -> B

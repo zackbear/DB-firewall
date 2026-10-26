@@ -81,7 +81,10 @@ MySQL has no RLS. Its layer is views plus triggers, keyed on the user variable
   tables read slower through them.
 * Re-running drops and re-creates each trigger, so writes in between are not
   checked, and `CREATE OR REPLACE VIEW` waits for open transactions that read
-  the view. Re-run when the app is quiet.
+  the view. Re-run when the app is quiet. It also drops and re-creates the
+  routines, and MySQL deletes a routine's grants with it: run the
+  `GRANT EXECUTE ON PROCEDURE db._firewall_init_connection` again after each
+  run (until then the app's pool hook fails with "execute command denied").
 * `run_migration()` is tested with PyMySQL. Old mysql-connector versions
   refuse the multi-statement routines.
 * Tables with names over 57 characters get a hashed name stem
