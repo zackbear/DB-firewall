@@ -51,8 +51,9 @@ def migrated():
     cur.execute(f"CREATE USER 'dbfw_app'@'%' IDENTIFIED BY '{APP_PW}'")
     cur.execute(f"GRANT SELECT ON `{U.path.lstrip('/')}`.`v_orders` TO 'dbfw_app'@'%'")
     cur.execute("DELETE FROM _firewall_tenant_map")
-    cur.execute("INSERT INTO _firewall_tenant_map (db_user, tenant_id) VALUES "
-                "(SUBSTRING_INDEX(CURRENT_USER(), '@', 1), 'A'), ('dbfw_app', 'B')")
+    # Only the app user is mapped: a mapped user gets its tenant from the map
+    # even with no session tenant, which the fail-closed tests rule out.
+    cur.execute("INSERT INTO _firewall_tenant_map (db_user, tenant_id) VALUES ('dbfw_app', 'B')")
     c.commit()
     c.close()
 
@@ -148,8 +149,11 @@ def test_resolution_from_map_and_session_var(conn, cfg):
     cfg["resolution"] = [{"source": "session_var"}]
     assert protect(conn, config=cfg)._tenant_id == "B"
     conn.cursor().execute("SET @_fw_tenant_id = NULL")
+    cur = conn.cursor()
+    cur.execute("INSERT INTO _firewall_tenant_map (db_user, tenant_id) "
+                "VALUES (SUBSTRING_INDEX(CURRENT_USER(), '@', 1), 'A')")
     cfg["resolution"] = [{"source": "db_user_map"}]
-    assert protect(conn, config=cfg)._tenant_id == "A"
+    assert protect(conn, config=cfg)._tenant_id == "A"    # rolled back by the fixture
 
 
 def test_excluded_user(conn, cfg):
