@@ -37,6 +37,8 @@ CREATE TABLE dbo._firewall_audit_log (
     auth_method     NVARCHAR(50) DEFAULT 'auto'
 );
 
+IF NOT EXISTS (SELECT * FROM sys.indexes WHERE name = 'IX_firewall_audit_tenant'
+               AND object_id = OBJECT_ID('dbo._firewall_audit_log'))
 CREATE NONCLUSTERED INDEX IX_firewall_audit_tenant
     ON dbo._firewall_audit_log (tenant_id, assigned_at)
     WHERE tenant_id IS NOT NULL;
