@@ -72,6 +72,8 @@ def test_protect_scopes_both_layers(conn, cfg):
 
 def test_set_tenant_does_not_commit_caller_work(conn, cfg):
     cur = conn.cursor()
+    cur.execute("DELETE FROM NOTES WHERE id = 99")
+    conn.commit()
     cur.execute("INSERT INTO NOTES (id, body) VALUES (99, 'uncommitted')")
     protect(conn, tenant_id="A", config=cfg)              # calls set_tenant (audits)
     conn.rollback()
@@ -126,8 +128,13 @@ def test_request_tenant_and_rewrite_on_join(conn, cfg):
 
 
 def test_scanner(conn, cfg):
+    cur = conn.cursor()
+    cur.execute("BEGIN EXECUTE IMMEDIATE 'DROP TABLE LATE_TABLE PURGE'; "
+                "EXCEPTION WHEN OTHERS THEN NULL; END;")
+    cur.execute("CREATE TABLE LATE_TABLE (id NUMBER, org_id VARCHAR2(64))")  # after the migration
     report = scan_tables(conn, DBEngine.ORACLE, cfg)
+    cur.execute("DROP TABLE LATE_TABLE PURGE")
     assert report["ORDERS"]["protected"] is True
-    assert report["LATE_TABLE"]["protected"] is False     # created after the migration
+    assert report["LATE_TABLE"]["protected"] is False
     assert "PLAIN" not in report and "NOTES" not in report  # no org_id column
     assert "VPD_AUDIT_LOG" not in report and "TENANT_USER_MAP" not in report
