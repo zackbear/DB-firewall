@@ -160,11 +160,11 @@ def test_readme_grants_are_enough_for_the_app(cfg):
         app.cursor().execute("CALL _firewall_init_connection()")      # pool hook: map -> B
         pc = protect(app, tenant_id="B", config=cfg)                   # audit row as the app
         cur = pc.cursor()
-        cur.execute("UPDATE orders SET id = id WHERE id = 2")
+        cur.execute("UPDATE orders SET id = 20 WHERE id = 2")           # rolled back below
         assert cur.rowcount == 1
         cur.execute("DELETE FROM orders WHERE id = 1")                 # A's row: scoped away
         assert cur.rowcount == 0
-        assert _ids(app.cursor()) == [2]                               # raw read through the view
+        assert _ids(app.cursor()) == [20]                              # raw read through the view
         with pytest.raises(pymysql.err.OperationalError):
             app.cursor().execute("CALL _firewall_apply_all()")         # no EXECUTE on it
     finally:
