@@ -375,6 +375,10 @@ class TestMySQLGuard:
         "EXECUTE st",
         "CALL _firewall_init_connection()",
         "DO SLEEP(1)",
+        "/*!DELETE FROM orders*/",
+        "/*M!DELETE FROM orders*/",
+        "SELECT id FROM orders WHERE id > 0 /*! OR 1=1 */",
+        "SELECT id FROM orders /*!80000 , @y := 1 */",
     ])
     def test_statements_naming_the_layer_are_refused(self, cfg, rewriter, sql):
         from db_firewall.rewrite import check_no_tenant, rewrite_query
@@ -383,6 +387,12 @@ class TestMySQLGuard:
             rewrite_query(sql, "A", cfg, None, DBEngine.MYSQL)
         with pytest.raises(PermissionError):
             check_no_tenant(sql, cfg, None, DBEngine.MYSQL)
+
+    def test_unknown_engine_gets_the_mysql_check(self, cfg):
+        from db_firewall.rewrite import rewrite_query
+        cfg["rewriter"] = "regex"
+        with pytest.raises(PermissionError):
+            rewrite_query("SET @_fw_tenänt_id = '__BYPASS__'", "A", cfg, None, DBEngine.UNKNOWN)
 
     def test_at_sign_in_literals_and_other_engines_is_fine(self, cfg):
         from db_firewall.rewrite import rewrite_query

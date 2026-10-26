@@ -59,8 +59,10 @@ MySQL has no RLS. Its layer is views plus triggers, keyed on the user variable
   refuses every statement with a user variable (an `@` outside single-quoted
   literals and comments, also inside double quotes or backticks) and dynamic
   SQL (`PREPARE`, `EXECUTE`, `DEALLOCATE`, `CALL`, `DO`, `HANDLER`). Pass
-  values as parameters or single-quoted literals. Agents with a raw
-  connection are not covered.
+  values as parameters or single-quoted literals. The same check runs when
+  the engine is not recognised. Agents with a raw connection are not covered.
+* On every engine the middleware refuses MySQL/MariaDB executable comments
+  (`/*! ... */`, `/*M! ... */`): MySQL runs their text as SQL.
 * Grants for the app user: `SELECT` on the `v_` views; `SELECT`, `INSERT`,
   `UPDATE`, `DELETE` on the base tables (the middleware's `UPDATE`/`DELETE`
   adds a `WHERE` on the tenant column, which needs `SELECT`; the triggers

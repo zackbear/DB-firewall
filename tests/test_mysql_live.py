@@ -172,6 +172,16 @@ def test_readme_grants_are_enough_for_the_app(cfg):
         app.close()
 
 
+@pytest.mark.parametrize("rewriter", ["ast", "regex"])
+def test_executable_comments_refused(conn, cfg, rewriter):
+    cfg["rewriter"] = rewriter
+    cur = protect(conn, tenant_id="A", config=cfg).cursor()
+    for sql in ("SELECT id FROM orders WHERE id > 0 /*! OR 1=1 */", "/*!DELETE FROM orders*/"):
+        with pytest.raises(PermissionError):
+            cur.execute(sql)
+    assert _ids(conn.cursor(), "orders") == [1, 2]       # nothing deleted (raw admin read)
+
+
 def test_trigger_blocks_null_tenant_insert(conn, cfg):
     protect(conn, tenant_id="A", config=cfg)
     with pytest.raises(pymysql.err.OperationalError, match="Cross-tenant INSERT"):

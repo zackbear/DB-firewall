@@ -133,11 +133,18 @@ _FIREWALL_NAMES_RE = re.compile(
 _MYSQL_DYNAMIC_RE = re.compile(r"^\s*(?:PREPARE|EXECUTE|DEALLOCATE|CALL|DO|HANDLER)\b", re.I)
 
 
+# MySQL runs the text inside /*! ... */ (MariaDB: /*M! ... */) as SQL, so a
+# checker that treats it as a comment is blind to it: refused on every engine.
+_EXEC_COMMENT_RE = re.compile(r"/\*M?!", re.I)
+
+
 def _refuse_firewall_names(sql: str, engine: str = None) -> None:
+    if _EXEC_COMMENT_RE.search(sql):
+        raise PermissionError("DB Firewall: MySQL executable comments (/*! */) are refused")
     if _FIREWALL_NAMES_RE.search(sql):
         raise PermissionError("DB Firewall: statement names the firewall's tenant "
                               "variable or routines; refused")
-    if engine == DBEngine.MYSQL:
+    if engine in (DBEngine.MYSQL, DBEngine.UNKNOWN, None):     # unknown: could be MySQL
         clean = _strip_sql(sql)
         if "@" in clean or _MYSQL_DYNAMIC_RE.match(clean):
             raise PermissionError("DB Firewall: MySQL user variables and dynamic SQL "

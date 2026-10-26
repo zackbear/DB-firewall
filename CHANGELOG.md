@@ -100,6 +100,11 @@
   - a table name over 57 characters stopped the trigger step; such names now
     get a hashed stem.
 - SQL Server migration failed on a second run (the audit index already existed).
+- MySQL executable comments (`/*! ... */`, `/*M! ... */`) passed the middleware.
+  With `rewriter: regex`, `/*!DELETE FROM orders*/` ran unscoped and
+  `... /*! OR 1=1 */` widened a scoped query to every tenant. They are now
+  refused on every engine (predates this PR). The MySQL checks also run when
+  the engine is not recognised.
 - Docs: unread config keys, scanner coverage, audit and fail-closed wording
   (first commits of this PR).
 
