@@ -89,6 +89,29 @@ def _reject_unsafe_shape(clean: str) -> None:
             "cannot be safely scoped to a tenant")
 
 
+_FROM_LIST_END_RE = re.compile(
+    r"\b(?:WHERE|ORDER\s+BY|GROUP\s+BY|HAVING|LIMIT|OFFSET|FETCH|FOR|WINDOW|RETURNING"
+    r"|ON\s+DUPLICATE|ON\s+CONFLICT|SET|VALUES)\b", re.IGNORECASE)
+
+
+def _hidden_table_shape(clean: str):
+    """A shape that can put a table where _extract_tables does not look: the
+    regex path refuses it instead of passing the statement through unscoped."""
+    if re.search(r"\bSTRAIGHT_JOIN\b", clean, re.IGNORECASE):
+        return "STRAIGHT_JOIN"
+    if re.search(r"\b(?:FROM|JOIN)\s*\(", clean, re.IGNORECASE):
+        return "parenthesised table or derived table"
+    for m in _FROM_RE.finditer(clean):
+        rest = clean[m.end():]
+        end = _FROM_LIST_END_RE.search(rest)
+        depth = 0
+        for ch in rest[:end.start()] if end else rest:
+            depth += (ch == "(") - (ch == ")")
+            if ch == "," and depth == 0:
+                return "comma join"
+    return None
+
+
 def _is_excluded_table(table: str, excluded: List[str]) -> bool:
     """Check if table matches exclusion patterns."""
     import fnmatch
@@ -146,9 +169,11 @@ def _refuse_firewall_names(sql: str, engine: str = None) -> None:
                               "variable or routines; refused")
     if engine in (DBEngine.MYSQL, DBEngine.UNKNOWN, None):     # unknown: could be MySQL
         clean = _strip_sql(sql)
-        if "@" in clean or _MYSQL_DYNAMIC_RE.match(clean):
-            raise PermissionError("DB Firewall: MySQL user variables and dynamic SQL "
-                                  "(PREPARE/EXECUTE/CALL/DO/HANDLER) are refused")
+        # "#" starts a comment on MySQL that strip_sql does not blank: a trailing
+        # "# x" would comment out a predicate appended after it.
+        if "@" in clean or "#" in clean or _MYSQL_DYNAMIC_RE.match(clean):
+            raise PermissionError("DB Firewall: MySQL user variables, # comments and "
+                                  "dynamic SQL (PREPARE/EXECUTE/CALL/DO/HANDLER) are refused")
 
 
 def rewrite_query(sql: str, tenant_id: str, config: dict,
@@ -249,6 +274,10 @@ def _rewrite_query_regex(sql: str, tenant_id: str, config: dict, is_protected) -
         if head.startswith(op.upper()) and not protect.get(op, True):
             return sql
 
+    shape = _hidden_table_shape(clean)
+    if shape:
+        raise PermissionError(f"DB Firewall: unsupported statement shape ({shape}) for "
+                              "rewriter: regex; use the default ast rewriter")
     if not protected_tables:
         return sql
 

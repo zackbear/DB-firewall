@@ -182,6 +182,23 @@ def test_executable_comments_refused(conn, cfg, rewriter):
     assert _ids(conn.cursor(), "orders") == [1, 2]       # nothing deleted (raw admin read)
 
 
+@pytest.mark.parametrize("rewriter", ["ast", "regex"])
+@pytest.mark.parametrize("sql", [
+    "SELECT o.id FROM (SELECT 1) t, orders o",
+    "SELECT id FROM (orders)",
+    "SELECT o.id FROM (SELECT 1) t STRAIGHT_JOIN orders o",
+    "SELECT id FROM orders # x",
+])
+def test_no_read_of_another_tenant(conn, cfg, rewriter, sql):
+    cfg["rewriter"] = rewriter
+    cur = protect(conn, tenant_id="A", config=cfg).cursor()
+    try:
+        cur.execute(sql)
+    except PermissionError:
+        return                                            # refused: fine
+    assert sorted(r[0] for r in cur.fetchall()) == [1]   # scoped: only tenant A
+
+
 def test_trigger_blocks_null_tenant_insert(conn, cfg):
     protect(conn, tenant_id="A", config=cfg)
     with pytest.raises(pymysql.err.OperationalError, match="Cross-tenant INSERT"):

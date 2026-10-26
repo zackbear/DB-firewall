@@ -62,7 +62,12 @@ MySQL has no RLS. Its layer is views plus triggers, keyed on the user variable
   values as parameters or single-quoted literals. The same check runs when
   the engine is not recognised. Agents with a raw connection are not covered.
 * On every engine the middleware refuses MySQL/MariaDB executable comments
-  (`/*! ... */`, `/*M! ... */`): MySQL runs their text as SQL.
+  (`/*! ... */`, `/*M! ... */`): MySQL runs their text as SQL. On MySQL it
+  also refuses `#` comments.
+* `rewriter: regex` on MySQL reads base tables with no database layer behind
+  it. It refuses comma joins, parenthesised or derived tables and
+  `STRAIGHT_JOIN`, because its table finder cannot see every table in those.
+  Use the default `ast` rewriter.
 * Grants for the app user: `SELECT` on the `v_` views; `SELECT`, `INSERT`,
   `UPDATE`, `DELETE` on the base tables (the middleware's `UPDATE`/`DELETE`
   adds a `WHERE` on the tenant column, which needs `SELECT`; the triggers

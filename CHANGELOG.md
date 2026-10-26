@@ -105,6 +105,13 @@
   `... /*! OR 1=1 */` widened a scoped query to every tenant. They are now
   refused on every engine (predates this PR). The MySQL checks also run when
   the engine is not recognised.
+- `rewriter: regex` passed a statement through unscoped when its table finder
+  missed a table: `FROM (SELECT 1) t, orders`, `FROM (orders)`,
+  `STRAIGHT_JOIN`, and a trailing MySQL `# comment` that hid the appended
+  predicate. On MySQL these read every tenant's rows (predates this PR). It
+  now refuses comma joins, parenthesised and derived tables and
+  `STRAIGHT_JOIN` on every engine, and `#` on MySQL. The default `ast`
+  rewriter was not affected.
 - Docs: unread config keys, scanner coverage, audit and fail-closed wording
   (first commits of this PR).
 

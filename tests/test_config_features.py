@@ -388,6 +388,26 @@ class TestMySQLGuard:
         with pytest.raises(PermissionError):
             check_no_tenant(sql, cfg, None, DBEngine.MYSQL)
 
+    @pytest.mark.parametrize("sql", [
+        "SELECT o.id, o.org_id FROM (SELECT 1) t, orders o",
+        "SELECT * FROM (SELECT 1) t, orders",
+        "SELECT id, org_id FROM (orders)",
+        "SELECT o.id FROM (SELECT 1) t STRAIGHT_JOIN orders o",
+        "SELECT id, org_id FROM orders # x",
+    ])
+    def test_regex_refuses_shapes_that_hide_a_table(self, cfg, sql):
+        from db_firewall.rewrite import rewrite_query
+        cfg["rewriter"] = "regex"
+        with pytest.raises(PermissionError):
+            rewrite_query(sql, "A", cfg, None, DBEngine.MYSQL)
+
+    def test_regex_still_scopes_plain_shapes(self, cfg):
+        from db_firewall.rewrite import rewrite_query
+        cfg["rewriter"] = "regex"
+        out = rewrite_query("SELECT a, f(b, c) FROM orders WHERE x IN (1, 2) LIMIT 1, 2",
+                            "A", cfg, None, DBEngine.MYSQL)
+        assert "tenant_id = 'A'" in out
+
     def test_unknown_engine_gets_the_mysql_check(self, cfg):
         from db_firewall.rewrite import rewrite_query
         cfg["rewriter"] = "regex"
