@@ -135,8 +135,13 @@ def test_bypass_marker_and_tenant_match_are_exact(conn):
 
 def test_middleware_refuses_setting_the_variable(conn, cfg):
     pc = protect(conn, tenant_id="A", config=cfg)
-    with pytest.raises(PermissionError):
-        pc.cursor().execute("SET @a = 1, @_fw_tenant_id = '__BYPASS__'")
+    for sql in ("SET @a = 1, @_fw_tenant_id = '__BYPASS__'",
+                "SET @'_fw_tenant_i\\d' = '__BYPASS__'", "SET @_fw_tenänt_id = '__BYPASS__'"):
+        with pytest.raises(PermissionError):
+            pc.cursor().execute(sql)
+    cur = conn.cursor()
+    cur.execute("SELECT _firewall_is_bypass(), @_fw_tenant_id")
+    assert cur.fetchone() == (0, "A")
 
 
 def test_trigger_blocks_null_tenant_insert(conn, cfg):

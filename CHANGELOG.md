@@ -28,8 +28,12 @@
   contain `#`, and are checked when a config is passed as a dict too.
 - **MySQL:** a tenant id of `__BYPASS__` (any case) is refused, and the views
   and triggers match tenants exactly (`BINARY`). A tenant `b` no longer sees
-  rows of `B` at the database layer. Statements that name `@_fw_tenant_id`
-  or the firewall routines are refused by the middleware.
+  rows of `B` at the database layer.
+- **MySQL: the middleware refuses user variables and dynamic SQL.** Any
+  statement with an `@` outside single-quoted literals and comments, and any
+  `PREPARE`, `EXECUTE`, `DEALLOCATE`, `CALL`, `DO` or `HANDLER`, is refused.
+  An `@` inside a double-quoted string or a backticked name is refused too:
+  pass such values as parameters.
 - **The scanner** fails on an engine it does not know, instead of passing with
   an empty report.
 - **Oracle:** run the migration as SYS. Re-running it now replaces the policies
@@ -78,9 +82,11 @@
     `vendors`, so it got no view or triggers. The PostgreSQL, MySQL and SQL
     Server scripts now escape `_` in `LIKE` (`ESCAPE '#'`, `[_]`).
 - MySQL layer, found by the second review of this PR:
-  - the middleware let `SET @a=1, @_fw_tenant_id=...`, quoted variable names
-    and `:=` through; it now refuses any statement that names the tenant
-    variable, the tenant routines or `@dbfw_tenant_column`;
+  - the middleware let `SET @a=1, @_fw_tenant_id=...`, quoted, escaped and
+    accented variable names, and `:=` through. On MySQL it now refuses every
+    statement with a user variable (`@` outside single-quoted literals) and
+    dynamic SQL (`PREPARE`, `EXECUTE`, `CALL`, `DO`, `HANDLER`), with either
+    rewriter;
   - a tenant named `__bypass__` (any case, or with accents) passed the bypass
     check. `__BYPASS__` is no longer a valid tenant id, and the SQL compares
     the marker and the tenant as `BINARY`;

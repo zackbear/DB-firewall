@@ -123,16 +123,25 @@ def _sql_literal(tenant_id: str) -> str:
 
 
 # The MySQL layer keys on the user variable @_fw_tenant_id and these routines.
-# The app never needs to name them, so any statement that does is refused, in
-# any form (SET @a=1, @_fw_tenant_id=..., @`_fw_tenant_id`, SELECT ... := ...).
 _FIREWALL_NAMES_RE = re.compile(
-    r"_fw_tenant_id|_firewall_(?:set_tenant|clear_tenant|apply_all)|dbfw_tenant_column", re.I)
+    r"_fw_tenant_id|_firewall_(?:set_tenant|clear_tenant|apply_all|init_connection)"
+    r"|dbfw_tenant_column", re.I)
+# MySQL folds variable names (escapes, accents: @'_fw_tenant_i\d', @_fw_tenänt_id),
+# so matching the name is not enough: on MySQL no user variable gets through at
+# all (an "@" outside single-quoted literals and comments), nor the statements
+# that run SQL built at run time. The ast rewriter refuses those heads too.
+_MYSQL_DYNAMIC_RE = re.compile(r"^\s*(?:PREPARE|EXECUTE|DEALLOCATE|CALL|DO|HANDLER)\b", re.I)
 
 
-def _refuse_firewall_names(sql: str) -> None:
+def _refuse_firewall_names(sql: str, engine: str = None) -> None:
     if _FIREWALL_NAMES_RE.search(sql):
         raise PermissionError("DB Firewall: statement names the firewall's tenant "
                               "variable or routines; refused")
+    if engine == DBEngine.MYSQL:
+        clean = _strip_sql(sql)
+        if "@" in clean or _MYSQL_DYNAMIC_RE.match(clean):
+            raise PermissionError("DB Firewall: MySQL user variables and dynamic SQL "
+                                  "(PREPARE/EXECUTE/CALL/DO/HANDLER) are refused")
 
 
 def rewrite_query(sql: str, tenant_id: str, config: dict,
@@ -150,7 +159,7 @@ def rewrite_query(sql: str, tenant_id: str, config: dict,
     """
     if not sql or not sql.strip():
         return sql
-    _refuse_firewall_names(sql)
+    _refuse_firewall_names(sql, engine)
 
     # No tenant → don't rewrite (fail-closed is enforced by check_no_tenant)
     if tenant_id is None:
@@ -195,7 +204,7 @@ def check_no_tenant(sql: str, config: dict, connection=None, engine: str = None)
     statement is on the pass-through list or touches no protected table."""
     if not sql or not sql.strip():
         return
-    _refuse_firewall_names(sql)
+    _refuse_firewall_names(sql, engine)
     if config.get("rewriter", "ast") != "regex":
         _sqlr.rewrite(sql, None, config.get("tenant_column", "tenant_id"),
                       _protected_predicate(config, connection, engine), engine)

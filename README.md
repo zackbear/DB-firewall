@@ -54,28 +54,40 @@ Tested live: PostgreSQL 16, MySQL 8.4, SQL Server 2022 and Oracle Database Free
 MySQL has no RLS. Its layer is views plus triggers, keyed on the user variable
 `@_fw_tenant_id`:
 
-* A client that can send raw SQL can set that variable. The MySQL layer only
-  holds when agents reach the database through the middleware, which refuses
-  any statement that names `@_fw_tenant_id`, the tenant routines or
-  `@dbfw_tenant_column`.
-* Grants for the app user: `SELECT` on the `v_` views, `INSERT`/`UPDATE`/
-  `DELETE` on the base tables (the triggers check them), and `EXECUTE` only on
-  `_firewall_init_connection`. Views and triggers run as their definer, so the
+* A client that can send raw SQL can set that variable (MySQL also accepts
+  escaped and accent-folded spellings of its name). So on MySQL the middleware
+  refuses every statement with a user variable (an `@` outside single-quoted
+  literals and comments, also inside double quotes or backticks) and dynamic
+  SQL (`PREPARE`, `EXECUTE`, `DEALLOCATE`, `CALL`, `DO`, `HANDLER`). Pass
+  values as parameters or single-quoted literals. Agents with a raw
+  connection are not covered.
+* Grants for the app user: `SELECT` on the `v_` views; `SELECT`, `INSERT`,
+  `UPDATE`, `DELETE` on the base tables (the middleware's `UPDATE`/`DELETE`
+  adds a `WHERE` on the tenant column, which needs `SELECT`; the triggers
+  check every write); `INSERT` on `_firewall_audit_log` when `audit.enabled`;
+  `EXECUTE` only on `_firewall_init_connection` (for pools). So reads of the
+  base tables are scoped by the middleware alone; the views are the read path
+  the database layer covers. Views and triggers run as their definer, so the
   app needs no other routine. Never grant it `EXECUTE ON db.*`,
-  `CREATE TEMPORARY TABLES`, or rights on the `_firewall_` tables.
+  `CREATE TEMPORARY TABLES`, DDL rights, or other rights on the `_firewall_`
+  tables.
 * A user with a `_firewall_tenant_map` row gets that tenant whenever none is
   set. The map uses the user part of the login (`USER()`, before the first
   `@`): keep no anonymous accounts and no user names that contain `@`.
 * The views and triggers compare tenants exactly (`BINARY`). The middleware's
   rewrite uses `=`, which ignores case under MySQL's default collation: keep
-  tenant ids unique ignoring case, and use a string tenant column.
+  tenant ids unique ignoring case, and use a string tenant column. `BINARY`
+  stops the views from seeking on an index of the tenant column, so large
+  tables read slower through them.
 * Re-running drops and re-creates each trigger, so writes in between are not
   checked, and `CREATE OR REPLACE VIEW` waits for open transactions that read
   the view. Re-run when the app is quiet.
 * `run_migration()` is tested with PyMySQL. Old mysql-connector versions
   refuse the multi-statement routines.
 * Tables with names over 57 characters get a hashed name stem
-  (`v_<first 40>_<16 hex>`), so the names fit MySQL's 64 characters.
+  (`v_<first 40>_<16 hex>`), so the names fit MySQL's 64 characters. A user
+  with DDL rights could create a table named like another table's stem and
+  take over its view and triggers; keep DDL away from app users.
 
 Oracle: run as SYS. The logon/logoff triggers call the package, and any other
 DBA user needs a direct grant from the schema owner first (see section 6b of

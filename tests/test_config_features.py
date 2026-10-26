@@ -366,6 +366,15 @@ class TestMySQLGuard:
         "CALL _firewall_set_tenant('B')",
         "CALL _firewall_apply_all()",
         "SET @dbfw_tenant_column = 'owner'",
+        "SET @'_fw_tenant_i\\d' = '__BYPASS__'",               # MySQL drops the backslash
+        'SET @"_fw_tenant_i\\d" = \'__BYPASS__\'',
+        "SET @_fw_tenänt_id = '__BYPASS__'",                    # accent-insensitive names
+        "SELECT @'_fw_tenant_i\\d' := '__BYPASS__'",
+        "SET @s = 'x'",
+        "PREPARE st FROM 'SET @x = 1'",
+        "EXECUTE st",
+        "CALL _firewall_init_connection()",
+        "DO SLEEP(1)",
     ])
     def test_statements_naming_the_layer_are_refused(self, cfg, rewriter, sql):
         from db_firewall.rewrite import check_no_tenant, rewrite_query
@@ -374,6 +383,11 @@ class TestMySQLGuard:
             rewrite_query(sql, "A", cfg, None, DBEngine.MYSQL)
         with pytest.raises(PermissionError):
             check_no_tenant(sql, cfg, None, DBEngine.MYSQL)
+
+    def test_at_sign_in_literals_and_other_engines_is_fine(self, cfg):
+        from db_firewall.rewrite import rewrite_query
+        assert rewrite_query("SELECT 'a@b' FROM t", "A", cfg, None, DBEngine.MYSQL)
+        assert rewrite_query("SELECT * FROM t WHERE j @> '{}'", "A", cfg, None, DBEngine.POSTGRESQL)
 
     @pytest.mark.parametrize("tenant", ["__BYPASS__", "__bypass__", "__Bypass__"])
     def test_bypass_marker_is_not_a_tenant(self, tenant):
