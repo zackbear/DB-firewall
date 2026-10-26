@@ -181,12 +181,11 @@ class TestAuditAndEngines:
         sql, params = conn.log[-1]
         assert sql.startswith("INSERT INTO _firewall_audit_log") and params == ("A",)
 
-    def test_oracle_uses_its_audit_table_and_marker(self, cfg):
+    def test_oracle_audit_left_to_the_package(self, cfg):
         cfg["audit"]["enabled"] = True
         conn = fake("oracledb")
-        sys.modules.setdefault("oracledb", type(sys)("oracledb")).paramstyle = "named"
         ProtectedConnection(conn, "A", cfg, DBEngine.ORACLE)
-        assert "INSERT INTO VPD_AUDIT_LOG" in conn.log[-1][0] and ":1" in conn.log[-1][0]
+        assert [sql for sql, _ in conn.log] == ["BEGIN PKG_SAAS_SECURITY.set_tenant(:1); END;"]
 
     def test_audit_failure_fails_closed(self, cfg):
         cfg["audit"]["enabled"] = True

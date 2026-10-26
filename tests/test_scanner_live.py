@@ -154,3 +154,37 @@ def test_real_migration_passes_scanner():
     finally:
         with psycopg.connect(DSN, autocommit=True) as admin:
             admin.execute("DROP DATABASE IF EXISTS dbfw_scan_tmp")
+
+
+def test_migration_and_scanner_with_custom_column_and_schema():
+    """tenant_column org_id in schema app: the migration protects it, the scanner
+    passes it, and RLS scopes rows by org_id for a non-owner role."""
+    from psycopg.conninfo import make_conninfo
+    from middleware.db_firewall import run_migration
+    cfg = load_config()
+    cfg["tenant_column"] = "org_id"
+    cfg["engines"] = {"postgresql": {"schema": "app"}}
+    with psycopg.connect(DSN, autocommit=True) as admin:
+        admin.execute("DROP DATABASE IF EXISTS dbfw_scan_col")
+        admin.execute("CREATE DATABASE dbfw_scan_col")
+    try:
+        with psycopg.connect(make_conninfo(DSN, dbname="dbfw_scan_col")) as c:
+            c.execute("CREATE SCHEMA app")
+            c.execute("CREATE TABLE app.orders (id int, org_id text)")
+            c.execute("CREATE TABLE app.plain (id int, tenant_id text)")      # wrong column: untouched
+            c.execute("INSERT INTO app.orders VALUES (1,'A'),(2,'B')")
+            c.execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='dbfw_col_app') "
+                      "THEN CREATE ROLE dbfw_col_app LOGIN; END IF; END $$")
+            c.execute("GRANT USAGE ON SCHEMA app TO dbfw_col_app")
+            c.execute("GRANT SELECT ON app.orders TO dbfw_col_app")
+            c.commit()
+            run_migration(c, DBEngine.POSTGRESQL, cfg)
+            report = scan_tables(c, DBEngine.POSTGRESQL, cfg)
+            assert report["orders"]["protected"] is True and "plain" not in report
+            assert scan_tables(c, DBEngine.POSTGRESQL, load_config()) == {}   # public has none
+        with psycopg.connect(make_conninfo(DSN, dbname="dbfw_scan_col", user="dbfw_col_app")) as app:
+            app.execute("SELECT set_config('app.current_tenant', 'A', true)")
+            assert app.execute("SELECT id FROM app.orders").fetchall() == [(1,)]
+    finally:
+        with psycopg.connect(DSN, autocommit=True) as admin:
+            admin.execute("DROP DATABASE IF EXISTS dbfw_scan_col")

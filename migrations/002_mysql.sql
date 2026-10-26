@@ -124,7 +124,8 @@ DELIMITER ;
 -- ============================================================================
 -- Run this stored procedure after every migration to auto-protect tables.
 --
--- For each table with a tenant_id column, it creates:
+-- For each table with the tenant column (@dbfw_tenant_column, default
+-- tenant_id), it creates:
 --   - A view: v_<table>  (filtered to current tenant)
 --   - BEFORE INSERT trigger (enforces tenant_id on new rows)
 --   - BEFORE UPDATE trigger (prevents cross-tenant updates)
@@ -136,18 +137,21 @@ DELIMITER ;
 
 DELIMITER //
 
-CREATE PROCEDURE IF NOT EXISTS _firewall_apply_all()
+DROP PROCEDURE IF EXISTS _firewall_apply_all //
+CREATE PROCEDURE _firewall_apply_all()
 BEGIN
     DECLARE done INT DEFAULT FALSE;
     DECLARE v_table VARCHAR(128);
     DECLARE v_schema VARCHAR(128);
+    -- Tenant column: SET @dbfw_tenant_column = 'org_id' before CALL (default tenant_id).
+    DECLARE v_col VARCHAR(64) DEFAULT COALESCE(NULLIF(@dbfw_tenant_column, ''), 'tenant_id');
     DECLARE cur CURSOR FOR
         SELECT c.TABLE_SCHEMA, c.TABLE_NAME
         FROM INFORMATION_SCHEMA.COLUMNS c
         JOIN INFORMATION_SCHEMA.TABLES t
             ON c.TABLE_SCHEMA = t.TABLE_SCHEMA
             AND c.TABLE_NAME = t.TABLE_NAME
-        WHERE c.COLUMN_NAME = 'tenant_id'
+        WHERE c.COLUMN_NAME = v_col
             AND t.TABLE_TYPE = 'BASE TABLE'
             AND c.TABLE_SCHEMA = DATABASE()
             AND c.TABLE_NAME NOT LIKE '_firewall_%'
@@ -168,7 +172,7 @@ BEGIN
         SET @sql = CONCAT(
             'CREATE OR REPLACE VIEW v_', v_table, ' AS ',
             'SELECT * FROM ', v_table,
-            ' WHERE tenant_id = _firewall_get_tenant() ',
+            ' WHERE `', v_col, '` = _firewall_get_tenant() ',
             'OR _firewall_get_tenant() IS NULL AND 1=0 ',
             'OR @_fw_tenant_id = ''__BYPASS__'''
         );
@@ -185,7 +189,7 @@ BEGIN
             '    SET @_fw_noop = 1; ',
             '  ELSEIF _firewall_get_tenant() IS NULL THEN ',
             '    SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''DB Firewall: No tenant context. INSERT denied.''; ',
-            '  ELSEIF NEW.tenant_id != _firewall_get_tenant() THEN ',
+            '  ELSEIF NEW.`', v_col, '` != _firewall_get_tenant() THEN ',
             '    SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''DB Firewall: Cross-tenant INSERT denied.''; ',
             '  END IF; ',
             'END'
@@ -203,9 +207,9 @@ BEGIN
             '    SET @_fw_noop = 1; ',
             '  ELSEIF _firewall_get_tenant() IS NULL THEN ',
             '    SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''DB Firewall: No tenant context. UPDATE denied.''; ',
-            '  ELSEIF OLD.tenant_id != _firewall_get_tenant() THEN ',
+            '  ELSEIF OLD.`', v_col, '` != _firewall_get_tenant() THEN ',
             '    SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''DB Firewall: Cross-tenant UPDATE denied.''; ',
-            '  ELSEIF NEW.tenant_id != OLD.tenant_id THEN ',
+            '  ELSEIF NEW.`', v_col, '` != OLD.`', v_col, '` THEN ',
             '    SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''DB Firewall: Changing tenant_id denied.''; ',
             '  END IF; ',
             'END'
@@ -223,7 +227,7 @@ BEGIN
             '    SET @_fw_noop = 1; ',
             '  ELSEIF _firewall_get_tenant() IS NULL THEN ',
             '    SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''DB Firewall: No tenant context. DELETE denied.''; ',
-            '  ELSEIF OLD.tenant_id != _firewall_get_tenant() THEN ',
+            '  ELSEIF OLD.`', v_col, '` != _firewall_get_tenant() THEN ',
             '    SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''DB Firewall: Cross-tenant DELETE denied.''; ',
             '  END IF; ',
             'END'

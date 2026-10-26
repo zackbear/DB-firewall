@@ -119,13 +119,16 @@ GO
 
 
 -- ============================================================================
--- 7. AUTO-APPLY RLS TO ALL TABLES WITH tenant_id
+-- 7. AUTO-APPLY RLS TO ALL TABLES WITH THE TENANT COLUMN (default tenant_id)
 -- ============================================================================
 
 DECLARE @table NVARCHAR(128);
 DECLARE @schema NVARCHAR(128);
 DECLARE @policy NVARCHAR(256);
 DECLARE @sql NVARCHAR(MAX);
+-- Tenant column: EXEC sp_set_session_context N'dbfw.tenant_column', N'org_id'
+-- in the same session before this script (default tenant_id).
+DECLARE @col SYSNAME = COALESCE(NULLIF(CAST(SESSION_CONTEXT(N'dbfw.tenant_column') AS SYSNAME), N''), N'tenant_id');
 
 DECLARE table_cursor CURSOR FOR
     SELECT c.TABLE_SCHEMA, c.TABLE_NAME
@@ -133,7 +136,7 @@ DECLARE table_cursor CURSOR FOR
     JOIN INFORMATION_SCHEMA.TABLES t
         ON c.TABLE_SCHEMA = t.TABLE_SCHEMA
         AND c.TABLE_NAME = t.TABLE_NAME
-    WHERE c.COLUMN_NAME = 'tenant_id'
+    WHERE c.COLUMN_NAME = @col
         AND t.TABLE_TYPE = 'BASE TABLE'
         AND c.TABLE_NAME NOT LIKE '_firewall_%'
         AND c.TABLE_NAME NOT IN (
@@ -158,13 +161,13 @@ BEGIN
     -- Create security policy with filter (SELECT) and block (INSERT/UPDATE/DELETE) predicates
     SET @sql = '
         CREATE SECURITY POLICY ' + QUOTENAME(@schema) + '.' + QUOTENAME(@policy) + '
-        ADD FILTER PREDICATE dbo._firewall_tenant_predicate(tenant_id)
+        ADD FILTER PREDICATE dbo._firewall_tenant_predicate(' + QUOTENAME(@col) + ')
             ON ' + QUOTENAME(@schema) + '.' + QUOTENAME(@table) + ',
-        ADD BLOCK PREDICATE dbo._firewall_tenant_predicate(tenant_id)
+        ADD BLOCK PREDICATE dbo._firewall_tenant_predicate(' + QUOTENAME(@col) + ')
             ON ' + QUOTENAME(@schema) + '.' + QUOTENAME(@table) + ' AFTER INSERT,
-        ADD BLOCK PREDICATE dbo._firewall_tenant_predicate(tenant_id)
+        ADD BLOCK PREDICATE dbo._firewall_tenant_predicate(' + QUOTENAME(@col) + ')
             ON ' + QUOTENAME(@schema) + '.' + QUOTENAME(@table) + ' BEFORE UPDATE,
-        ADD BLOCK PREDICATE dbo._firewall_tenant_predicate(tenant_id)
+        ADD BLOCK PREDICATE dbo._firewall_tenant_predicate(' + QUOTENAME(@col) + ')
             ON ' + QUOTENAME(@schema) + '.' + QUOTENAME(@table) + ' BEFORE DELETE
         WITH (STATE = ON, SCHEMABINDING = OFF)';
 

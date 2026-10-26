@@ -5,7 +5,8 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from .engines import DBEngine, detect_engine
+from .config import engine_options, load_config
+from .engines import DBEngine, detect_engine, placeholder
 
 logger = logging.getLogger("db_firewall")
 
@@ -24,14 +25,38 @@ _MIGRATION_FILES = {
 }
 
 
-def run_migration(connection, engine: Optional[str] = None):
+# Scripts that use client-only commands (MySQL DELIMITER, SQL*Plus DEFINE and
+# "/") cannot run through a DB-API driver: run them with the engine's client.
+_CLIENT_ONLY = {
+    DBEngine.MYSQL: "mysql -e \"SET @dbfw_tenant_column='<col>'; source migrations/002_mysql.sql\"",
+    DBEngine.ORACLE: "sqlplus <dba>@<db> @migrations/004_oracle.sql (set SCHEMA_OWNER, TENANT_COLUMN first)",
+}
+
+
+def _set_migration_settings(connection, cursor, engine: str, config: dict) -> None:
+    """Pass the tenant column (and the PostgreSQL schema) to the script."""
+    col = config.get("tenant_column", "tenant_id")
+    if engine == DBEngine.POSTGRESQL:
+        schema = engine_options(config, engine).get("schema") or "public"
+        cursor.execute("SELECT set_config('dbfw.tenant_column', %s, false), "
+                       "set_config('dbfw.schema', %s, false)", (col, schema))
+    elif engine == DBEngine.SQLSERVER:
+        cursor.execute(f"EXEC sp_set_session_context N'dbfw.tenant_column', {placeholder(connection)}",
+                       (col,))
+
+
+def run_migration(connection, engine: Optional[str] = None, config: Optional[dict] = None):
     """
-    Run the appropriate migration script for the detected database engine.
+    Run the migration script for the detected database engine, with the
+    tenant column from config (default load_config()). PostgreSQL and SQL
+    Server only: MySQL and Oracle scripts need their own client.
     Call this once during deployment / setup.
     """
     if engine is None:
         engine = detect_engine(connection)
-
+    if engine in _CLIENT_ONLY:
+        raise NotImplementedError(f"DB Firewall: run the {engine} migration with its client: "
+                                  f"{_CLIENT_ONLY[engine]}")
 
     filename = _MIGRATION_FILES.get(engine)
     if not filename:
@@ -43,14 +68,17 @@ def run_migration(connection, engine: Optional[str] = None):
         # Returning here would leave the database without row-level security.
         raise FileNotFoundError(f"DB Firewall: migration file not found: {migration_path}")
 
+    if config is None:
+        config = load_config()
     sql = migration_path.read_text()
     cursor = connection.cursor()
+    _set_migration_settings(connection, cursor, engine, config)
 
-    # Split on GO for SQL Server, semicolons for others
+    # Split on GO for SQL Server; other drivers take the script whole
     if engine == DBEngine.SQLSERVER:
         statements = re.split(r'\bGO\b', sql, flags=re.IGNORECASE)
     else:
-        statements = [sql]  # Let the driver handle multi-statement
+        statements = [sql]
 
     for stmt in statements:
         stmt = stmt.strip()

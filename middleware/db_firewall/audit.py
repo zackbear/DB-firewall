@@ -1,8 +1,9 @@
 """DB Firewall: audit rows for tenant assignments, audit purge, query logging.
 
 Columns match the migrations' audit tables (PostgreSQL, MySQL, SQL Server:
-_firewall_audit_log; Oracle: VPD_AUDIT_LOG). The row is written on the same
-connection, in the same transaction as the tenant context: a rollback drops it.
+_firewall_audit_log). The row is written on the same connection, in the same
+transaction as the tenant context: a rollback drops it. On Oracle the
+migration's set_tenant procedure writes VPD_AUDIT_LOG itself.
 """
 
 import logging
@@ -22,9 +23,8 @@ _INSERT_SQL = {
                      "{ph}, 'middleware')"),
     DBEngine.SQLSERVER: ("INSERT INTO {t} (client_host, tenant_id, auth_method) "
                          "VALUES (HOST_NAME(), {ph}, 'middleware')"),
-    DBEngine.ORACLE: ("INSERT INTO {t} (session_id, db_user, os_user, ip_address, tenant_id, auth_method) "
-                      "VALUES (SYS_CONTEXT('USERENV', 'SID'), USER, SYS_CONTEXT('USERENV', 'OS_USER'), "
-                      "SYS_CONTEXT('USERENV', 'IP_ADDRESS'), {ph}, 'MIDDLEWARE')"),
+    # Oracle: none. PKG_SAAS_SECURITY.set_tenant, which the middleware calls,
+    # already writes VPD_AUDIT_LOG (in an autonomous transaction).
 }
 
 _PURGE_SQL = {

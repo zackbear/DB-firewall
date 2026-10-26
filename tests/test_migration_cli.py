@@ -31,8 +31,9 @@ class FakeConn:
 
 def test_postgres_migration_file_is_found_and_run():
     conn = FakeConn()
-    run_migration(conn, DBEngine.POSTGRESQL)
-    assert len(conn.executed) == 1 and "_firewall_tenant_map" in conn.executed[0]
+    run_migration(conn, DBEngine.POSTGRESQL, {"tenant_column": "org_id"})
+    assert "dbfw.tenant_column" in conn.executed[0]          # settings first, then the script
+    assert len(conn.executed) == 2 and "_firewall_tenant_map" in conn.executed[1]
     assert conn.commits == 1
 
 
@@ -46,7 +47,13 @@ def test_sqlserver_migration_split_on_go():
 def test_missing_migration_file_raises(tmp_path, monkeypatch):
     monkeypatch.setattr(db_firewall, "MIGRATIONS_DIR", tmp_path)
     with pytest.raises(FileNotFoundError):
-        run_migration(FakeConn(), DBEngine.MYSQL)
+        run_migration(FakeConn(), DBEngine.SQLSERVER)
+
+
+@pytest.mark.parametrize("engine", [DBEngine.MYSQL, DBEngine.ORACLE])
+def test_client_only_scripts_are_refused(engine):
+    with pytest.raises(NotImplementedError):
+        run_migration(FakeConn(), engine)
 
 
 def test_engine_without_migration_is_a_noop():

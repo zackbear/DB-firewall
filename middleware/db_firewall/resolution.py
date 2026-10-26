@@ -56,7 +56,10 @@ _MAP_USER_EXPR = {
     DBEngine.POSTGRESQL: ("current_user", "TRUE"),
     DBEngine.MYSQL: ("SUBSTRING_INDEX(CURRENT_USER(), '@', 1)", "1"),
     DBEngine.SQLSERVER: ("SYSTEM_USER", "1"),
+    DBEngine.ORACLE: ("USER", "'Y'"),
 }
+# The Oracle migration names its map TENANT_USER_MAP (is_active 'Y'/'N').
+_DEFAULT_MAP_TABLE = {DBEngine.ORACLE: "TENANT_USER_MAP"}
 
 # Where each engine keeps a DB-side tenant set by the migration's procedures.
 _SESSION_VAR_SQL = {
@@ -74,13 +77,15 @@ def db_user(connection, engine: str) -> Optional[str]:
 
 def _resolve_tenant_from_map(connection, engine: str,
                              table: str = "_firewall_tenant_map") -> Optional[str]:
-    """The active _firewall_tenant_map row for the current DB user."""
+    """The active tenant map row for the current DB user."""
     expr = _MAP_USER_EXPR.get(engine)
     if expr is None:
         return None
+    if table == "_firewall_tenant_map":
+        table = _DEFAULT_MAP_TABLE.get(engine, table)
     user, true = expr
-    return probe(connection, f"SELECT tenant_id FROM {table} "
-                             f"WHERE db_user = {user} AND is_active = {true}")
+    sql = f"SELECT tenant_id FROM {table} WHERE db_user = {user} AND is_active = {true}"
+    return probe(connection, sql)
 
 
 def _from_session_var(connection, engine: str, entry: dict) -> Optional[str]:
