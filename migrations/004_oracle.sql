@@ -279,6 +279,21 @@ END;
 
 
 -- ============================================================================
+-- 6b. PRIVILEGE FOR THE TRIGGERS
+-- ============================================================================
+-- The logon/logoff triggers below belong to the user running this script and
+-- call the package, so that user needs EXECUTE on it. Without it they compile
+-- invalid, and an invalid logon trigger blocks logins.
+
+BEGIN
+  IF USER NOT IN ('&SCHEMA_OWNER', 'SYS') THEN
+    EXECUTE IMMEDIATE 'GRANT EXECUTE ON &SCHEMA_OWNER..&PACKAGE_NAME TO "' || USER || '"';
+  END IF;
+END;
+/
+
+
+-- ============================================================================
 -- 7. LOGON TRIGGER — AUTO-SET TENANT FOR AI AGENTS
 -- ============================================================================
 -- When any DB user connects (including MCP agents, JDBC connections,
@@ -317,6 +332,24 @@ BEGIN
 EXCEPTION
   WHEN OTHERS THEN
     NULL;
+END;
+/
+
+
+-- Safety: never leave an invalid logon/logoff trigger behind (it would block
+-- logins). Disable any that failed to compile and stop with an error.
+DECLARE
+  v_bad NUMBER;
+BEGIN
+  SELECT COUNT(*) INTO v_bad FROM user_objects
+  WHERE object_name IN ('TRG_VPD_LOGON_SET_TENANT', 'TRG_VPD_LOGOFF_CLEAR_TENANT')
+    AND status != 'VALID';
+  IF v_bad > 0 THEN
+    EXECUTE IMMEDIATE 'ALTER TRIGGER trg_vpd_logon_set_tenant DISABLE';
+    EXECUTE IMMEDIATE 'ALTER TRIGGER trg_vpd_logoff_clear_tenant DISABLE';
+    RAISE_APPLICATION_ERROR(-20010,
+      'DB Firewall: logon/logoff triggers are invalid and were disabled. Check privileges.');
+  END IF;
 END;
 /
 
