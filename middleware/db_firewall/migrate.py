@@ -45,6 +45,20 @@ def _set_migration_settings(connection, cursor, engine: str, config: dict) -> No
                        (col,))
 
 
+def _execute_script(cursor, engine: str, sql: str) -> None:
+    """SQL Server batches split on GO; other drivers take the script whole."""
+    statements = re.split(r'\bGO\b', sql, flags=re.IGNORECASE) \
+        if engine == DBEngine.SQLSERVER else [sql]
+    for stmt in statements:
+        stmt = stmt.strip()
+        if stmt:
+            try:
+                cursor.execute(stmt)
+            except Exception as e:
+                logger.error(f"DB Firewall: Migration error: {e}")
+                raise
+
+
 def run_migration(connection, engine: Optional[str] = None, config: Optional[dict] = None):
     """
     Run the migration script for the detected database engine, with the
@@ -74,21 +88,7 @@ def run_migration(connection, engine: Optional[str] = None, config: Optional[dic
     cursor = connection.cursor()
     _set_migration_settings(connection, cursor, engine, config)
 
-    # Split on GO for SQL Server; other drivers take the script whole
-    if engine == DBEngine.SQLSERVER:
-        statements = re.split(r'\bGO\b', sql, flags=re.IGNORECASE)
-    else:
-        statements = [sql]
-
-    for stmt in statements:
-        stmt = stmt.strip()
-        if stmt:
-            try:
-                cursor.execute(stmt)
-            except Exception as e:
-                logger.error(f"DB Firewall: Migration error: {e}")
-                raise
-
+    _execute_script(cursor, engine, sql)
     connection.commit()
     cursor.close()
     logger.info(f"DB Firewall: Migration applied for {engine}")

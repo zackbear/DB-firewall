@@ -14,9 +14,9 @@ version: "1.0"
 
 # ----------------------------------------------------------------------------
 # TENANT COLUMN — The column name used across all protected tables.
-# If a table has this column, the middleware protects it. The migrations only
-# protect tables with a column named tenant_id: with another tenant_column, set
-# up the database layer (RLS / views / policies) by hand.
+# If a table has this column, the middleware protects it. Pass the same name
+# to the migrations (run_migration() does it for PostgreSQL and SQL Server;
+# see README "Run the migration" for psql, mysql, sqlcmd and Oracle).
 # Env override: DB_FIREWALL_TENANT_COLUMN
 # ----------------------------------------------------------------------------
 tenant_column: "tenant_id"
@@ -68,36 +68,58 @@ protect:
   delete: true    # Prevents deleting rows across tenants
 
 # ----------------------------------------------------------------------------
-# AUDIT — NOT read by the Python middleware (reserved). The PostgreSQL, MySQL
-# and SQL Server migrations create _firewall_audit_log (Oracle: VPD_AUDIT_LOG),
-# and their _firewall_set_tenant writes a row per assignment. The middleware
-# sets context directly and writes no audit row.
-# Purge (PostgreSQL only): SELECT _firewall_purge_audit(90);
+# AUDIT — the middleware writes one row per DB-side tenant assignment.
+# Needs the migration's audit table (PostgreSQL, MySQL, SQL Server:
+# _firewall_audit_log). The row is part of the caller's transaction: a rollback
+# drops it. A failed audit write fails closed like the context itself.
+# Oracle: the migration's set_tenant always writes VPD_AUDIT_LOG itself.
+# Purge: purge_audit(conn) deletes rows older than retention_days (you commit).
+# log_queries: log every executed statement (after rewriting) to the
+# "db_firewall.audit" logger at INFO. Careful: SQL can hold personal data.
 # ----------------------------------------------------------------------------
 audit:
-  enabled: true
+  enabled: false
   table_name: "_firewall_audit_log"
-  retention_days: 90    # reserved, not read
-  log_queries: false    # Set true to log actual SQL (careful: PII risk)
+  retention_days: 90
+  log_queries: false
 
 # ----------------------------------------------------------------------------
-# TENANT RESOLUTION — fixed order, not configurable. protect(conn) without
-# tenant_id= uses the first of:
-#   1. the request's tenant (web integrations, tenant_scope(), set_tenant())
-#   2. the TENANT_ID environment variable, when set
-#   3. _firewall_tenant_map: the active row for the current DB user
-#      (PostgreSQL, MySQL, SQL Server)
-# Nothing found: no tenant, so fail_mode decides. Pass tenant_id= to be explicit.
+# TENANT RESOLUTION — protect(conn) without tenant_id= uses the request's
+# tenant first (web integrations, tenant_scope(), set_tenant()); that cannot be
+# moved. Then these sources, in order; the first valid tenant wins:
+#   env_var          an environment variable (variable:, default TENANT_ID)
+#   db_user_map      the active map row for the current DB user (table:;
+#                    Oracle default TENANT_USER_MAP). PostgreSQL, MySQL,
+#                    SQL Server, Oracle.
+#   session_var      a tenant already set DB-side on this connection
+#                    (PostgreSQL: variable:, default app.current_tenant).
+#                    Only enable it if nothing else sets that value session-wide.
+#   connection_param an attribute of the connection object, or param=value in
+#                    its DSN (param_name:, default tenant_id)
+# Nothing found: no tenant, so fail_mode decides.
 # ----------------------------------------------------------------------------
+resolution:
+  - source: "env_var"
+    variable: "TENANT_ID"
+    enabled: true
+  - source: "db_user_map"
+    table: "_firewall_tenant_map"
+    enabled: true
+  - source: "session_var"
+    variable: "app.current_tenant"
+    enabled: false
+  - source: "connection_param"
+    param_name: "tenant_id"
+    enabled: false
 
 # ----------------------------------------------------------------------------
-# EXCLUDED USERS — NOT read by the Python middleware yet (reserved): a listed
-# role is still filtered by the middleware. To bypass it, use an unwrapped
-# connection. EMPTY BY DEFAULT. On managed Postgres (Supabase, Neon, RDS) the application
-# often connects as "postgres"; a built-in bypass list would disable the
-# firewall for the app itself. Add roles deliberately, e.g. "_migrator".
-# The DB-native layer has its own opt-in list: the _firewall_bypass_roles
-# table created by the migrations (also empty by default).
+# EXCLUDED USERS — DB users whose connections the middleware does NOT scope
+# (no rewrite, no fail-closed check, no DB-side context). Exact match on the
+# name the database reports (Oracle: upper case). A failed lookup counts as
+# not excluded. The database layer still applies unless the role is also in
+# _firewall_bypass_roles. EMPTY BY DEFAULT: on managed Postgres (Supabase,
+# Neon, RDS) the app often connects as "postgres", so a built-in list would
+# disable the firewall for the app itself. Add roles deliberately, e.g. "_migrator".
 # ----------------------------------------------------------------------------
 excluded_users: []
 
@@ -117,21 +139,23 @@ excluded_tables:
   - "feature_flags"
 
 # ----------------------------------------------------------------------------
-# DATABASE-SPECIFIC OVERRIDES — NOT read by the Python middleware (reserved).
-# Each migration script sets up its own engine; the schema is fixed there.
+# PER-ENGINE OPTIONS
+#   use_rls / use_views / use_vpd: false = do not set the DB-side tenant
+#     context (middleware-only, e.g. before the migration is installed)
+#   schema: what the scanner checks (PostgreSQL: also where run_migration
+#     applies RLS). MySQL null = the current database; Oracle null = the user.
+#   audit_table: overrides audit.table_name for that engine
 # ----------------------------------------------------------------------------
 engines:
   postgresql:
-    use_rls: true               # Native Row-Level Security (preferred)
+    use_rls: true
     schema: "public"
   mysql:
-    use_views: true             # MySQL lacks native RLS; use view-based isolation
-    schema: null                # Uses default schema
+    use_views: true
+    schema: null
   sqlserver:
-    use_rls: true               # SQL Server 2016+ supports RLS
+    use_rls: true
     schema: "dbo"
   oracle:
-    use_vpd: true               # Virtual Private Database
+    use_vpd: true
     schema: "APP_USER"
-  sqlite:
-    use_middleware: true         # SQLite has no RLS; enforce in middleware only

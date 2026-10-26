@@ -31,7 +31,7 @@ Assess these before implementing — they determine which layers you need:
 - **NEVER share a DB user across tenants** — the `_firewall_tenant_map` must map one DB user per tenant; shared credentials make audit logs meaningless and break per-tenant revocation
 - **NEVER skip the CI scanner** — new tables added without RLS policies are silent cross-tenant leaks; the scanner is the only automated check that catches them before production
 - **NEVER use `SET` instead of `SET LOCAL` for tenant context in transactions** — `SET` persists across transaction boundaries in connection pools; a pooled connection reused by another tenant inherits the previous tenant's context. The middleware uses `set_config(..., true)` (transaction-local), so it refuses autocommit connections; release wrapped connections via `release()`/`close()` and hook `pool_checkin` into the pool
-- **NEVER hardcode bypass roles** — the `_firewall_bypass_roles` table is empty by default (`excluded_users` is reserved and not read); on Supabase/Neon/RDS the app connects as `postgres`, so a built-in `postgres` bypass disables every policy. Opt roles in explicitly, and never run the agent as the table owner, a superuser or a `BYPASSRLS` role
+- **NEVER hardcode bypass roles** — `excluded_users` and the `_firewall_bypass_roles` table are empty by default; on Supabase/Neon/RDS the app connects as `postgres`, so a built-in `postgres` bypass disables every policy. Opt roles in explicitly, and never run the agent as the table owner, a superuser or a `BYPASSRLS` role
 - **NEVER assume policy creation equals enforcement in PostgreSQL** — `CREATE POLICY` alone is insufficient; you must also run `ALTER TABLE your_table ENABLE ROW LEVEL SECURITY` separately, or the policy exists but silently does nothing
 
 ## Step 1: Add Config and Point to It
@@ -40,9 +40,10 @@ Copy `config/firewall.yaml` to `.db-firewall.yaml` in the project, then set `DB_
 
 | Field | Action |
 |-------|--------|
-| `tenant_column` | Match the project's actual column name (e.g. `org_id`, `company_id`). The migrations only protect columns named `tenant_id`: with another name, set up the database layer by hand |
+| `tenant_column` | Match the project's actual column name (e.g. `org_id`, `company_id`). Pass the same name to the migration (README "Run the migration"; `run_migration(conn)` does it for PostgreSQL and SQL Server) |
 | `excluded_tables` | Add migration/audit/config tables that are legitimately cross-tenant |
-| `excluded_users` | Leave empty. Reserved: the middleware does not read it yet. For a role that must bypass (e.g. `_migrator`), add it to `_firewall_bypass_roles` and give it a connection you do not wrap with `protect()` |
+| `excluded_users` | Leave empty unless a specific role (e.g. `_migrator`) must bypass the middleware; exact name as the database reports it (Oracle: upper case). Mirror it in `_firewall_bypass_roles` for the database layer |
+| `resolution`, `audit`, `engines` | Defaults keep the old behaviour. See `config/firewall.yaml` before changing them; enable `session_var` resolution only if nothing else sets the tenant session-wide |
 | `fail_mode` | **ALWAYS set to `closed` for production** — `open` is for local dev only |
 
 ## Step 2: Run the Database Migration
@@ -56,7 +57,7 @@ Select based on detected database engine:
 | PostgreSQL | `migrations/001_postgresql.sql` | Native RLS — read entire file, contains policy + role setup |
 | MySQL / MariaDB | `migrations/002_mysql.sql` | Views + triggers — read entire file, order matters |
 | SQL Server | `migrations/003_sqlserver.sql` | Native RLS — read entire file, contains security predicate functions |
-| Oracle | `migrations/004_oracle.sql` | VPD — read entire file, parameter order is exact and non-negotiable. It only protects the tables it names (`ORDERS`, `CUSTOMERS`, `INVOICES`, `TRANSACTIONS`): add the project's tables to that list |
+| Oracle | `migrations/004_oracle.sql` | VPD — read entire file. Set `SCHEMA_OWNER` and `TENANT_COLUMN`, run as SYS with SQL*Plus/SQLcl. Every table in that schema with the column gets the policy; re-run after adding tables |
 | SQLite | No migration needed | Middleware-only enforcement — skip to Step 3 |
 
 **Do NOT load** migration files for database engines not present in the project.
@@ -132,7 +133,7 @@ Run it from the repo root. It scopes every SQL-looking string in a `tools/call` 
   run: python -m hooks.scanner --dsn $DATABASE_URL --strict
 ```
 
-Run it from the repo root. It reads the schema (empty tables included) and lists every non-excluded table with the tenant column (PostgreSQL: `public`; MySQL: the current database). Oracle is not checked. On PostgreSQL a table passes only when RLS is enabled AND forced, all four firewall policies (`_sel`, `_ins`, `_upd`, `_del`) exist on that exact `public.<table>`, and no other permissive policy exists. `--strict` fails the build on any unprotected table; `--json` shows `rls_forced`, `missing_policies` and `extra_permissive_policies`. Run it locally first to review the output before adding it to CI.
+Run it from the repo root. It reads the schema (empty tables included) and lists every non-excluded table with the tenant column, in `engines.<engine>.schema` (defaults: PostgreSQL `public`, MySQL the current database, Oracle the connecting user; SQL Server: all schemas). Oracle passes with an enabled `FN_TENANT_ISOLATION` policy covering all four statement types. On PostgreSQL a table passes only when RLS is enabled AND forced, all four firewall policies (`_sel`, `_ins`, `_upd`, `_del`) exist on that exact `<schema>.<table>`, and no other permissive policy exists. `--strict` fails the build on any unprotected table; `--json` shows `rls_forced`, `missing_policies` and `extra_permissive_policies`. Run it locally first to review the output before adding it to CI.
 
 ## Step 5: Seed Tenant Mappings
 
@@ -157,7 +158,8 @@ One row per DB user. Never share a DB user between tenants.
 | Middleware filtering but raw SQL queries bypass it | Raw SQL not routed through middleware connection wrapper | Add `protect()` to all connection acquisition paths; use DB-level RLS as primary layer |
 | INSERT rows have NULL tenant_id despite firewall | Policy only filters SELECT; INSERT policy is missing | Add a separate `WITH CHECK` policy or use a trigger to stamp tenant_id on INSERT |
 | Scanner fails a table you protected by hand | RLS not forced, a firewall policy missing, or an extra permissive policy (PostgreSQL ORs them) | Run `--json`; fix what `rls_forced`, `missing_policies` or `extra_permissive_policies` shows, or re-run the migration |
-| PostgreSQL: a new table in another schema is not reported | The PostgreSQL scanner and migration cover `public` only | Keep tenant tables in `public`, or protect other schemas by hand |
+| PostgreSQL: a new table in another schema is not reported | The PostgreSQL scanner and migration cover one schema (`engines.postgresql.schema`, default `public`) | Set that schema, or run the migration and scanner once per schema |
+| Oracle: logins fail or tenants are never set after the migration | The logon trigger did not compile (script not run as SYS) and was disabled | Run as SYS, or grant EXECUTE on the package to your DBA user (section 6b) and recompile |
 
 ## NoSQL Stores (MongoDB, Redis, Firestore, Convex)
 

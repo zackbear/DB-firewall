@@ -1,5 +1,66 @@
 # Changelog
 
+## 2026-10-26: config sections, migrations, Oracle (PR #10)
+
+### Upgrading
+
+- **`resolution`, `excluded_users`, `audit` and `engines` now take effect.**
+  The defaults keep the old behaviour. If your `.db-firewall.yaml` was copied
+  from the old sample, check these sections before upgrading. The old sample
+  listed `db_user_map` first, then `session_var` and `connection_param` enabled,
+  with `env_var` off: that order is now used.
+- **`audit.enabled` now defaults to false.** It used to be true but was never
+  read. With true, the PostgreSQL, MySQL or SQL Server audit table from the
+  migration must exist, or tenant assignment fails under `fail_mode: closed`.
+- **`run_migration()`** now refuses MySQL and Oracle with `NotImplementedError`.
+  Those scripts need their own client (`DELIMITER`, SQL*Plus `DEFINE`). Before,
+  it sent them to the driver, which cannot run them.
+- **The scanner** fails on an engine it does not know, instead of passing with
+  an empty report.
+- **Oracle:** run the migration as SYS. Re-running it now replaces the policies
+  on every table in `SCHEMA_OWNER` that has `TENANT_COLUMN`.
+
+### Added
+
+- `excluded_users`: connections whose DB user is listed are not scoped. Exact
+  match on the name the database reports; a failed lookup counts as not excluded.
+- `audit`: one audit row per DB-side tenant assignment, `purge_audit(conn)`
+  for `retention_days`, and `log_queries` to the `db_firewall.audit` logger.
+- `resolution`: the order `protect()` uses to look for a tenant: `env_var`,
+  `db_user_map`, `session_var`, `connection_param`. The request tenant always
+  comes first.
+- `engines`: `use_rls` / `use_views` / `use_vpd` false skips the DB-side
+  context; `schema` sets what the scanner checks (and where the PostgreSQL
+  migration applies RLS); `audit_table` per engine.
+- Migrations take the tenant column: PostgreSQL (`dbfw.tenant_column`,
+  `dbfw.schema`), MySQL (`@dbfw_tenant_column`), SQL Server (session context),
+  Oracle (`DEFINE TENANT_COLUMN`).
+- Scanner: Oracle VPD check (`oracle://` DSN). MySQL checks all three triggers.
+- Live Oracle Database Free 23ai test suite (`tests/test_oracle_live.py`).
+
+### Fixed
+
+- Django WSGI: a sync streaming body closed early runs its cleanup as the
+  request's tenant.
+- Oracle `set_tenant` committed the caller's open transaction and hid a failed
+  context set. The audit row now uses an autonomous transaction, and a context
+  error reaches the caller.
+- Oracle migration: the logon/logoff triggers compiled invalid when the script
+  ran as a DBA user other than SYS, and an invalid logon trigger blocks logins.
+  Invalid triggers are now disabled, with an error that says to run as SYS.
+- Oracle migration protected a fixed list of 4 tables; it now finds every table
+  with the tenant column.
+- SQL Server tenant context used `?`, which pymssql does not bind; it now uses
+  the driver's parameter marker.
+- Docs: unread config keys, scanner coverage, audit and fail-closed wording
+  (first commits of this PR).
+
+### Not tested live
+
+- The MySQL and SQL Server migration changes and scanner checks are tested with
+  scripted cursors only. [Unverified] MySQL may refuse `CREATE TRIGGER` inside a
+  prepared statement, which `002_mysql.sql` uses; this predates this PR.
+
 ## 2026-10-20: security and structure batch (PRs #4 to #9)
 
 Read **Upgrading** first: four of these changes can break an existing setup.
@@ -90,8 +151,7 @@ Also changed:
   `GZipMiddleware`) must sit above DB Firewall in `MIDDLEWARE`. If it sits below
   and the server's send fails mid-stream, that stream's cleanup does not run.
 - Under Django WSGI, a sync streaming body that is closed early may run its
-  `finally` as another tenant. Django calls the original generator's `close()`
-  directly. A fix is planned.
+  `finally` as another tenant. (Fixed 2026-10-26.)
 - The MCP wrapper finds SQL by its first keyword. Prose that starts with a
   keyword is treated as SQL. A bare SQL Server procedure name without `EXEC`
   or a `sp_` / `xp_` prefix is not caught. Row-level security is the backstop.
