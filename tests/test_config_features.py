@@ -109,12 +109,37 @@ class TestResolution:
         conn = fake(**{"FROM tenants.map": "T"})
         assert resolve_tenant(conn, DBEngine.MYSQL, cfg) == "T"
 
-    def test_invalid_value_skipped_with_warning(self, cfg, monkeypatch, caplog):
-        monkeypatch.setenv("TENANT_ID", "bad\\id")
+    @pytest.mark.parametrize("bad", ["", "bad\\id", "a\nb"])
+    def test_invalid_env_value_fails_closed(self, cfg, monkeypatch, bad):
+        monkeypatch.setenv("TENANT_ID", bad)
         conn = fake(**{"_firewall_tenant_map": "MAP"})
-        with caplog.at_level(logging.WARNING, logger="db_firewall"):
-            assert resolve_tenant(conn, DBEngine.MYSQL, cfg) == "MAP"
-        assert "ignoring tenant from env_var" in caplog.text
+        with pytest.raises(ValueError):                 # never falls through to the map
+            resolve_tenant(conn, DBEngine.MYSQL, cfg)
+
+    def test_empty_db_value_is_unset(self, cfg):
+        cfg["resolution"] = [{"source": "session_var"}, {"source": "db_user_map"}]
+        conn = fake(**{"@_fw_tenant_id": "", "_firewall_tenant_map": "MAP"})
+        assert resolve_tenant(conn, DBEngine.MYSQL, cfg) == "MAP"
+
+    def test_custom_session_var_name(self, cfg):
+        cfg["resolution"] = [{"source": "session_var", "variable": "app.org"}]
+        conn = fake("psycopg2", **{"current_setting": "S"})
+        assert resolve_tenant(conn, DBEngine.POSTGRESQL, cfg) == "S"
+        assert conn.log[-1][1] == ("app.org",)
+
+    def test_oracle_default_map_table(self, cfg):
+        cfg["resolution"] = [{"source": "db_user_map"}]
+        conn = fake("oracledb", **{"FROM TENANT_USER_MAP": "O"})
+        assert resolve_tenant(conn, DBEngine.ORACLE, cfg) == "O"
+
+    @pytest.mark.parametrize("table", ["t WHERE 1=1 OR 1", "tmap#", "a b"])
+    def test_dict_config_table_names_are_checked(self, cfg, table):
+        cfg["resolution"] = [{"source": "db_user_map", "table": table}]
+        with pytest.raises(ValueError):
+            protect(fake(), config=cfg)
+        cfg["audit"]["table_name"] = table
+        with pytest.raises(ValueError):
+            purge_audit(fake(), cfg, DBEngine.MYSQL)
 
     def test_session_var_per_engine(self, cfg):
         cfg["resolution"] = [{"source": "session_var"}]
@@ -166,6 +191,31 @@ class TestExcludedUsers:
         protect(conn, tenant_id="A", config=cfg)
         assert not any("CURRENT_USER" in sql for sql, _ in conn.log)
 
+    def test_bypass_with_request_tenant_sets_no_db_context(self, cfg):
+        cfg["excluded_users"] = ["svc"]
+        cfg["audit"]["enabled"] = True
+        conn = fake(**{"CURRENT_USER()": "svc"})
+        with tenant_scope("A"):
+            assert protect(conn, config=cfg)._bypass
+        assert not any("_fw_tenant_id" in sql or "INSERT" in sql for sql, _ in conn.log)
+
+    def test_sqlalchemy_apply_tenant_skips_excluded_and_use_off(self, cfg):
+        from db_firewall.sqlalchemy_hooks import _apply_tenant
+        cfg["audit"]["enabled"] = True
+        cfg["excluded_users"] = ["svc"]
+        excluded, off = fake(**{"CURRENT_USER()": "svc"}), fake(**{"CURRENT_USER()": "app"})
+        cfg_off = copy.deepcopy(cfg)
+        cfg_off["engines"]["mysql"] = {"use_views": False}
+        with tenant_scope("A"):
+            _apply_tenant(excluded, cfg)
+            _apply_tenant(off, cfg_off)
+            used = fake(**{"CURRENT_USER()": "app"})
+            _apply_tenant(used, cfg)
+        for conn in (excluded, off):
+            assert not any("_fw_tenant_id" in sql or "INSERT" in sql for sql, _ in conn.log)
+        assert any(sql.startswith("SET @_fw_tenant_id") for sql, _ in used.log)
+        assert any(sql.startswith("INSERT INTO _firewall_audit_log") for sql, _ in used.log)
+
     def test_match_is_exact(self, cfg):
         cfg["excluded_users"] = ["SVC"]
         assert not protect(fake(**{"CURRENT_USER()": "svc"}), config=cfg)._bypass
@@ -211,6 +261,14 @@ class TestAuditAndEngines:
             monkey._bypass = True
             monkey.execute("SELECT 1")
         assert "tenant=A sql=SELECT 1" in caplog.text
+
+    def test_purge_retention_days(self, cfg):
+        conn = fake()
+        purge_audit(conn, cfg, DBEngine.MYSQL)
+        purge_audit(conn, cfg, DBEngine.MYSQL, retention_days=7)
+        cfg["audit"]["retention_days"] = 30
+        purge_audit(conn, cfg, DBEngine.MYSQL)
+        assert [p for _, p in conn.log] == [(90,), (7,), (30,)]
 
     def test_purge_rejects_negative_and_unknown(self, cfg):
         with pytest.raises(ValueError):

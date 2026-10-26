@@ -12,9 +12,20 @@
 - **`audit.enabled` now defaults to false.** It used to be true but was never
   read. With true, the PostgreSQL, MySQL or SQL Server audit table from the
   migration must exist, or tenant assignment fails under `fail_mode: closed`.
-- **`run_migration()`** now refuses MySQL and Oracle with `NotImplementedError`.
-  Those scripts need their own client (`DELIMITER`, SQL*Plus `DEFINE`). Before,
-  it sent them to the driver, which cannot run them.
+- **MySQL migration: new steps.** The old script could not run on a live
+  server (see Fixed). `source migrations/002_mysql.sql` no longer applies the
+  views and triggers by itself: run `CALL _firewall_apply_all()` and pipe its
+  output to `mysql` (README "Run the migration"), or use `run_migration(conn)`.
+  It drops and re-creates the firewall routines and triggers.
+- **`run_migration()`** runs MySQL (it parses `DELIMITER`) and refuses Oracle
+  with `NotImplementedError` (SQL*Plus `DEFINE`). Before, it sent both scripts
+  to the driver, which cannot run them.
+- **Oracle now resolves the tenant from `TENANT_USER_MAP` by default** (the
+  `db_user_map` source). Before, `protect()` on Oracle found no tenant there.
+- **A set but invalid tenant value raises**, as before (`TENANT_ID=""` or
+  `"bad\id"`). It never falls through to the next source.
+- **Table names in config** (`resolution[].table`, audit tables) may no longer
+  contain `#`, and are checked when a config is passed as a dict too.
 - **The scanner** fails on an engine it does not know, instead of passing with
   an empty report.
 - **Oracle:** run the migration as SYS. Re-running it now replaces the policies
@@ -36,7 +47,7 @@
   `dbfw.schema`), MySQL (`@dbfw_tenant_column`), SQL Server (session context),
   Oracle (`DEFINE TENANT_COLUMN`).
 - Scanner: Oracle VPD check (`oracle://` DSN). MySQL checks all three triggers.
-- Live Oracle Database Free 23ai test suite (`tests/test_oracle_live.py`).
+- Live test suites for MySQL, SQL Server and Oracle.
 
 ### Fixed
 
@@ -50,16 +61,28 @@
   Invalid triggers are now disabled, with an error that says to run as SYS.
 - Oracle migration protected a fixed list of 4 tables; it now finds every table
   with the tenant column.
-- SQL Server tenant context used `?`, which pymssql does not bind; it now uses
-  the driver's parameter marker.
+- SQL Server tenant context, introspection and scanner used `?`, which pymssql
+  does not bind; they now use the driver's parameter marker.
+- MySQL migration, found on a live MySQL 8.4 (all predate this PR):
+  - the views read `@_fw_tenant_id` directly, which MySQL refuses (ERROR 1351);
+  - the triggers were created through `PREPARE`, which MySQL refuses (ERROR 1295);
+  - the routines looked up the caller with `CURRENT_USER()`, which inside a
+    DEFINER routine is the definer: the map and bypass checks used the wrong
+    user. They now use `USER()`;
+  - a row with a NULL tenant column passed the insert trigger (`!=` with NULL);
+  - `NOT LIKE 'v_%'` skipped every table whose name starts with `v`, such as
+    `vendors`, so it got no view or triggers. All scripts now escape `_` in
+    `LIKE`.
+- SQL Server migration failed on a second run (the audit index already existed).
 - Docs: unread config keys, scanner coverage, audit and fail-closed wording
   (first commits of this PR).
 
-### Not tested live
+### Tested live
 
-- The MySQL and SQL Server migration changes and scanner checks are tested with
-  scripted cursors only. [Unverified] MySQL may refuse `CREATE TRIGGER` inside a
-  prepared statement, which `002_mysql.sql` uses; this predates this PR.
+- PostgreSQL 16 (CI), MySQL 8.4, SQL Server 2022 Developer and Oracle Database
+  Free 23ai: `tests/test_mysql_live.py`, `tests/test_sqlserver_live.py`,
+  `tests/test_oracle_live.py` (opt-in; setup SQL in `tests/live_setup/`).
+- Not tested: MariaDB, older MySQL and SQL Server versions, Azure SQL.
 
 ## 2026-10-20: security and structure batch (PRs #4 to #9)
 

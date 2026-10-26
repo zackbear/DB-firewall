@@ -31,8 +31,10 @@ export PYTHONPATH="$PWD/middleware:$PYTHONPATH"   # no pip package yet: import f
 psql -c "SET dbfw.tenant_column = 'tenant_id'" -c "SET dbfw.schema = 'public'" \
      -f migrations/001_postgresql.sql
 
-# MySQL (mysql client: the script uses DELIMITER)
-mysql -e "SET @dbfw_tenant_column = 'tenant_id'; source migrations/002_mysql.sql"
+# MySQL (or run_migration(conn)). Step 2 creates the views and prints the
+# trigger DDL, which step 3 runs: MySQL cannot create a trigger from a routine.
+mysql db < migrations/002_mysql.sql
+mysql -N -B -r db -e "SET @dbfw_tenant_column = 'tenant_id'; CALL _firewall_apply_all()" | mysql db
 
 # SQL Server (or run_migration(conn)); set the column in the same session first.
 # set_col.sql holds one line: EXEC sp_set_session_context N'dbfw.tenant_column', N'tenant_id';
@@ -44,10 +46,17 @@ sqlplus / as sysdba @migrations/004_oracle.sql
 
 Each script protects every table that has the tenant column (PostgreSQL: in the
 chosen schema; MySQL: the current database; SQL Server: all schemas; Oracle:
-`SCHEMA_OWNER`). Re-run it after adding tables. `run_migration()` handles
-PostgreSQL and SQL Server; the MySQL and Oracle scripts need their own client.
-Tested live: PostgreSQL 16 and Oracle Database Free 23ai. The MySQL and SQL
-Server scripts are not tested against a live server.
+`SCHEMA_OWNER`). Re-run it after adding tables (MySQL: steps 2 and 3).
+`run_migration()` handles PostgreSQL, MySQL and SQL Server; Oracle needs sqlplus.
+Tested live: PostgreSQL 16, MySQL 8.4, SQL Server 2022 and Oracle Database Free
+23ai (see "Tests" for the live suites).
+
+MySQL has no RLS. Its layer is views plus triggers, keyed on the user variable
+`@_fw_tenant_id`. A client that can send raw SQL can set that variable, so the
+MySQL layer only holds when agents reach the database through the middleware
+(which refuses `SET @_fw_tenant_id`). A user with a `_firewall_tenant_map` row
+gets that tenant whenever no tenant is set. Keep no anonymous MySQL accounts:
+the routines identify the caller by the login name (`USER()`).
 
 Oracle: run as SYS. The logon/logoff triggers call the package, and any other
 DBA user needs a direct grant from the schema owner first (see section 6b of
@@ -261,7 +270,7 @@ db-security-check:
 RUN python -m hooks.scanner --dsn $DATABASE_URL --strict
 ```
 
-With `--strict` the scanner returns exit code 1 if ANY non-excluded table with the tenant column is missing protection: PostgreSQL RLS, MySQL views + triggers, a SQL Server security policy named `firewall_rls_<table>`, or an Oracle VPD policy (`FN_TENANT_ISOLATION`, enabled, covering SELECT/INSERT/UPDATE/DELETE with update check; DSN `oracle://user:pass@host:1521/service`, needs `oracledb`). On SQLite every such table is reported unprotected, and an engine the scanner does not know fails the run. `engines.<engine>.schema` sets the schema it checks. It reads the schema, not the rows, so empty tables are checked too. On PostgreSQL a table counts as protected only when row-level security is enabled AND forced (table owners bypass unforced RLS) and all four firewall policies (select, insert, update, delete) exist on that exact `<schema>.<table>`, with no other permissive policy (PostgreSQL ORs permissive policies, so one extra `USING (true)` opens every row). The JSON report lists `missing_policies`, `extra_permissive_policies` and `rls_forced`.
+With `--strict` the scanner returns exit code 1 if ANY non-excluded table with the tenant column is missing protection: PostgreSQL RLS, MySQL views + triggers, a SQL Server security policy named `firewall_rls_<table>`, or an Oracle VPD policy (`FN_TENANT_ISOLATION`, enabled, covering SELECT/INSERT/UPDATE/DELETE with update check; DSN `oracle://user:pass@host:1521/service`, needs `oracledb`). On SQLite every such table is reported unprotected, and an engine the scanner does not know fails the run. `engines.<engine>.schema` sets the schema it checks on PostgreSQL, MySQL and Oracle; on SQL Server it checks all schemas. It reads the schema, not the rows, so empty tables are checked too. On PostgreSQL a table counts as protected only when row-level security is enabled AND forced (table owners bypass unforced RLS) and all four firewall policies (select, insert, update, delete) exist on that exact `<schema>.<table>`, with no other permissive policy (PostgreSQL ORs permissive policies, so one extra `USING (true)` opens every row). The JSON report lists `missing_policies`, `extra_permissive_policies` and `rls_forced`.
 
 ---
 
@@ -419,6 +428,8 @@ as a superuser. CI does the same with a `postgres:16` service and fails below
 | `test_config_features.py` | `excluded_users`, `audit`, `resolution`, `engines` (fakes + live PostgreSQL) |
 | `test_scanner_fakes.py` | scanner logic for MySQL, SQL Server, Oracle (scripted cursors) |
 | `test_oracle_live.py` | live Oracle: VPD migration with a custom column, middleware, scanner (opt-in: `DBFW_ORA_DSN`; setup steps in the file) |
+| `test_mysql_live.py` | live MySQL: `run_migration()` with a custom column, views and triggers, middleware, audit, resolution, scanner (opt-in: `DBFW_MYSQL_DSN`, admin user; run `tests/live_setup/mysql_before.sql` first) |
+| `test_sqlserver_live.py` | live SQL Server: `run_migration()` with a custom column, security policy, middleware, audit, resolution, scanner (opt-in: `DBFW_MSSQL_DSN`, needs `pymssql`; run `tests/live_setup/sqlserver_before.sql` first) |
 | `test_gate_live.py`, `test_pool_leak.py`, `test_scanner_live.py` | live PostgreSQL: middleware vs RLS, pool leaks, scanner (opt-in: `DBFW_PG_DSN`) |
 | `test_adapters_*.py` | MongoDB (mongomock), Redis (skipped unless `redis` is installed and a server runs at `REDIS_URL`, default `localhost:6390`; not run in CI), Firestore (fake client) |
 

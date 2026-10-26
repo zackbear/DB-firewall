@@ -44,6 +44,26 @@ def test_mysql_needs_view_and_all_three_triggers():
     assert conn.log[2][1] == ("app", "_fw_bi_orders", "_fw_bu_orders", "_fw_bd_orders")
 
 
+def test_mysql_schema_option():
+    cfg = load_config()
+    cfg["engines"] = {"mysql": {"schema": "app"}}
+    conn = Script([[]])
+    scan_tables(conn, DBEngine.MYSQL, cfg)
+    assert conn.log[0][1] == ("tenant_id", "app")
+
+
+def test_sqlserver_uses_the_driver_marker(monkeypatch):
+    import types
+    monkeypatch.setitem(sys.modules, "fakemssql", types.SimpleNamespace(paramstyle="pyformat"))
+    conn = type("Cursor", (Script,), {"__module__": "fakemssql"})([[("orders",)], [(1,)]])
+    scan_tables(conn, DBEngine.SQLSERVER, load_config())
+    assert "?" not in conn.log[1][0] and "%s" in conn.log[1][0]       # pymssql binds %s
+    from middleware.db_firewall.introspection import _lookup_tenant_column
+    conn.answers = [[]]
+    _lookup_tenant_column(conn, "orders", DBEngine.SQLSERVER, "tenant_id")
+    assert "?" not in conn.log[-1][0] and conn.log[-1][0].count("%s") == 2
+
+
 def test_sqlserver_policy_by_name():
     conn = Script([[("orders",), ("items",)], [(1,)], []])
     report = scan_tables(conn, DBEngine.SQLSERVER, load_config())

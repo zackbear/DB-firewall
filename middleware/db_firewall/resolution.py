@@ -6,6 +6,7 @@ import re
 import weakref
 from typing import Optional
 
+from .config import check_table_name
 from .engines import DBEngine, _is_autocommit, placeholder
 from .introspection import _META_SAVEPOINT, _conn_dsn, _in_transaction
 from .rewrite import validate_tenant_id
@@ -83,6 +84,7 @@ def _resolve_tenant_from_map(connection, engine: str,
         return None
     if table == "_firewall_tenant_map":
         table = _DEFAULT_MAP_TABLE.get(engine, table)
+    check_table_name(table)
     user, true = expr
     sql = f"SELECT tenant_id FROM {table} WHERE db_user = {user} AND is_active = {true}"
     return probe(connection, sql)
@@ -121,17 +123,17 @@ def _source_value(connection, engine: str, entry: dict) -> Optional[str]:
 
 def resolve_tenant(connection, engine: str, config: dict) -> Optional[str]:
     """First tenant found by the enabled resolution sources, in order.
-    A value that is not a valid tenant id is skipped with a warning."""
+    A source with no value is skipped. A value that is set but is not a valid
+    tenant id raises ValueError (fail closed): the next source is NOT tried,
+    so a broken TENANT_ID never binds the connection to another tenant."""
     for entry in config.get("resolution") or []:
         if not entry.get("enabled", True):
             continue
         value = _source_value(connection, engine, entry)
-        if value is None or value == "":
+        # An empty DB value means "not set"; an empty env var is set (and invalid).
+        if value is None or (value == "" and entry["source"] != "env_var"):
             continue
-        try:
-            return validate_tenant_id(str(value))
-        except ValueError as e:
-            logger.warning(f"DB Firewall: ignoring tenant from {entry['source']}: {e}")
+        return validate_tenant_id(str(value))
     return None
 
 

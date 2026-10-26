@@ -94,7 +94,15 @@ def load_config(project_root: Optional[str] = None) -> dict:
 
 
 RESOLUTION_SOURCES = ("env_var", "db_user_map", "session_var", "connection_param")
-_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$#]*(\.[A-Za-z_][A-Za-z0-9_$#]*)?$")
+# No "#": MySQL reads it as a comment start.
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*)?$")
+
+
+def check_table_name(name: str) -> str:
+    """name, or ValueError when it is not a plain [schema.]table identifier."""
+    if not _IDENT_RE.match(str(name)):
+        raise ValueError(f"DB Firewall: unsafe table name: {name!r}")
+    return name
 
 
 def validate_config(config: dict) -> None:
@@ -103,16 +111,16 @@ def validate_config(config: dict) -> None:
         if not isinstance(entry, dict) or entry.get("source") not in RESOLUTION_SOURCES:
             raise ValueError(f"DB Firewall: resolution entries need source one of "
                              f"{RESOLUTION_SOURCES}, got {entry!r}")
-        if entry.get("table") is not None and not _IDENT_RE.match(str(entry["table"])):
-            raise ValueError(f"DB Firewall: unsafe table name in resolution: {entry['table']!r}")
+        if entry.get("table") is not None:
+            check_table_name(entry["table"])
     users = config.get("excluded_users") or []
     if not isinstance(users, list) or not all(isinstance(u, str) and u for u in users):
         raise ValueError("DB Firewall: excluded_users must be a list of user names")
     tables = [(config.get("audit") or {}).get("table_name")]
     tables += [(o or {}).get("audit_table") for o in (config.get("engines") or {}).values()]
     for t in tables:
-        if t is not None and not _IDENT_RE.match(str(t)):
-            raise ValueError(f"DB Firewall: unsafe audit table name: {t!r}")
+        if t is not None:
+            check_table_name(t)
 
 
 def engine_options(config: dict, engine: str) -> dict:

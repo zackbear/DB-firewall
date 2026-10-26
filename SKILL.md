@@ -40,10 +40,10 @@ Copy `config/firewall.yaml` to `.db-firewall.yaml` in the project, then set `DB_
 
 | Field | Action |
 |-------|--------|
-| `tenant_column` | Match the project's actual column name (e.g. `org_id`, `company_id`). Pass the same name to the migration (README "Run the migration"; `run_migration(conn)` does it for PostgreSQL and SQL Server) |
+| `tenant_column` | Match the project's actual column name (e.g. `org_id`, `company_id`). Pass the same name to the migration (README "Run the migration"; `run_migration(conn)` does it for PostgreSQL, MySQL and SQL Server) |
 | `excluded_tables` | Add migration/audit/config tables that are legitimately cross-tenant |
 | `excluded_users` | Leave empty unless a specific role (e.g. `_migrator`) must bypass the middleware; exact name as the database reports it (Oracle: upper case). Mirror it in `_firewall_bypass_roles` for the database layer |
-| `resolution`, `audit`, `engines` | Defaults keep the old behaviour. See `config/firewall.yaml` before changing them; enable `session_var` resolution only if nothing else sets the tenant session-wide |
+| `resolution`, `audit`, `engines` | Defaults keep the old behaviour. See `config/firewall.yaml` before changing them; `session_var` takes any tenant already on the connection, so enable it only if every return to the pool runs `release()` or `pool_checkin()`. A set but invalid `TENANT_ID` raises; it does not fall through |
 | `fail_mode` | **ALWAYS set to `closed` for production** — `open` is for local dev only |
 
 ## Step 2: Run the Database Migration
@@ -55,7 +55,7 @@ Select based on detected database engine:
 | Engine | Migration File | Notes |
 |--------|---------------|-------|
 | PostgreSQL | `migrations/001_postgresql.sql` | Native RLS — read entire file, contains policy + role setup |
-| MySQL / MariaDB | `migrations/002_mysql.sql` | Views + triggers — read entire file, order matters |
+| MySQL / MariaDB | `migrations/002_mysql.sql` | Views + triggers — read entire file. Use `run_migration(conn)` or the two client steps in the README (the triggers come from `CALL _firewall_apply_all()`). Agents must query the `v_` views, and only through the middleware: raw SQL can set `@_fw_tenant_id` |
 | SQL Server | `migrations/003_sqlserver.sql` | Native RLS — read entire file, contains security predicate functions |
 | Oracle | `migrations/004_oracle.sql` | VPD — read entire file. Set `SCHEMA_OWNER` and `TENANT_COLUMN`, run as SYS with SQL*Plus/SQLcl. Every table in that schema with the column gets the policy; re-run after adding tables |
 | SQLite | No migration needed | Middleware-only enforcement — skip to Step 3 |

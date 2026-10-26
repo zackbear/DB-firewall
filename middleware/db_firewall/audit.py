@@ -9,7 +9,7 @@ migration's set_tenant procedure writes VPD_AUDIT_LOG itself.
 import logging
 from typing import Optional
 
-from .config import engine_options
+from .config import check_table_name, engine_options
 from .engines import DBEngine, placeholder
 
 logger = logging.getLogger("db_firewall")
@@ -36,9 +36,10 @@ _PURGE_SQL = {
 
 
 def audit_table(config: dict, engine: str) -> str:
-    """engines.<engine>.audit_table, else audit.table_name (both validated by load_config)."""
-    return (engine_options(config, engine).get("audit_table")
-            or (config.get("audit") or {}).get("table_name") or "_firewall_audit_log")
+    """engines.<engine>.audit_table, else audit.table_name. Checked here too:
+    a config passed as a dict never went through load_config."""
+    return check_table_name(engine_options(config, engine).get("audit_table")
+                            or (config.get("audit") or {}).get("table_name") or "_firewall_audit_log")
 
 
 def audit_enabled(config: dict) -> bool:

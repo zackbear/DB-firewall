@@ -15,7 +15,7 @@ version: "1.0"
 # ----------------------------------------------------------------------------
 # TENANT COLUMN — The column name used across all protected tables.
 # If a table has this column, the middleware protects it. Pass the same name
-# to the migrations (run_migration() does it for PostgreSQL and SQL Server;
+# to the migrations (run_migration() does it for PostgreSQL, MySQL and SQL Server;
 # see README "Run the migration" for psql, mysql, sqlcmd and Oracle).
 # Env override: DB_FIREWALL_TENANT_COLUMN
 # ----------------------------------------------------------------------------
@@ -71,7 +71,8 @@ protect:
 # AUDIT — the middleware writes one row per DB-side tenant assignment.
 # Needs the migration's audit table (PostgreSQL, MySQL, SQL Server:
 # _firewall_audit_log). The row is part of the caller's transaction: a rollback
-# drops it. A failed audit write fails closed like the context itself.
+# drops it. A failed audit write fails closed like the context itself. With
+# fail_mode: open on PostgreSQL the failed insert still aborts the transaction.
 # Oracle: the migration's set_tenant always writes VPD_AUDIT_LOG itself.
 # Purge: purge_audit(conn) deletes rows older than retention_days (you commit).
 # log_queries: log every executed statement (after rewriting) to the
@@ -86,14 +87,20 @@ audit:
 # ----------------------------------------------------------------------------
 # TENANT RESOLUTION — protect(conn) without tenant_id= uses the request's
 # tenant first (web integrations, tenant_scope(), set_tenant()); that cannot be
-# moved. Then these sources, in order; the first valid tenant wins:
+# moved. Then these sources, in order. A source with no value is skipped; a
+# value that is set but invalid (e.g. TENANT_ID="bad\id") raises, it does not
+# fall through to the next source:
 #   env_var          an environment variable (variable:, default TENANT_ID)
 #   db_user_map      the active map row for the current DB user (table:;
-#                    Oracle default TENANT_USER_MAP). PostgreSQL, MySQL,
+#                    Oracle default TENANT_USER_MAP). PostgreSQL, MySQL
+#                    (user part of CURRENT_USER(), without @host),
 #                    SQL Server, Oracle.
 #   session_var      a tenant already set DB-side on this connection
 #                    (PostgreSQL: variable:, default app.current_tenant).
-#                    Only enable it if nothing else sets that value session-wide.
+#                    It takes whatever tenant is already on the connection,
+#                    including one left by an earlier user of a pooled
+#                    connection. Enable it only if every return to the pool
+#                    runs release() or pool_checkin().
 #   connection_param an attribute of the connection object, or param=value in
 #                    its DSN (param_name:, default tenant_id)
 # Nothing found: no tenant, so fail_mode decides.
@@ -144,6 +151,7 @@ excluded_tables:
 #     context (middleware-only, e.g. before the migration is installed)
 #   schema: what the scanner checks (PostgreSQL: also where run_migration
 #     applies RLS). MySQL null = the current database; Oracle null = the user.
+#     SQL Server: not used, the scanner checks all schemas.
 #   audit_table: overrides audit.table_name for that engine
 # ----------------------------------------------------------------------------
 engines:
