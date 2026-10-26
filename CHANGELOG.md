@@ -25,9 +25,10 @@ scripts that call the removed commands.
 3. **`protect()` and the shared tenant (#4).** `protect(conn, tenant_id="A")`
    no longer sets the shared request tenant, so a later `protect(other_conn)`
    without a tenant does not inherit "A". It falls back to the `TENANT_ID`
-   environment variable, then `_firewall_tenant_map`, then no tenant: queries on
-   protected tables are refused under `fail_mode: closed`, unscoped under `open`. Pass
-   `tenant_id=` to every `protect()` call, or wrap the work in `tenant_scope("A")`.
+   environment variable, then `_firewall_tenant_map`, then no tenant: queries
+   on protected tables are refused under `fail_mode: closed`, unscoped under
+   `open`. Pass `tenant_id=` to every `protect()` call, or wrap the work in
+   `tenant_scope("A")`.
 4. **CLI (#6, #8).** The `migrate` and `check` commands did nothing and are
    removed. `python -m middleware.db_firewall info` prints the active config.
    Apply migrations with `psql` / `mysql` / `sqlcmd` or `run_migration(conn)`,

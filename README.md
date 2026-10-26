@@ -355,7 +355,7 @@ db-firewall/
 │   ├── 001_postgresql.sql        # PostgreSQL native RLS (auto-applies to public tables with a tenant_id column)
 │   ├── 002_mysql.sql             # MySQL secure views + triggers
 │   ├── 003_sqlserver.sql         # SQL Server security policies
-│   └── 004_oracle.sql            # Oracle VPD (production-hardened)
+│   └── 004_oracle.sql            # Oracle VPD (production-hardened; protects the tables it lists, add yours)
 ├── middleware/
 │   ├── db_firewall/              # Universal Python middleware (DB-agnostic), one module per concern:
 │   │                             #   config, engines, context, introspection, rewrite, db_context,

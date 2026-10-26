@@ -56,7 +56,7 @@ Select based on detected database engine:
 | PostgreSQL | `migrations/001_postgresql.sql` | Native RLS — read entire file, contains policy + role setup |
 | MySQL / MariaDB | `migrations/002_mysql.sql` | Views + triggers — read entire file, order matters |
 | SQL Server | `migrations/003_sqlserver.sql` | Native RLS — read entire file, contains security predicate functions |
-| Oracle | `migrations/004_oracle.sql` | VPD — read entire file, parameter order is exact and non-negotiable |
+| Oracle | `migrations/004_oracle.sql` | VPD — read entire file, parameter order is exact and non-negotiable. It only protects the tables it names (`ORDERS`, `CUSTOMERS`, `INVOICES`, `TRANSACTIONS`): add the project's tables to that list |
 | SQLite | No migration needed | Middleware-only enforcement — skip to Step 3 |
 
 **Do NOT load** migration files for database engines not present in the project.
