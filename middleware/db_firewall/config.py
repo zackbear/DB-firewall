@@ -100,7 +100,7 @@ _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*)?$")
 
 def check_table_name(name: str) -> str:
     """name, or ValueError when it is not a plain [schema.]table identifier."""
-    if not _IDENT_RE.match(str(name)):
+    if not _IDENT_RE.fullmatch(str(name)):
         raise ValueError(f"DB Firewall: unsafe table name: {name!r}")
     return name
 

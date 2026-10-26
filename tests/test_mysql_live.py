@@ -29,6 +29,7 @@ from middleware.db_firewall import (DBEngine, detect_engine, load_config, pool_c
 
 U = urlparse(DSN)
 APP_PW = "DbfwApp_2026x"
+LONG = "a_table_name_that_is_longer_than_fifty_seven_characters_xyz"
 
 
 def _connect(user=None, password=None):
@@ -87,11 +88,28 @@ def test_migration_built_view_and_triggers_for_custom_column(conn):
                 "WHERE table_schema = DATABASE() AND table_name = 'v_orders'")
     assert cur.fetchone()[0] == 1
     cur.execute("SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema = DATABASE() "
-                "AND event_object_table IN ('orders', 'vault') AND trigger_name LIKE '\\_fw\\_b%'")
-    assert cur.fetchone()[0] == 6
+                "AND event_object_table IN ('orders', 'vault', %s) AND trigger_name LIKE '#_fw#_b%%' ESCAPE '#'",
+                (LONG,))
+    assert cur.fetchone()[0] == 9
     cur.execute("SELECT COUNT(*) FROM information_schema.views "
                 "WHERE table_schema = DATABASE() AND table_name = 'v_plain'")
     assert cur.fetchone()[0] == 0                         # plain has tenant_id, not org_id
+
+
+def test_migration_under_no_backslash_escapes():
+    c = _connect()
+    try:
+        c.cursor().execute("SET SESSION sql_mode = CONCAT(@@sql_mode, ',NO_BACKSLASH_ESCAPES')")
+        run_migration(c, DBEngine.MYSQL, _cfg())             # re-run, routines re-created in this mode
+        cur = c.cursor()
+        cur.execute("SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema = DATABASE() "
+                    "AND trigger_name LIKE '#_fw#_b%' ESCAPE '#'")
+        assert cur.fetchone()[0] == 9
+        cur.execute("SELECT COUNT(*) FROM information_schema.views WHERE table_schema = DATABASE() "
+                    "AND table_name LIKE 'v#__firewall%' ESCAPE '#'")
+        assert cur.fetchone()[0] == 0                         # no views on the firewall's own tables
+    finally:
+        c.close()
 
 
 def test_view_fails_closed_without_tenant(conn):
@@ -104,6 +122,21 @@ def test_view_resolves_the_caller_not_the_definer():
         assert _ids(app.cursor()) == [2]
     finally:
         app.close()
+
+
+def test_bypass_marker_and_tenant_match_are_exact(conn):
+    cur = conn.cursor()
+    for value in ("__bypass__", "__BYPÄSS__", "b"):          # row 2 belongs to "B"
+        cur.execute("SET @_fw_tenant_id = %s", (value,))
+        assert _ids(cur) == []
+    with pytest.raises(pymysql.err.OperationalError, match="Cross-tenant INSERT"):
+        cur.execute("INSERT INTO orders VALUES (93, 'A')")
+
+
+def test_middleware_refuses_setting_the_variable(conn, cfg):
+    pc = protect(conn, tenant_id="A", config=cfg)
+    with pytest.raises(PermissionError):
+        pc.cursor().execute("SET @a = 1, @_fw_tenant_id = '__BYPASS__'")
 
 
 def test_trigger_blocks_null_tenant_insert(conn, cfg):
@@ -177,5 +210,6 @@ def test_scanner(conn, cfg):
     cur.execute("DROP TABLE late_table")
     assert report["orders"]["protected"] is True
     assert report["vault"]["protected"] is True
+    assert report[LONG]["protected"] is True                 # hashed name stem
     assert report["late_table"]["protected"] is False
     assert "plain" not in report and "notes" not in report

@@ -107,6 +107,8 @@ def validate_tenant_id(tenant_id: str) -> str:
     """Reject tenant ids that cannot be safely embedded in SQL or session state."""
     if not isinstance(tenant_id, str) or not tenant_id:
         raise ValueError("DB Firewall: tenant_id must be a non-empty string")
+    if tenant_id.casefold() == "__bypass__":
+        raise ValueError("DB Firewall: __BYPASS__ is reserved (MySQL bypass marker)")
     if any(c in tenant_id for c in _BAD_TENANT_CHARS):
         raise ValueError("DB Firewall: tenant_id contains NUL/newline/backslash characters")
     if _sqlr._PH_PREFIX in tenant_id:
@@ -118,6 +120,19 @@ def _sql_literal(tenant_id: str) -> str:
     """Return tenant_id as a quoted SQL string literal (single quotes doubled)."""
     validate_tenant_id(tenant_id)
     return "'" + tenant_id.replace("'", "''") + "'"
+
+
+# The MySQL layer keys on the user variable @_fw_tenant_id and these routines.
+# The app never needs to name them, so any statement that does is refused, in
+# any form (SET @a=1, @_fw_tenant_id=..., @`_fw_tenant_id`, SELECT ... := ...).
+_FIREWALL_NAMES_RE = re.compile(
+    r"_fw_tenant_id|_firewall_(?:set_tenant|clear_tenant|apply_all)|dbfw_tenant_column", re.I)
+
+
+def _refuse_firewall_names(sql: str) -> None:
+    if _FIREWALL_NAMES_RE.search(sql):
+        raise PermissionError("DB Firewall: statement names the firewall's tenant "
+                              "variable or routines; refused")
 
 
 def rewrite_query(sql: str, tenant_id: str, config: dict,
@@ -135,6 +150,7 @@ def rewrite_query(sql: str, tenant_id: str, config: dict,
     """
     if not sql or not sql.strip():
         return sql
+    _refuse_firewall_names(sql)
 
     # No tenant → don't rewrite (fail-closed is enforced by check_no_tenant)
     if tenant_id is None:
@@ -179,6 +195,7 @@ def check_no_tenant(sql: str, config: dict, connection=None, engine: str = None)
     statement is on the pass-through list or touches no protected table."""
     if not sql or not sql.strip():
         return
+    _refuse_firewall_names(sql)
     if config.get("rewriter", "ast") != "regex":
         _sqlr.rewrite(sql, None, config.get("tenant_column", "tenant_id"),
                       _protected_predicate(config, connection, engine), engine)

@@ -116,6 +116,11 @@ def run_migration(connection, engine: Optional[str] = None, config: Optional[dic
         ddl = cursor.fetchone()[0]
         while cursor.nextset():     # the CALL's status result
             pass
+        statements = _mysql_statements(ddl)
+        created = sum(s.lstrip().startswith("CREATE TRIGGER") for s in statements)
+        if created != ddl.count("CREATE TRIGGER"):      # never report success without triggers
+            raise RuntimeError("DB Firewall: could not split the trigger DDL from "
+                               "_firewall_apply_all(); no triggers were created")
         _execute_script(cursor, engine, ddl)
     connection.commit()
     cursor.close()

@@ -163,7 +163,7 @@ BEGIN
         WHERE c.column_name = col
             AND t.table_type = 'BASE TABLE'
             AND c.table_schema = sch
-            AND c.table_name NOT LIKE '\_firewall\_%'
+            AND c.table_name NOT LIKE '#_firewall#_%' ESCAPE '#'
             AND c.table_name NOT IN (
                 'schema_migrations', 'alembic_version',
                 'knex_migrations', 'prisma_migrations',

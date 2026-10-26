@@ -41,7 +41,14 @@ def test_mysql_needs_view_and_all_three_triggers():
     report = scan_tables(conn, DBEngine.MYSQL, load_config())
     assert report["orders"]["protected"] and not report["items"]["protected"]
     assert conn.log[0][1] == ("tenant_id", None)                # schema None = DATABASE()
-    assert conn.log[2][1] == ("app", "_fw_bi_orders", "_fw_bu_orders", "_fw_bd_orders")
+    assert conn.log[2][1] == ("app", "_fw_bi_orders", "_fw_bu_orders", "_fw_bd_orders", "orders")
+
+
+def test_mysql_long_table_name_stem():
+    from hooks.scan_engines import _mysql_stem
+    long = "t" * 60
+    assert _mysql_stem("orders") == "orders"
+    assert len("_fw_bi_" + _mysql_stem(long)) <= 64 and _mysql_stem(long) != _mysql_stem(long[:-1] + "u")
 
 
 def test_mysql_schema_option():

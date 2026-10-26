@@ -3,6 +3,7 @@ DB Firewall scanner: per-engine checks. Each returns {table: {..., "protected": 
 for every non-excluded table that has the tenant column.
 """
 
+import hashlib
 import os
 import sys
 from typing import Dict
@@ -101,6 +102,14 @@ def _scan_postgres(cursor, tenant_col, excluded, opts) -> Dict[str, dict]:
     return results
 
 
+def _mysql_stem(table: str) -> str:
+    """Name stem for v_<stem> and _fw_b?_<stem>, as 002_mysql.sql builds it:
+    over 57 characters, the first 40 plus "_" plus 16 hex digits of SHA1."""
+    if len(table) <= 57:
+        return table
+    return f"{table[:40]}_{hashlib.sha1(table.encode('utf-8')).hexdigest()[:16]}"
+
+
 def _scan_mysql(cursor, tenant_col, excluded, opts) -> Dict[str, dict]:
     """Protected = the v_<table> view and all three _fw_b{i,u,d}_<table> triggers."""
     results = {}
@@ -108,12 +117,14 @@ def _scan_mysql(cursor, tenant_col, excluded, opts) -> Dict[str, dict]:
     for schema, table in cursor.fetchall():
         if _is_excluded_table(table, excluded):
             continue
+        stem = _mysql_stem(table)
         cursor.execute("SELECT 1 FROM INFORMATION_SCHEMA.VIEWS "
-                       "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s", (schema, f"v_{table}"))
+                       "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s", (schema, f"v_{stem}"))
         has_view = cursor.fetchone() is not None
         cursor.execute("SELECT COUNT(*) FROM INFORMATION_SCHEMA.TRIGGERS "
-                       "WHERE TRIGGER_SCHEMA = %s AND TRIGGER_NAME IN (%s, %s, %s)",
-                       (schema, f"_fw_bi_{table}", f"_fw_bu_{table}", f"_fw_bd_{table}"))
+                       "WHERE TRIGGER_SCHEMA = %s AND TRIGGER_NAME IN (%s, %s, %s) "
+                       "AND EVENT_OBJECT_TABLE = %s",
+                       (schema, f"_fw_bi_{stem}", f"_fw_bu_{stem}", f"_fw_bd_{stem}", table))
         has_triggers = cursor.fetchone()[0] == 3
         results[table] = {"has_tenant_col": True, "has_secure_view": has_view,
                           "has_triggers": has_triggers, "protected": has_view and has_triggers}

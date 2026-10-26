@@ -352,3 +352,31 @@ class TestLivePostgres:
                                   "WHERE auth_method = 'middleware' AND tenant_id = 'A'")).scalar()
             assert n >= 1
         eng.dispose()
+
+
+# ---------------------------------------------------------------- MySQL layer guard
+
+class TestMySQLGuard:
+    @pytest.mark.parametrize("rewriter", ["ast", "regex"])
+    @pytest.mark.parametrize("sql", [
+        "SET @a = 1, @_fw_tenant_id = '__BYPASS__'",
+        "SET @`_fw_tenant_id` = 'B'",
+        "SET @'_fw_tenant_id' = 'B'",
+        "SELECT @_FW_TENANT_ID := 'B'",
+        "CALL _firewall_set_tenant('B')",
+        "CALL _firewall_apply_all()",
+        "SET @dbfw_tenant_column = 'owner'",
+    ])
+    def test_statements_naming_the_layer_are_refused(self, cfg, rewriter, sql):
+        from db_firewall.rewrite import check_no_tenant, rewrite_query
+        cfg["rewriter"] = rewriter
+        with pytest.raises(PermissionError):
+            rewrite_query(sql, "A", cfg, None, DBEngine.MYSQL)
+        with pytest.raises(PermissionError):
+            check_no_tenant(sql, cfg, None, DBEngine.MYSQL)
+
+    @pytest.mark.parametrize("tenant", ["__BYPASS__", "__bypass__", "__Bypass__"])
+    def test_bypass_marker_is_not_a_tenant(self, tenant):
+        from db_firewall.rewrite import validate_tenant_id
+        with pytest.raises(ValueError):
+            validate_tenant_id(tenant)
