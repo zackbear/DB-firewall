@@ -9,7 +9,7 @@
 -- Adapted:  Production-hardened with audit logging, error handling,
 --           multi-table support, and DML protection.
 --
--- Usage:    Run with SQL*Plus or SQLcl as SYS or a DBA-privileged user.
+-- Usage:    Run with SQL*Plus or SQLcl as SYS (see 6b for other DBA users).
 --           Set SCHEMA_OWNER and TENANT_COLUMN below before deploying.
 --           Every table in SCHEMA_OWNER with TENANT_COLUMN gets the policy.
 -- ============================================================================
@@ -279,18 +279,15 @@ END;
 
 
 -- ============================================================================
--- 6b. PRIVILEGE FOR THE TRIGGERS
+-- 6b. NOTE ON THE TRIGGERS
 -- ============================================================================
 -- The logon/logoff triggers below belong to the user running this script and
--- call the package, so that user needs EXECUTE on it. Without it they compile
--- invalid, and an invalid logon trigger blocks logins.
-
-BEGIN
-  IF USER NOT IN ('&SCHEMA_OWNER', 'SYS') THEN
-    EXECUTE IMMEDIATE 'GRANT EXECUTE ON &SCHEMA_OWNER..&PACKAGE_NAME TO "' || USER || '"';
-  END IF;
-END;
-/
+-- call the package. Run the script as SYS. Any other DBA user needs a direct
+-- grant from the owner (Oracle does not let a user grant to itself):
+--   as SCHEMA_OWNER:  GRANT EXECUTE ON PKG_SAAS_SECURITY TO <dba_user>;
+--   then:             ALTER TRIGGER trg_vpd_logon_set_tenant COMPILE; (and ENABLE)
+-- A trigger that does not compile is disabled at the end of this script, so
+-- it cannot block logins.
 
 
 -- ============================================================================
@@ -348,7 +345,7 @@ BEGIN
     EXECUTE IMMEDIATE 'ALTER TRIGGER trg_vpd_logon_set_tenant DISABLE';
     EXECUTE IMMEDIATE 'ALTER TRIGGER trg_vpd_logoff_clear_tenant DISABLE';
     RAISE_APPLICATION_ERROR(-20010,
-      'DB Firewall: logon/logoff triggers are invalid and were disabled. Check privileges.');
+      'DB Firewall: logon/logoff triggers are invalid and were disabled. Run as SYS (see 6b).');
   END IF;
 END;
 /
