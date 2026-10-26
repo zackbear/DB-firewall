@@ -459,3 +459,39 @@ def test_close_from_another_thread_runs_cleanup_as_tenant():
             await asyncio.sleep(0.01)
         return list(seen)
     assert asyncio.run(run()) == ["A"]
+
+
+def test_wsgi_stream_closed_early_cleans_up_as_tenant():
+    """WSGI: the server closes the response after a client disconnect. The
+    body's finally must run as the request's tenant, not the ambient one."""
+    from django.test import RequestFactory
+    seen = []
+
+    def view(request):
+        def body():
+            try:
+                yield f"{get_tenant()},"
+                yield f"{get_tenant()},"
+            finally:
+                seen.append(get_tenant())
+        return StreamingHttpResponse(body())
+
+    mw = django_middleware_class(tenant_id_source=lambda r: "A")(view)
+    response = mw(RequestFactory().get("/"))
+    first = next(iter(response))                 # the server sent one chunk
+    set_tenant("B")                              # another request runs on this thread
+    try:
+        response.close()                         # client went away: server closes early
+    finally:
+        set_tenant(None)
+    assert first == b"A," and seen == ["A"]
+
+
+def test_wsgi_stream_read_fully_still_works():
+    from django.test import RequestFactory
+
+    def view(request):
+        return StreamingHttpResponse(f"{get_tenant()}," for _ in range(2))
+    response = django_middleware_class(tenant_id_source=lambda r: "A")(view)(RequestFactory().get("/"))
+    assert b"".join(response) == b"A,A,"
+    response.close()

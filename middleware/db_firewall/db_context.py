@@ -3,7 +3,7 @@
 import logging
 from typing import Optional
 
-from .engines import DBEngine, _is_autocommit, _pg_transaction_idle, detect_engine
+from .engines import placeholder, DBEngine, _is_autocommit, _pg_transaction_idle, detect_engine
 
 logger = logging.getLogger("db_firewall")
 
@@ -64,7 +64,9 @@ def _clear_context_mysql(connection):
 def _set_context_sqlserver(connection, tenant_id: str):
     """Set tenant via SQL Server SESSION_CONTEXT."""
     cursor = connection.cursor()
-    cursor.execute("EXEC sp_set_session_context @key=N'tenant_id', @value=?", (tenant_id,))
+    # pyodbc binds "?", pymssql binds "%s": use the driver's own marker.
+    cursor.execute(f"EXEC sp_set_session_context @key=N'tenant_id', @value={placeholder(connection)}",
+                   (tenant_id,))
     cursor.close()
 
 

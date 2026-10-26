@@ -1,15 +1,16 @@
 """DB Firewall: ProtectedCursor, ProtectedConnection and protect()."""
 
-import os
 import logging
 from typing import Optional
 
-from .engines import DBEngine, _is_autocommit, detect_engine
+from .engines import DBEngine, detect_engine
 from .context import TenantContext
 from .db_context import _CONTEXT_SETTERS, clear_db_context
-from .introspection import _META_SAVEPOINT, _conn_table_cache, _in_transaction
+from .introspection import _conn_table_cache
 from .rewrite import check_no_tenant, rewrite_query, validate_tenant_id
-from .config import load_config
+from .config import db_context_enabled, load_config
+from .resolution import is_excluded, resolve_tenant
+from .audit import log_query, write_assignment
 
 logger = logging.getLogger("db_firewall")
 
@@ -34,21 +35,25 @@ class ProtectedCursor:
     """Wraps a DB-API cursor to enforce tenant isolation on every query."""
 
     def __init__(self, cursor, tenant_id: str, config: dict,
-                 connection=None, engine: str = DBEngine.UNKNOWN):
+                 connection=None, engine: str = DBEngine.UNKNOWN, bypass: bool = False):
         self._cursor = cursor
         self._tenant_id = tenant_id
         self._config = config
         self._connection = connection
         self._engine = engine
+        self._bypass = bypass           # DB user in excluded_users: not scoped
 
     def _guard(self, sql: str) -> str:
         """Rewrite (tenant set) or fail-closed check (no tenant); one code
         path for execute / executemany / stream / copy (H7)."""
-        if self._tenant_id:
-            return rewrite_query(sql, self._tenant_id, self._config,
-                                 self._connection, self._engine)
-        if self._config.get("fail_mode", "closed") == "closed":
+        if self._bypass:
+            pass
+        elif self._tenant_id:
+            sql = rewrite_query(sql, self._tenant_id, self._config,
+                                self._connection, self._engine)
+        elif self._config.get("fail_mode", "closed") == "closed":
             check_no_tenant(sql, self._config, self._connection, self._engine)
+        log_query(self._tenant_id, sql, self._config)
         return sql
 
     def execute(self, sql: str, params=None, **kwargs):
@@ -92,20 +97,24 @@ class ProtectedCursor:
 class ProtectedConnection:
     """Wraps a DB-API connection with tenant isolation."""
 
-    def __init__(self, connection, tenant_id: str, config: dict, engine: str):
+    def __init__(self, connection, tenant_id: str, config: dict, engine: str,
+                 bypass: bool = False):
         self._connection = connection
         self._tenant_id = tenant_id
         self._config = config
         self._engine = engine
+        self._bypass = bypass
+        self._db_context = not bypass and db_context_enabled(config, engine)
 
         if tenant_id is not None:
             validate_tenant_id(tenant_id)
 
-        # Set database-level context if engine supports it
-        setter = _CONTEXT_SETTERS.get(engine)
+        # Set database-level context if engine supports it (and an audit row)
+        setter = _CONTEXT_SETTERS.get(engine) if self._db_context else None
         if setter and tenant_id:
             try:
                 setter(connection, tenant_id)
+                write_assignment(connection, engine, tenant_id, config)
                 logger.info(f"DB Firewall: Set DB-level context for {engine}")
             except Exception as e:
                 # Silent fallback would leave the DB layer unguarded: fail closed.
@@ -123,7 +132,7 @@ class ProtectedConnection:
         raw_cursor = self._connection.cursor(*args, **kwargs)
         return ProtectedCursor(
             raw_cursor, self._tenant_id, self._config,
-            self._connection, self._engine
+            self._connection, self._engine, self._bypass
         )
 
     # psycopg3 / sqlite3 connection-level shortcuts: route through a
@@ -166,7 +175,8 @@ class ProtectedConnection:
         committed only when no transaction is open; if you release() inside an
         open transaction that is then rolled back, the pool's ``reset`` hook
         must be ``pool_checkin`` (which rolls back, clears and commits)."""
-        clear_db_context(self._connection, self._engine)
+        if self._db_context:
+            clear_db_context(self._connection, self._engine)
 
     def __exit__(self, *args):
         self.release()
@@ -188,12 +198,13 @@ def protect(connection, tenant_id: Optional[str] = None,
 
     Args:
         connection: Any DB-API 2.0 connection (psycopg2, mysql-connector, etc.)
-        tenant_id:  Explicit tenant ID. If None, resolves from:
-                    1. The request's TenantContext
-                    2. TENANT_ID environment variable
-                    3. DB user mapping table (_firewall_tenant_map)
+        tenant_id:  Explicit tenant ID. If None: the request's TenantContext,
+                    then the config "resolution" sources in order (default:
+                    TENANT_ID env var, then _firewall_tenant_map).
         config:     Override configuration dict. If None, load_config():
                     DB_FIREWALL_CONFIG, else defaults.
+
+    A connection whose DB user is in excluded_users is returned unscoped.
 
     Returns:
         ProtectedConnection that silently filters all queries.
@@ -204,60 +215,15 @@ def protect(connection, tenant_id: Optional[str] = None,
     engine = detect_engine(connection)
     _conn_table_cache(connection).clear()   # schema may have changed since last protect()
 
-    # Resolve tenant
+    if is_excluded(connection, engine, config):
+        return ProtectedConnection(connection, None, config, engine, bypass=True)
+
     if tenant_id is None:
-        tenant_id = TenantContext.get()
+        tenant_id = TenantContext.get()     # always first: never overridden by config
     if tenant_id is None:
-        tenant_id = os.environ.get("TENANT_ID")
-    if tenant_id is None:
-        tenant_id = _resolve_tenant_from_map(connection, engine)
+        tenant_id = resolve_tenant(connection, engine, config)
 
     if tenant_id is None and config.get("fail_mode") == "closed":
         logger.warning("DB Firewall: No tenant resolved. All DML will be blocked.")
 
     return ProtectedConnection(connection, tenant_id, config, engine)
-
-
-_TENANT_MAP_SQL = {
-    DBEngine.POSTGRESQL: ("SELECT tenant_id FROM _firewall_tenant_map "
-                          "WHERE db_user = current_user AND is_active = TRUE"),
-    DBEngine.MYSQL: ("SELECT tenant_id FROM _firewall_tenant_map "
-                     "WHERE db_user = SUBSTRING_INDEX(CURRENT_USER(), '@', 1) AND is_active = 1"),
-    DBEngine.SQLSERVER: ("SELECT tenant_id FROM _firewall_tenant_map "
-                         "WHERE db_user = SYSTEM_USER AND is_active = 1"),
-}
-
-
-def _resolve_tenant_from_map(connection, engine: str) -> Optional[str]:
-    """Look the tenant up in _firewall_tenant_map. A missing table or grant
-    must not abort the caller's open transaction (M1): the probe runs inside
-    a SAVEPOINT that is rolled back on failure."""
-    sql = _TENANT_MAP_SQL.get(engine)
-    if sql is None:
-        return None
-    in_txn = _in_transaction(connection)
-    cursor = connection.cursor()
-    try:
-        if in_txn:
-            cursor.execute(f"SAVEPOINT {_META_SAVEPOINT}")
-        try:
-            cursor.execute(sql)
-            row = cursor.fetchone()
-        except Exception as e:
-            logger.debug(f"DB Firewall: Could not auto-resolve tenant: {e}")
-            if in_txn:
-                cursor.execute(f"ROLLBACK TO SAVEPOINT {_META_SAVEPOINT}")
-            elif in_txn is False and not _is_autocommit(connection):
-                connection.rollback()       # the implicit transaction was ours alone
-            return None
-        if in_txn:
-            cursor.execute(f"RELEASE SAVEPOINT {_META_SAVEPOINT}")
-        return row[0] if row else None
-    except Exception as e:
-        logger.debug(f"DB Firewall: Could not auto-resolve tenant: {e}")
-        return None
-    finally:
-        try:
-            cursor.close()
-        except Exception:
-            pass

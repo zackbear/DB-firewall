@@ -2,6 +2,7 @@
 
 import copy
 import os
+import re
 import json
 import logging
 from pathlib import Path
@@ -34,10 +35,30 @@ DEFAULT_CONFIG = {
     # send that header, so it is off by default. ?tenant_id= is never trusted.
     "trust_tenant_header": False,
     "protect": {"select": True, "insert": True, "update": True, "delete": True},
-    "audit": {"enabled": True, "table_name": "_firewall_audit_log", "retention_days": 90},
-    # Empty by default: managed Postgres (Supabase, Neon, RDS) apps often connect
-    # as "postgres", so a built-in bypass list would disable the firewall entirely.
+    # Middleware audit: one row per DB-side tenant assignment (needs the
+    # migration's audit table). Off by default: no table is required.
+    "audit": {"enabled": False, "table_name": "_firewall_audit_log",
+              "retention_days": 90, "log_queries": False},
+    # DB users (exactly as the database reports them) whose connections the
+    # middleware does not scope. Empty by default: managed Postgres (Supabase,
+    # Neon, RDS) apps often connect as "postgres", so a built-in bypass list
+    # would disable the firewall entirely.
     "excluded_users": [],
+    # protect() fallbacks when no tenant is passed and the request has none,
+    # tried in order. The request tenant always comes first and cannot be moved.
+    "resolution": [
+        {"source": "env_var", "variable": "TENANT_ID", "enabled": True},
+        {"source": "db_user_map", "table": "_firewall_tenant_map", "enabled": True},
+    ],
+    # Per-engine options. use_* false: do not set the DB-side tenant context
+    # (middleware-only). schema: what the scanner checks. audit_table: overrides
+    # audit.table_name for that engine.
+    "engines": {
+        "postgresql": {"use_rls": True, "schema": "public"},
+        "mysql": {"use_views": True, "schema": None},
+        "sqlserver": {"use_rls": True, "schema": "dbo"},
+        "oracle": {"use_vpd": True, "schema": None, "audit_table": "VPD_AUDIT_LOG"},
+    },
     "excluded_tables": [
         "_firewall_*", "schema_migrations", "alembic_version",
         "knex_migrations", "prisma_migrations", "flyway_schema_history",
@@ -68,7 +89,42 @@ def load_config(project_root: Optional[str] = None) -> dict:
     cfg_path = _resolve_config_path(Path(explicit))
     config.update(_read_config_file(cfg_path))
     logger.info(f"DB Firewall: Loaded config from {cfg_path}")
+    validate_config(config)
     return _apply_env_overrides(config)
+
+
+RESOLUTION_SOURCES = ("env_var", "db_user_map", "session_var", "connection_param")
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$#]*(\.[A-Za-z_][A-Za-z0-9_$#]*)?$")
+
+
+def validate_config(config: dict) -> None:
+    """Fail loudly on settings the firewall would otherwise misread."""
+    for entry in config.get("resolution") or []:
+        if not isinstance(entry, dict) or entry.get("source") not in RESOLUTION_SOURCES:
+            raise ValueError(f"DB Firewall: resolution entries need source one of "
+                             f"{RESOLUTION_SOURCES}, got {entry!r}")
+        if entry.get("table") is not None and not _IDENT_RE.match(str(entry["table"])):
+            raise ValueError(f"DB Firewall: unsafe table name in resolution: {entry['table']!r}")
+    users = config.get("excluded_users") or []
+    if not isinstance(users, list) or not all(isinstance(u, str) and u for u in users):
+        raise ValueError("DB Firewall: excluded_users must be a list of user names")
+    tables = [(config.get("audit") or {}).get("table_name")]
+    tables += [(o or {}).get("audit_table") for o in (config.get("engines") or {}).values()]
+    for t in tables:
+        if t is not None and not _IDENT_RE.match(str(t)):
+            raise ValueError(f"DB Firewall: unsafe audit table name: {t!r}")
+
+
+def engine_options(config: dict, engine: str) -> dict:
+    """engines.<engine>, over the built-in defaults for that engine."""
+    opts = dict(DEFAULT_CONFIG["engines"].get(engine, {}))
+    opts.update((config.get("engines") or {}).get(engine) or {})
+    return opts
+
+
+def db_context_enabled(config: dict, engine: str) -> bool:
+    """False when engines.<engine>.use_rls / use_views / use_vpd is false."""
+    return all(v for k, v in engine_options(config, engine).items() if k.startswith("use_"))
 
 
 def _resolve_config_path(path: Path) -> Path:

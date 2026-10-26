@@ -22,17 +22,17 @@ Usage:
 
 Layout (each module imports only from the ones before it):
     config, engines, context, introspection, rewrite, db_context,
-    wrappers, streams, web, sqlalchemy_hooks, migrate
+    resolution, audit, wrappers, streams, web, sqlalchemy_hooks, migrate
 """
 
 import sys
 import types
 
 from . import (config, engines, context, introspection, rewrite, db_context,
-               wrappers, streams, web, sqlalchemy_hooks, migrate)
+               resolution, audit, wrappers, streams, web, sqlalchemy_hooks, migrate)
 
 _SUBMODULES = (config, engines, context, introspection, rewrite, db_context,
-               wrappers, streams, web, sqlalchemy_hooks, migrate)
+               resolution, audit, wrappers, streams, web, sqlalchemy_hooks, migrate)
 
 # Re-export every top-level name, so `db_firewall.X` keeps working for the
 # public API and for the internals the hooks and tests use.
