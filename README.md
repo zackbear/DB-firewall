@@ -52,11 +52,30 @@ Tested live: PostgreSQL 16, MySQL 8.4, SQL Server 2022 and Oracle Database Free
 23ai (see "Tests" for the live suites).
 
 MySQL has no RLS. Its layer is views plus triggers, keyed on the user variable
-`@_fw_tenant_id`. A client that can send raw SQL can set that variable, so the
-MySQL layer only holds when agents reach the database through the middleware
-(which refuses `SET @_fw_tenant_id`). A user with a `_firewall_tenant_map` row
-gets that tenant whenever no tenant is set. Keep no anonymous MySQL accounts:
-the routines identify the caller by the login name (`USER()`).
+`@_fw_tenant_id`:
+
+* A client that can send raw SQL can set that variable. The MySQL layer only
+  holds when agents reach the database through the middleware, which refuses
+  any statement that names `@_fw_tenant_id`, the tenant routines or
+  `@dbfw_tenant_column`.
+* Grants for the app user: `SELECT` on the `v_` views, `INSERT`/`UPDATE`/
+  `DELETE` on the base tables (the triggers check them), and `EXECUTE` only on
+  `_firewall_init_connection`. Views and triggers run as their definer, so the
+  app needs no other routine. Never grant it `EXECUTE ON db.*`,
+  `CREATE TEMPORARY TABLES`, or rights on the `_firewall_` tables.
+* A user with a `_firewall_tenant_map` row gets that tenant whenever none is
+  set. The map uses the user part of the login (`USER()`, before the first
+  `@`): keep no anonymous accounts and no user names that contain `@`.
+* The views and triggers compare tenants exactly (`BINARY`). The middleware's
+  rewrite uses `=`, which ignores case under MySQL's default collation: keep
+  tenant ids unique ignoring case, and use a string tenant column.
+* Re-running drops and re-creates each trigger, so writes in between are not
+  checked, and `CREATE OR REPLACE VIEW` waits for open transactions that read
+  the view. Re-run when the app is quiet.
+* `run_migration()` is tested with PyMySQL. Old mysql-connector versions
+  refuse the multi-statement routines.
+* Tables with names over 57 characters get a hashed name stem
+  (`v_<first 40>_<16 hex>`), so the names fit MySQL's 64 characters.
 
 Oracle: run as SYS. The logon/logoff triggers call the package, and any other
 DBA user needs a direct grant from the schema owner first (see section 6b of
@@ -270,7 +289,7 @@ db-security-check:
 RUN python -m hooks.scanner --dsn $DATABASE_URL --strict
 ```
 
-With `--strict` the scanner returns exit code 1 if ANY non-excluded table with the tenant column is missing protection: PostgreSQL RLS, MySQL views + triggers, a SQL Server security policy named `firewall_rls_<table>`, or an Oracle VPD policy (`FN_TENANT_ISOLATION`, enabled, covering SELECT/INSERT/UPDATE/DELETE with update check; DSN `oracle://user:pass@host:1521/service`, needs `oracledb`). On SQLite every such table is reported unprotected, and an engine the scanner does not know fails the run. `engines.<engine>.schema` sets the schema it checks on PostgreSQL, MySQL and Oracle; on SQL Server it checks all schemas. It reads the schema, not the rows, so empty tables are checked too. On PostgreSQL a table counts as protected only when row-level security is enabled AND forced (table owners bypass unforced RLS) and all four firewall policies (select, insert, update, delete) exist on that exact `<schema>.<table>`, with no other permissive policy (PostgreSQL ORs permissive policies, so one extra `USING (true)` opens every row). The JSON report lists `missing_policies`, `extra_permissive_policies` and `rls_forced`.
+With `--strict` the scanner returns exit code 1 if ANY non-excluded table with the tenant column is missing protection: PostgreSQL RLS, MySQL views + triggers, a SQL Server security policy named `firewall_rls_<table>`, or an Oracle VPD policy (`FN_TENANT_ISOLATION`, enabled, covering SELECT/INSERT/UPDATE/DELETE with update check; DSN `oracle://user:pass@host:1521/service`, needs `oracledb`). On SQLite every such table is reported unprotected, and an engine the scanner does not know fails the run. `engines.<engine>.schema` sets the schema it checks on PostgreSQL, MySQL and Oracle; on SQL Server it checks all schemas. It reads the schema, not the rows, so empty tables are checked too. On MySQL it checks that the view and the three triggers exist, not what they contain. On PostgreSQL a table counts as protected only when row-level security is enabled AND forced (table owners bypass unforced RLS) and all four firewall policies (select, insert, update, delete) exist on that exact `<schema>.<table>`, with no other permissive policy (PostgreSQL ORs permissive policies, so one extra `USING (true)` opens every row). The JSON report lists `missing_policies`, `extra_permissive_policies` and `rls_forced`.
 
 ---
 

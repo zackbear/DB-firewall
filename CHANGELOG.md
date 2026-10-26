@@ -26,6 +26,10 @@
   `"bad\id"`). It never falls through to the next source.
 - **Table names in config** (`resolution[].table`, audit tables) may no longer
   contain `#`, and are checked when a config is passed as a dict too.
+- **MySQL:** a tenant id of `__BYPASS__` (any case) is refused, and the views
+  and triggers match tenants exactly (`BINARY`). A tenant `b` no longer sees
+  rows of `B` at the database layer. Statements that name `@_fw_tenant_id`
+  or the firewall routines are refused by the middleware.
 - **The scanner** fails on an engine it does not know, instead of passing with
   an empty report.
 - **Oracle:** run the migration as SYS. Re-running it now replaces the policies
@@ -71,8 +75,22 @@
     user. They now use `USER()`;
   - a row with a NULL tenant column passed the insert trigger (`!=` with NULL);
   - `NOT LIKE 'v_%'` skipped every table whose name starts with `v`, such as
-    `vendors`, so it got no view or triggers. All scripts now escape `_` in
-    `LIKE`.
+    `vendors`, so it got no view or triggers. The PostgreSQL, MySQL and SQL
+    Server scripts now escape `_` in `LIKE` (`ESCAPE '#'`, `[_]`).
+- MySQL layer, found by the second review of this PR:
+  - the middleware let `SET @a=1, @_fw_tenant_id=...`, quoted variable names
+    and `:=` through; it now refuses any statement that names the tenant
+    variable, the tenant routines or `@dbfw_tenant_column`;
+  - a tenant named `__bypass__` (any case, or with accents) passed the bypass
+    check. `__BYPASS__` is no longer a valid tenant id, and the SQL compares
+    the marker and the tenant as `BINARY`;
+  - under `NO_BACKSLASH_ESCAPES` the migration reported success but created
+    no triggers. The script uses no backslash escapes now, and
+    `run_migration()` raises if the trigger DDL does not split;
+  - `_firewall_apply_all` ran as its definer with a column name the caller
+    sets; it is now `SQL SECURITY INVOKER`;
+  - a table name over 57 characters stopped the trigger step; such names now
+    get a hashed stem.
 - SQL Server migration failed on a second run (the audit index already existed).
 - Docs: unread config keys, scanner coverage, audit and fail-closed wording
   (first commits of this PR).
