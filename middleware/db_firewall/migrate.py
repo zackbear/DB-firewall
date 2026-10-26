@@ -25,10 +25,8 @@ _MIGRATION_FILES = {
 }
 
 
-# Scripts that use client-only commands (MySQL DELIMITER, SQL*Plus DEFINE and
-# "/") cannot run through a DB-API driver: run them with the engine's client.
+# The Oracle script uses SQL*Plus commands (DEFINE, "/"): run it with sqlplus.
 _CLIENT_ONLY = {
-    DBEngine.MYSQL: "mysql -e \"SET @dbfw_tenant_column='<col>'; source migrations/002_mysql.sql\"",
     DBEngine.ORACLE: "sqlplus <dba>@<db> @migrations/004_oracle.sql (set SCHEMA_OWNER, TENANT_COLUMN first)",
 }
 
@@ -40,15 +38,39 @@ def _set_migration_settings(connection, cursor, engine: str, config: dict) -> No
         schema = engine_options(config, engine).get("schema") or "public"
         cursor.execute("SELECT set_config('dbfw.tenant_column', %s, false), "
                        "set_config('dbfw.schema', %s, false)", (col, schema))
+    elif engine == DBEngine.MYSQL:
+        cursor.execute("SET @dbfw_tenant_column = %s", (col,))
     elif engine == DBEngine.SQLSERVER:
         cursor.execute(f"EXEC sp_set_session_context N'dbfw.tenant_column', {placeholder(connection)}",
                        (col,))
 
 
+def _mysql_statements(sql: str) -> list:
+    """Split a mysql-client script on its DELIMITER (default ";")."""
+    statements, buf, delim = [], [], ";"
+    for line in sql.splitlines():
+        if line.strip().upper().startswith("DELIMITER "):
+            delim = line.split(None, 1)[1].strip()
+            continue
+        if not buf and (not line.strip() or line.lstrip().startswith("--")):
+            continue
+        buf.append(line)
+        if line.rstrip().endswith(delim):
+            statements.append("\n".join(buf).rstrip()[:-len(delim)])
+            buf = []
+    if "".join(buf).strip():
+        statements.append("\n".join(buf))
+    return statements
+
+
 def _execute_script(cursor, engine: str, sql: str) -> None:
-    """SQL Server batches split on GO; other drivers take the script whole."""
-    statements = re.split(r'\bGO\b', sql, flags=re.IGNORECASE) \
-        if engine == DBEngine.SQLSERVER else [sql]
+    """SQL Server batches split on GO; MySQL on DELIMITER; others whole."""
+    if engine == DBEngine.SQLSERVER:
+        statements = re.split(r'\bGO\b', sql, flags=re.IGNORECASE)
+    elif engine == DBEngine.MYSQL:
+        statements = _mysql_statements(sql)
+    else:
+        statements = [sql]
     for stmt in statements:
         stmt = stmt.strip()
         if stmt:
@@ -62,8 +84,8 @@ def _execute_script(cursor, engine: str, sql: str) -> None:
 def run_migration(connection, engine: Optional[str] = None, config: Optional[dict] = None):
     """
     Run the migration script for the detected database engine, with the
-    tenant column from config (default load_config()). PostgreSQL and SQL
-    Server only: MySQL and Oracle scripts need their own client.
+    tenant column from config (default load_config()). On MySQL it also runs
+    the trigger DDL that _firewall_apply_all() returns. Oracle needs sqlplus.
     Call this once during deployment / setup.
     """
     if engine is None:
@@ -89,6 +111,12 @@ def run_migration(connection, engine: Optional[str] = None, config: Optional[dic
     _set_migration_settings(connection, cursor, engine, config)
 
     _execute_script(cursor, engine, sql)
+    if engine == DBEngine.MYSQL:
+        cursor.execute("CALL _firewall_apply_all()")
+        ddl = cursor.fetchone()[0]
+        while cursor.nextset():     # the CALL's status result
+            pass
+        _execute_script(cursor, engine, ddl)
     connection.commit()
     cursor.close()
     logger.info(f"DB Firewall: Migration applied for {engine}")

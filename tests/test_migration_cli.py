@@ -50,10 +50,16 @@ def test_missing_migration_file_raises(tmp_path, monkeypatch):
         run_migration(FakeConn(), DBEngine.SQLSERVER)
 
 
-@pytest.mark.parametrize("engine", [DBEngine.MYSQL, DBEngine.ORACLE])
-def test_client_only_scripts_are_refused(engine):
+def test_oracle_script_is_refused():
     with pytest.raises(NotImplementedError):
-        run_migration(FakeConn(), engine)
+        run_migration(FakeConn(), DBEngine.ORACLE)
+
+
+def test_mysql_split_on_delimiter():
+    from middleware.db_firewall.migrate import _mysql_statements
+    stmts = _mysql_statements("DELIMITER //\nCREATE PROCEDURE p() BEGIN SELECT 1; END //\n"
+                              "DELIMITER ;\n-- note\nCALL p();\n")
+    assert stmts == ["CREATE PROCEDURE p() BEGIN SELECT 1; END ", "CALL p()"]
 
 
 def test_engine_without_migration_is_a_noop():

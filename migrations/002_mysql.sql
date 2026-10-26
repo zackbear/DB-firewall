@@ -44,23 +44,30 @@ CREATE TABLE IF NOT EXISTS _firewall_audit_log (
 --    (unlike PostgreSQL search_path). Session TEMPORARY tables do shadow a
 --    same-named base table inside routines, so do NOT grant
 --    CREATE TEMPORARY TABLES to application users.
+--    Inside a DEFINER routine or view CURRENT_USER() is the definer, so the
+--    caller is read with USER() (the user name the client logged in with).
+--    Keep no anonymous accounts: with one, USER() is whatever name was typed.
+--    DROP + CREATE, not IF NOT EXISTS, so an upgrade replaces old bodies.
 DELIMITER //
 
-CREATE PROCEDURE IF NOT EXISTS _firewall_set_tenant(IN p_tenant VARCHAR(128))
+DROP PROCEDURE IF EXISTS _firewall_set_tenant //
+CREATE PROCEDURE _firewall_set_tenant(IN p_tenant VARCHAR(128))
 BEGIN
     SET @_fw_tenant_id = p_tenant;
 
     INSERT INTO _firewall_audit_log (connection_id, db_user, client_host, tenant_id, auth_method)
-    VALUES (CONNECTION_ID(), CURRENT_USER(), SUBSTRING_INDEX(USER(), '@', -1), p_tenant, 'set_tenant');
+    VALUES (CONNECTION_ID(), USER(), SUBSTRING_INDEX(USER(), '@', -1), p_tenant, 'set_tenant');
 END //
 
-CREATE PROCEDURE IF NOT EXISTS _firewall_clear_tenant()
+DROP PROCEDURE IF EXISTS _firewall_clear_tenant //
+CREATE PROCEDURE _firewall_clear_tenant()
 BEGIN
     SET @_fw_tenant_id = NULL;
 END //
 
-CREATE FUNCTION IF NOT EXISTS _firewall_get_tenant()
-RETURNS VARCHAR(128) DETERMINISTIC READS SQL DATA
+DROP FUNCTION IF EXISTS _firewall_get_tenant //
+CREATE FUNCTION _firewall_get_tenant()
+RETURNS VARCHAR(128) NOT DETERMINISTIC READS SQL DATA
 BEGIN
     DECLARE v_tenant VARCHAR(128);
 
@@ -71,7 +78,7 @@ BEGIN
     IF v_tenant IS NULL THEN
         SELECT tenant_id INTO v_tenant
         FROM _firewall_tenant_map
-        WHERE db_user = SUBSTRING_INDEX(CURRENT_USER(), '@', 1)
+        WHERE db_user = SUBSTRING_INDEX(USER(), '@', 1)
           AND is_active = 1
         LIMIT 1;
 
@@ -82,6 +89,12 @@ BEGIN
 
     RETURN v_tenant;
 END //
+
+-- A view cannot read a user variable (ERROR 1351); it calls this instead.
+DROP FUNCTION IF EXISTS _firewall_is_bypass //
+CREATE FUNCTION _firewall_is_bypass()
+RETURNS TINYINT NOT DETERMINISTIC NO SQL
+RETURN COALESCE(@_fw_tenant_id = '__BYPASS__', 0) //
 
 -- 4. Connection init procedure — call this on every new connection
 --    Connection pool libraries should call this in their on_connect hook.
@@ -94,7 +107,7 @@ BEGIN
     DECLARE v_tenant VARCHAR(128);
     DECLARE v_user VARCHAR(128);
 
-    SET v_user = SUBSTRING_INDEX(CURRENT_USER(), '@', 1);
+    SET v_user = SUBSTRING_INDEX(USER(), '@', 1);
 
     -- Bypass only for roles deliberately listed in _firewall_bypass_roles
     IF EXISTS (SELECT 1 FROM _firewall_bypass_roles WHERE role_name = v_user) THEN
@@ -120,19 +133,22 @@ DELIMITER ;
 
 
 -- ============================================================================
--- 5. AUTO-GENERATE SECURE VIEWS + WRITE TRIGGERS
+-- 5. SECURE VIEWS + WRITE TRIGGERS
 -- ============================================================================
--- Run this stored procedure after every migration to auto-protect tables.
---
 -- For each table with the tenant column (@dbfw_tenant_column, default
--- tenant_id), it creates:
---   - A view: v_<table>  (filtered to current tenant)
---   - BEFORE INSERT trigger (enforces tenant_id on new rows)
---   - BEFORE UPDATE trigger (prevents cross-tenant updates)
---   - BEFORE DELETE trigger (prevents cross-tenant deletes)
+-- tenant_id) in the current database, _firewall_apply_all():
+--   - creates the view v_<table> (filtered to the current tenant)
+--   - returns, as one text row, the DDL for the BEFORE INSERT / UPDATE /
+--     DELETE triggers. MySQL cannot create a trigger from a stored routine or
+--     a prepared statement, so the client runs that DDL:
+--
+--   mysql -N -B -r db -e "SET @dbfw_tenant_column = 'tenant_id'; CALL _firewall_apply_all()" | mysql db
+--
+-- run_migration(conn) does both steps. Re-run after adding tables.
 --
 -- IMPORTANT: Your application/agents should query the VIEWS (v_orders),
 -- not the base tables (orders). Revoke direct table access from agent users.
+-- The tenant is a user variable: a client that can send raw SQL can set it.
 -- ============================================================================
 
 DELIMITER //
@@ -142,11 +158,12 @@ CREATE PROCEDURE _firewall_apply_all()
 BEGIN
     DECLARE done INT DEFAULT FALSE;
     DECLARE v_table VARCHAR(128);
-    DECLARE v_schema VARCHAR(128);
-    -- Tenant column: SET @dbfw_tenant_column = 'org_id' before CALL (default tenant_id).
+    DECLARE t VARCHAR(300);
+    DECLARE c VARCHAR(200);
+    DECLARE v_ddl LONGTEXT DEFAULT 'DELIMITER $$\n';
     DECLARE v_col VARCHAR(64) DEFAULT COALESCE(NULLIF(@dbfw_tenant_column, ''), 'tenant_id');
     DECLARE cur CURSOR FOR
-        SELECT c.TABLE_SCHEMA, c.TABLE_NAME
+        SELECT c.TABLE_NAME
         FROM INFORMATION_SCHEMA.COLUMNS c
         JOIN INFORMATION_SCHEMA.TABLES t
             ON c.TABLE_SCHEMA = t.TABLE_SCHEMA
@@ -154,93 +171,66 @@ BEGIN
         WHERE c.COLUMN_NAME = v_col
             AND t.TABLE_TYPE = 'BASE TABLE'
             AND c.TABLE_SCHEMA = DATABASE()
-            AND c.TABLE_NAME NOT LIKE '_firewall_%'
-            AND c.TABLE_NAME NOT LIKE 'v_%'
+            AND c.TABLE_NAME NOT LIKE '\_firewall\_%'
             AND c.TABLE_NAME NOT IN (
                 'schema_migrations', 'knex_migrations',
                 'prisma_migrations', 'flyway_schema_history'
             );
     DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = TRUE;
 
+    SET c = CONCAT('`', REPLACE(v_col, '`', '``'), '`');
     OPEN cur;
 
     read_loop: LOOP
-        FETCH cur INTO v_schema, v_table;
+        FETCH cur INTO v_table;
         IF done THEN LEAVE read_loop; END IF;
+        SET t = CONCAT('`', REPLACE(v_table, '`', '``'), '`');
 
-        -- Create filtered view
+        -- Filtered view (CREATE VIEW is allowed in a prepared statement)
         SET @sql = CONCAT(
-            'CREATE OR REPLACE VIEW v_', v_table, ' AS ',
-            'SELECT * FROM ', v_table,
-            ' WHERE `', v_col, '` = _firewall_get_tenant() ',
-            'OR _firewall_get_tenant() IS NULL AND 1=0 ',
-            'OR @_fw_tenant_id = ''__BYPASS__'''
+            'CREATE OR REPLACE VIEW `v_', REPLACE(v_table, '`', '``'), '` AS ',
+            'SELECT * FROM ', t,
+            ' WHERE ', c, ' = _firewall_get_tenant() OR _firewall_is_bypass() = 1'
         );
         PREPARE stmt FROM @sql;
         EXECUTE stmt;
         DEALLOCATE PREPARE stmt;
 
-        -- BEFORE INSERT trigger
-        SET @sql = CONCAT(
-            'CREATE TRIGGER IF NOT EXISTS _fw_bi_', v_table,
-            ' BEFORE INSERT ON ', v_table, ' FOR EACH ROW ',
+        SET v_ddl = CONCAT(v_ddl,
+            'DROP TRIGGER IF EXISTS `_fw_bi_', REPLACE(v_table, '`', '``'), '`$$\n',
+            'CREATE TRIGGER `_fw_bi_', REPLACE(v_table, '`', '``'), '` BEFORE INSERT ON ', t, ' FOR EACH ROW ',
             'BEGIN ',
-            '  IF @_fw_tenant_id = ''__BYPASS__'' THEN ',
-            '    SET @_fw_noop = 1; ',
-            '  ELSEIF _firewall_get_tenant() IS NULL THEN ',
-            '    SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''DB Firewall: No tenant context. INSERT denied.''; ',
-            '  ELSEIF NEW.`', v_col, '` != _firewall_get_tenant() THEN ',
-            '    SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''DB Firewall: Cross-tenant INSERT denied.''; ',
-            '  END IF; ',
-            'END'
-        );
-        PREPARE stmt FROM @sql;
-        EXECUTE stmt;
-        DEALLOCATE PREPARE stmt;
+            'IF @_fw_tenant_id = ''__BYPASS__'' THEN SET @_fw_noop = 1; ',
+            'ELSEIF _firewall_get_tenant() IS NULL THEN ',
+            'SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''DB Firewall: No tenant context. INSERT denied.''; ',
+            'ELSEIF NOT (NEW.', c, ' <=> _firewall_get_tenant()) THEN ',
+            'SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''DB Firewall: Cross-tenant INSERT denied.''; ',
+            'END IF; END$$\n',
 
-        -- BEFORE UPDATE trigger
-        SET @sql = CONCAT(
-            'CREATE TRIGGER IF NOT EXISTS _fw_bu_', v_table,
-            ' BEFORE UPDATE ON ', v_table, ' FOR EACH ROW ',
+            'DROP TRIGGER IF EXISTS `_fw_bu_', REPLACE(v_table, '`', '``'), '`$$\n',
+            'CREATE TRIGGER `_fw_bu_', REPLACE(v_table, '`', '``'), '` BEFORE UPDATE ON ', t, ' FOR EACH ROW ',
             'BEGIN ',
-            '  IF @_fw_tenant_id = ''__BYPASS__'' THEN ',
-            '    SET @_fw_noop = 1; ',
-            '  ELSEIF _firewall_get_tenant() IS NULL THEN ',
-            '    SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''DB Firewall: No tenant context. UPDATE denied.''; ',
-            '  ELSEIF OLD.`', v_col, '` != _firewall_get_tenant() THEN ',
-            '    SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''DB Firewall: Cross-tenant UPDATE denied.''; ',
-            '  ELSEIF NEW.`', v_col, '` != OLD.`', v_col, '` THEN ',
-            '    SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''DB Firewall: Changing tenant_id denied.''; ',
-            '  END IF; ',
-            'END'
-        );
-        PREPARE stmt FROM @sql;
-        EXECUTE stmt;
-        DEALLOCATE PREPARE stmt;
+            'IF @_fw_tenant_id = ''__BYPASS__'' THEN SET @_fw_noop = 1; ',
+            'ELSEIF _firewall_get_tenant() IS NULL THEN ',
+            'SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''DB Firewall: No tenant context. UPDATE denied.''; ',
+            'ELSEIF NOT (OLD.', c, ' <=> _firewall_get_tenant()) THEN ',
+            'SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''DB Firewall: Cross-tenant UPDATE denied.''; ',
+            'ELSEIF NOT (NEW.', c, ' <=> OLD.', c, ') THEN ',
+            'SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''DB Firewall: Changing tenant_id denied.''; ',
+            'END IF; END$$\n',
 
-        -- BEFORE DELETE trigger
-        SET @sql = CONCAT(
-            'CREATE TRIGGER IF NOT EXISTS _fw_bd_', v_table,
-            ' BEFORE DELETE ON ', v_table, ' FOR EACH ROW ',
+            'DROP TRIGGER IF EXISTS `_fw_bd_', REPLACE(v_table, '`', '``'), '`$$\n',
+            'CREATE TRIGGER `_fw_bd_', REPLACE(v_table, '`', '``'), '` BEFORE DELETE ON ', t, ' FOR EACH ROW ',
             'BEGIN ',
-            '  IF @_fw_tenant_id = ''__BYPASS__'' THEN ',
-            '    SET @_fw_noop = 1; ',
-            '  ELSEIF _firewall_get_tenant() IS NULL THEN ',
-            '    SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''DB Firewall: No tenant context. DELETE denied.''; ',
-            '  ELSEIF OLD.`', v_col, '` != _firewall_get_tenant() THEN ',
-            '    SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''DB Firewall: Cross-tenant DELETE denied.''; ',
-            '  END IF; ',
-            'END'
-        );
-        PREPARE stmt FROM @sql;
-        EXECUTE stmt;
-        DEALLOCATE PREPARE stmt;
-
+            'IF @_fw_tenant_id = ''__BYPASS__'' THEN SET @_fw_noop = 1; ',
+            'ELSEIF _firewall_get_tenant() IS NULL THEN ',
+            'SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''DB Firewall: No tenant context. DELETE denied.''; ',
+            'ELSEIF NOT (OLD.', c, ' <=> _firewall_get_tenant()) THEN ',
+            'SIGNAL SQLSTATE ''45000'' SET MESSAGE_TEXT = ''DB Firewall: Cross-tenant DELETE denied.''; ',
+            'END IF; END$$\n');
     END LOOP;
     CLOSE cur;
+    SELECT CONCAT(v_ddl, 'DELIMITER ;') AS trigger_ddl;
 END //
 
 DELIMITER ;
-
--- Run it
-CALL _firewall_apply_all();

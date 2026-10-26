@@ -138,7 +138,7 @@ DECLARE table_cursor CURSOR FOR
         AND c.TABLE_NAME = t.TABLE_NAME
     WHERE c.COLUMN_NAME = @col
         AND t.TABLE_TYPE = 'BASE TABLE'
-        AND c.TABLE_NAME NOT LIKE '_firewall_%'
+        AND c.TABLE_NAME NOT LIKE '[_]firewall[_]%'
         AND c.TABLE_NAME NOT IN (
             'schema_migrations', '__EFMigrationsHistory',
             'flyway_schema_history', '__MigrationHistory'
