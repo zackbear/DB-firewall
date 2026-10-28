@@ -249,12 +249,13 @@ GRANT TRUNCATE ON {S}.docs TO {ROLE};
 -- @undo
 REVOKE TRUNCATE ON {S}.docs FROM {ROLE};
 
--- @attack it has TRUNCATE through a role it is a member of
+-- @attack it has TRUNCATE through a role it can SET ROLE to (NOINHERIT)
 -- @check {S}.docs: no TRUNCATE
 -- @setup
-CREATE ROLE {ROLE}_trunc NOLOGIN; GRANT TRUNCATE ON {S}.docs TO {ROLE}_trunc; GRANT {ROLE}_trunc TO {ROLE};
+CREATE ROLE {ROLE}_trunc NOLOGIN; GRANT TRUNCATE ON {S}.docs TO {ROLE}_trunc;
+ALTER ROLE {ROLE} NOINHERIT; GRANT {ROLE}_trunc TO {ROLE};
 -- @undo
-REVOKE {ROLE}_trunc FROM {ROLE}; REVOKE ALL ON {S}.docs FROM {ROLE}_trunc; DROP ROLE {ROLE}_trunc;
+ALTER ROLE {ROLE} INHERIT; REVOKE {ROLE}_trunc FROM {ROLE}; REVOKE ALL ON {S}.docs FROM {ROLE}_trunc; DROP ROLE {ROLE}_trunc;
 
 -- @attack it owns a table (an owner can create triggers on it)
 -- @check -: cannot create triggers
