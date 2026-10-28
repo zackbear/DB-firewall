@@ -54,7 +54,7 @@ Select based on detected database engine:
 
 | Engine | Migration File | Notes |
 |--------|---------------|-------|
-| PostgreSQL | `migrations/001_postgresql.sql` | Native RLS — read entire file, contains policy + role setup |
+| PostgreSQL | `migrations/001_postgresql.sql` | Native RLS — read entire file, contains policy + role setup. If the project already has RLS policies (Supabase, Drizzle `pgPolicy`), use `policy_mode: restrictive` (`dbfw.policy_mode`) so the tenant policies AND with them |
 | MySQL / MariaDB | `migrations/002_mysql.sql` | Views + triggers — read entire file. Use `run_migration(conn)` or the two client steps in the README (the triggers come from `CALL _firewall_apply_all()`). Agents must query the `v_` views, and only through the middleware: raw SQL can set `@_fw_tenant_id` |
 | SQL Server | `migrations/003_sqlserver.sql` | Native RLS — read entire file, contains security predicate functions |
 | Oracle | `migrations/004_oracle.sql` | VPD — read entire file. Set `SCHEMA_OWNER` and `TENANT_COLUMN`, run as SYS with SQL*Plus/SQLcl. Every table in that schema with the column gets the policy; re-run after adding tables |
@@ -67,6 +67,8 @@ Select based on detected database engine:
 Read `middleware/db_firewall/__init__.py` and `middleware/db_firewall/wrappers.py` before integrating: the package re-exports the full API surface (`protect`, `tenant_scope`, the framework hooks), and `wrappers.py` holds `protect()`.
 
 Select the integration pattern for the detected framework:
+
+**TypeScript on PostgreSQL (node-postgres, postgres.js, Drizzle, AI SDK):** use `@db-firewall/pg` (`packages/ts`, read its README). Wrap every query in `withTenant(db, tenantId, fn)`, call `assertSafeRole(db)` at start-up, and bind AI SDK tools per request with `bindTenant(tools, session.tenantId)`. Never add a tenant field to a tool's input schema.
 
 **Python (any framework):**
 ```python

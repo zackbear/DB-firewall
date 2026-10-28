@@ -153,12 +153,16 @@ excluded_tables:
 #   schema: what the scanner checks (PostgreSQL: also where run_migration
 #     applies RLS). MySQL null = the current database; Oracle null = the user.
 #     SQL Server: not used, the scanner checks all schemas.
+#   policy_mode (PostgreSQL): "permissive" (default) or "restrictive".
+#     restrictive = the tenant policies AND with the app's own RLS policies
+#     (Supabase, Drizzle pgPolicy); see README "Run the migration".
 #   audit_table: overrides audit.table_name for that engine
 # ----------------------------------------------------------------------------
 engines:
   postgresql:
     use_rls: true
     schema: "public"
+    policy_mode: "permissive"
   mysql:
     use_views: true
     schema: null

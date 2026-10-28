@@ -1,0 +1,137 @@
+// Live tests against PostgreSQL with the DB Firewall migration. Skipped
+// without DBFW_PG_URL (CI sets it).
+import { after, before, describe, it } from "node:test";
+import assert from "node:assert/strict";
+import pg from "pg";
+import postgres from "postgres";
+import { drizzle } from "drizzle-orm/node-postgres";
+import { sql as dsql } from "drizzle-orm";
+import {
+  assertSafeRole, bindTenant, currentTenant, runWithTenant, validateTenantId,
+  withTenant, withTenantPg,
+} from "../dist/index.js";
+import { ADMIN_URL, SCHEMA, adminQuery, appUrl, live, setup } from "./setup.mjs";
+const ids = (rows) => rows.map((r) => Number(r.id)).sort();
+const SELECT = `SELECT id FROM ${SCHEMA}.docs`;
+
+describe("tenant ids", () => {
+  for (const bad of ["", "a\u0000b", "a\nb", "a\\b", "__BYPASS__", "__bypass__", 7, undefined]) {
+    it(`refuses ${JSON.stringify(bad)}`, () => assert.throws(() => validateTenantId(bad)));
+  }
+  it("fails closed with no tenant, before touching the database", async () => {
+    const db = { query: () => { throw new Error("must not be called"); }, connect() {} };
+    await assert.rejects(withTenant(db, async () => 1), /no tenant/);
+  });
+  it("scopes nest and do not leak between concurrent calls", async () => {
+    const seen = await Promise.all(["A", "B"].map((t) =>
+      runWithTenant(t, async () => { await new Promise((r) => setTimeout(r, 5)); return currentTenant(); })));
+    assert.deepEqual(seen, ["A", "B"]);
+    assert.equal(currentTenant(), undefined);
+  });
+});
+
+describe("node-postgres", live, () => {
+  let pool, admin;
+  before(async () => { await setup(); pool = new pg.Pool({ connectionString: appUrl(), max: 1 }); });
+  after(async () => { await pool?.end(); });
+
+  it("reads only the tenant's rows", async () => {
+    assert.deepEqual(ids(await withTenantPg(pool, "A", async (c) => (await c.query(SELECT)).rows)), [1]);
+    assert.deepEqual(ids(await withTenant(pool, "B", async (c) => (await c.query(SELECT)).rows)), [2]);
+  });
+  it("the pooled connection comes back with no tenant (max: 1, same connection)", async () => {
+    await withTenant(pool, "A", async (c) => c.query(SELECT));
+    const { rows } = await pool.query("SELECT current_setting('app.current_tenant', true) AS t");
+    assert.ok(!rows[0].t, `leaked tenant ${rows[0].t}`);
+    assert.deepEqual(ids((await pool.query(SELECT)).rows), []);     // RLS: no tenant, no rows
+  });
+  it("cross-tenant insert is refused by RLS", async () => {
+    await assert.rejects(withTenant(pool, "A", (c) =>
+      c.query(`INSERT INTO ${SCHEMA}.docs VALUES (50, 'B', 'x')`)), /row-level security/);
+  });
+  it("an error rolls back and leaves the connection usable", async () => {
+    await assert.rejects(withTenant(pool, "A", async (c) => {
+      await c.query(`UPDATE ${SCHEMA}.docs SET body = 'changed' WHERE id = 1`);
+      throw new Error("boom");
+    }), /boom/);
+    const rows = await adminQuery(`SELECT body FROM ${SCHEMA}.docs WHERE id = 1`);
+    assert.equal(rows[0].body, "a-doc");
+    assert.deepEqual(ids(await withTenant(pool, "A", async (c) => (await c.query(SELECT)).rows)), [1]);
+  });
+  it("assertSafeRole accepts the app role and refuses a superuser and a bypass role", async () => {
+    await assertSafeRole(pool);
+    admin = new pg.Pool({ connectionString: ADMIN_URL, max: 1 });
+    try {
+      const { rows } = await admin.query("SELECT rolsuper FROM pg_roles WHERE rolname = current_user");
+      if (rows[0].rolsuper) await assert.rejects(assertSafeRole(admin), /superuser/);
+    } finally { await admin.end(); }
+    await adminQuery("INSERT INTO public._firewall_bypass_roles (role_name) VALUES ('dbfw_ts')");
+    try {
+      await assert.rejects(assertSafeRole(pool), /_firewall_bypass_roles/);
+    } finally {
+      await adminQuery("DELETE FROM public._firewall_bypass_roles WHERE role_name = 'dbfw_ts'");
+    }
+  });
+});
+
+describe("postgres.js", live, () => {
+  let sql;
+  before(async () => { await setup(); sql = postgres(appUrl(), { max: 1, onnotice: () => {} }); });
+  after(async () => { await sql?.end(); });
+
+  it("reads only the tenant's rows, nothing leaks after", async () => {
+    assert.deepEqual(ids(await withTenant(sql, "A", (tx) => tx.unsafe(SELECT))), [1]);
+    assert.deepEqual(ids(await withTenant(sql, "B", (tx) => tx`SELECT id FROM ts_app.docs`)), [2]);
+    assert.deepEqual(ids(await sql.unsafe(SELECT)), []);
+    await assertSafeRole(sql);
+  });
+});
+
+describe("Drizzle", live, () => {
+  let pool, db;
+  before(async () => {
+    await setup();
+    pool = new pg.Pool({ connectionString: appUrl(), max: 1 });
+    db = drizzle(pool);
+  });
+  after(async () => { await pool?.end(); });
+
+  it("reads only the tenant's rows, nothing leaks after", async () => {
+    const read = async (tx) => (await tx.execute(dsql.raw(SELECT))).rows;
+    assert.deepEqual(ids(await withTenant(db, "A", read)), [1]);
+    assert.deepEqual(ids(await withTenant(db, "B", read)), [2]);
+    assert.deepEqual(ids((await db.execute(dsql.raw(SELECT))).rows), []);
+    await assertSafeRole(db);
+  });
+});
+
+describe("bindTenant (AI SDK tool set)", live, () => {
+  let pool;
+  before(async () => { await setup(); pool = new pg.Pool({ connectionString: appUrl(), max: 2 }); });
+  after(async () => { await pool?.end(); });
+
+  // An AI SDK-shaped tool: the model chooses the arguments, never the tenant.
+  const tools = () => ({
+    listDocs: {
+      description: "List documents",
+      execute: async ({ tenant_id: ignored } = {}) =>
+        ids(await withTenant(pool, async (c) => (await c.query(SELECT)).rows)),
+    },
+    note: "not a tool",
+  });
+
+  it("each request's tools see only that request's tenant, even if the model names another", async () => {
+    const [a, b] = await Promise.all([
+      bindTenant(tools(), "A").listDocs.execute({ tenant_id: "B" }),
+      bindTenant(tools(), "B").listDocs.execute({ tenant_id: "A" }),
+    ]);
+    assert.deepEqual([a, b], [[1], [2]]);
+  });
+  it("unbound tools fail closed", async () => {
+    await assert.rejects(tools().listDocs.execute(), /no tenant/);
+  });
+  it("copies non-tool values and refuses a bad tenant at bind time", () => {
+    assert.equal(bindTenant(tools(), "A").note, "not a tool");
+    assert.throws(() => bindTenant(tools(), "__bypass__"));
+  });
+});

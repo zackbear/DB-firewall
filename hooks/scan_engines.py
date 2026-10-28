@@ -13,9 +13,12 @@ from middleware.db_firewall import DBEngine, _is_excluded_table, engine_options,
 
 # Exact schema.table match (pg_class + pg_namespace), so a same-named table
 # elsewhere cannot vouch for this one. Protected = RLS enabled AND forced
-# (owners bypass unforced RLS) AND all four firewall policies AND no other
-# PERMISSIVE policy: PostgreSQL ORs permissive policies, so one extra
-# "USING (true)" opens every row. Params: (schema, tenant column).
+# (owners bypass unforced RLS) AND all four firewall policies AND, for
+# permissive firewall policies, no other PERMISSIVE policy: PostgreSQL ORs
+# permissive policies, so one extra "USING (true)" opens every row. When all
+# four firewall policies are RESTRICTIVE (policy_mode: restrictive) they AND
+# with every other policy, so the app's permissive policies cannot widen past
+# the tenant and are allowed. Params: (schema, tenant column).
 _PG_SQL = """
             WITH t AS (
                 SELECT c.oid, n.nspname, c.relname, c.relrowsecurity, c.relforcerowsecurity,
@@ -40,7 +43,12 @@ _PG_SQL = """
                            AND p.policyname NOT IN (
                                SELECT pre || '_' || op
                                FROM unnest(ARRAY[t.stem, t.legacy]) AS pre,
-                                    unnest(ARRAY['sel', 'ins', 'upd', 'del']) AS op))
+                                    unnest(ARRAY['sel', 'ins', 'upd', 'del']) AS op)),
+                   COALESCE((SELECT count(*) = 4 AND bool_and(p.permissive = 'RESTRICTIVE')
+                             FROM pg_policies p
+                             WHERE p.schemaname = t.nspname AND p.tablename = t.relname
+                               AND p.policyname IN (t.stem || '_sel', t.stem || '_ins',
+                                                    t.stem || '_upd', t.stem || '_del')), false)
             FROM t
             ORDER BY t.relname
 """
@@ -89,7 +97,7 @@ _ORACLE_SQL = """
 def _scan_postgres(cursor, tenant_col, excluded, opts) -> Dict[str, dict]:
     results = {}
     cursor.execute(_PG_SQL, (opts.get("schema") or "public", tenant_col))
-    for table, enabled, forced, missing, extra in cursor.fetchall():
+    for table, enabled, forced, missing, extra, restrictive in cursor.fetchall():
         if _is_excluded_table(table, excluded):
             continue
         missing, extra = sorted(missing), sorted(extra)
@@ -97,7 +105,9 @@ def _scan_postgres(cursor, tenant_col, excluded, opts) -> Dict[str, dict]:
             "has_tenant_col": True, "has_rls_policy": not missing,
             "missing_policies": missing, "extra_permissive_policies": extra,
             "rls_enabled": bool(enabled), "rls_forced": bool(forced),
-            "protected": bool(enabled) and bool(forced) and not missing and not extra,
+            "policy_mode": "restrictive" if restrictive else "permissive",
+            "protected": bool(enabled) and bool(forced) and not missing
+                         and (bool(restrictive) or not extra),
         }
     return results
 

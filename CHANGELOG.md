@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-10-28: TypeScript package and restrictive policies (PR #12)
+
+- **`@db-firewall/pg`** (`packages/ts`): tenant isolation for TypeScript on
+  PostgreSQL. `withTenant(db, tenantId, fn)` runs `fn` in one transaction with
+  `app.current_tenant` set for that transaction only, on node-postgres,
+  postgres.js or Drizzle, and fails closed without a tenant. `bindTenant(tools,
+  tenantId)` binds AI SDK tools (or any `{ execute }` set) to the server's
+  tenant, so the model cannot pick it. `assertSafeRole(db)` refuses a
+  superuser, a `BYPASSRLS` role or a bypass role. No runtime dependencies.
+  Tested live in CI with the real migration, including through the AI SDK's
+  `generateText`. Not yet published to npm.
+- **PostgreSQL `policy_mode: restrictive`** (`engines.postgresql.policy_mode`,
+  `dbfw.policy_mode`): the tenant policies are created `AS RESTRICTIVE`, so
+  they AND with the app's own RLS policies instead of being OR-ed with them.
+  A table with no permissive policy of its own gets `fw_<hash>_base`. The
+  scanner accepts other permissive policies when all four tenant policies are
+  restrictive, and reports `policy_mode`. The default stays `permissive`.
+
 ## 2026-10-28: live CI and attack corpus (PR #11)
 
 - **CI runs the live suites** on MySQL 8.4 and SQL Server 2022 for every pull
