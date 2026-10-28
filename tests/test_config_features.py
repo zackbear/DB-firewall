@@ -290,6 +290,9 @@ class TestAuditAndEngines:
 def pg():
     psycopg = pytest.importorskip("psycopg")
     with psycopg.connect(DSN, autocommit=True) as admin:
+        # Install the test key: without it a fresh database generates its own.
+        admin.execute("SELECT set_config('dbfw.tenant_key', %s, false)",
+                      (os.environ["DB_FIREWALL_TENANT_KEY"],))
         admin.execute(open(os.path.join(os.path.dirname(__file__), '..', 'migrations',
                                         '001_postgresql.sql')).read())
         admin.execute("DROP TABLE IF EXISTS cf_orders")
