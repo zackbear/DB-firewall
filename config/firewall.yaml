@@ -174,7 +174,7 @@ engines:
     # true: also revoke CREATE on the database and every schema, TRIGGER and
     # TRUNCATE on every table (default privileges too), and pg_stat_activity,
     # from PUBLIC and app_role, by any grantor (what `db-firewall verify` fails
-    # on). Refuses if app_role owns the database, a schema or a table.
+    # on). Refuses if app_role owns the database or any object in it.
     # Database-wide; needs a superuser.
     harden: false
     app_role: null

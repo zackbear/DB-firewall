@@ -28,6 +28,19 @@ const PREDEFINED = ["pg_read_all_data", "pg_write_all_data", "pg_execute_server_
 const anyRole = (expr: string) =>
   `EXISTS (SELECT 1 FROM pg_roles m WHERE pg_has_role(current_user, m.oid, 'MEMBER') AND ${expr})`;
 
+/** Functions PostgreSQL runs without checking the caller's EXECUTE: trigger and
+ *  event trigger functions, aggregate and range support, index support
+ *  (amproc), selectivity estimators, type I/O and encoding conversions. */
+const IMPLICIT = `(SELECT tgfoid FROM pg_trigger UNION SELECT evtfoid FROM pg_event_trigger
+  UNION SELECT unnest(ARRAY[aggtransfn, aggfinalfn, aggcombinefn, aggserialfn, aggdeserialfn,
+                            aggmtransfn, aggminvtransfn, aggmfinalfn])::oid FROM pg_aggregate
+  UNION SELECT unnest(ARRAY[rngcanonical, rngsubdiff])::oid FROM pg_range
+  UNION SELECT amproc FROM pg_amproc
+  UNION SELECT unnest(ARRAY[oprrest, oprjoin])::oid FROM pg_operator
+  UNION SELECT unnest(ARRAY[typinput, typoutput, typreceive, typsend, typmodin, typmodout,
+                            typanalyze, typsubscript])::oid FROM pg_type
+  UNION SELECT conproc FROM pg_conversion)`;
+
 /**
  * The role and every role it can SET ROLE to (or inherits): none may skip RLS.
  * Also: the app must not be able to write the firewall's own tables.
@@ -84,6 +97,26 @@ export async function roleChecks(client: pg.ClientBase): Promise<Check[]> {
            AND proname LIKE '#_firewall#_%' ESCAPE '#' AND pg_has_role(current_user, proowner, 'MEMBER')`);
       return { ok: rows.length === 0, detail: rows.length
         ? `can act as the owner of ${rows.map((x) => x.name).join(", ")} (could drop or replace the bypass list)` : "owns none" };
+    }),
+    // An owner can change what runs in other tenants' sessions: a domain
+    // constraint or a function body that sends values out (pg_notify), a
+    // table's RLS, its own grants back. Any object in the database counts
+    // (pg_shdepend), except temporary ones, large objects and default ACLs.
+    () => guard("owns no database objects", async () => {
+      const { rows } = await client.query(
+        `SELECT 'database ' || datname AS name FROM pg_database
+         WHERE datname = current_database() AND pg_has_role(current_user, datdba, 'MEMBER')
+         UNION ALL (SELECT o.type || ' ' || o.identity FROM pg_shdepend s
+           CROSS JOIN LATERAL pg_identify_object(s.classid, s.objid, 0) o
+           WHERE s.dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) AND s.deptype = 'o'
+             AND s.classid NOT IN ('pg_largeobject'::regclass, 'pg_default_acl'::regclass)
+             AND pg_has_role(current_user, s.refobjid, 'MEMBER')
+             AND COALESCE(o.schema, '') NOT LIKE 'pg#_temp#_%' ESCAPE '#'
+             AND COALESCE(o.schema, '') NOT LIKE 'pg#_toast#_temp#_%' ESCAPE '#'
+           ORDER BY 1 LIMIT 20)`);
+      return { ok: rows.length === 0, detail: rows.length
+        ? `a role it can use owns ${rows.map((r) => r.name).join(", ")}: give them to another role (run migrations as it)`
+        : "owns none" };
     }),
     // The policies call these (and they sign): see firewallObjects().
     () => guard("firewall functions unchanged", () => firewallObjects(client)),
@@ -203,6 +236,8 @@ type VerifyOpts = {
   tenant: string; key: Buffer; schemas?: string[]; column?: string; exclude?: string[]; writeProbe?: boolean;
   /** Allowlist mode: see strictChecks(). */
   strict?: boolean; allowGlobal?: string[];
+  /** --strict: accept that the role reads other sessions' SQL (an info line instead). */
+  allowQueryText?: boolean;
 };
 type VerifyResult = { checks: Check[]; tables: TableReport[]; excluded: string[] };
 
@@ -280,7 +315,9 @@ async function verifyTables(client: pg.ClientBase, opts: VerifyOpts): Promise<Ve
   }
   checks.push(await bypassObjects(client, column, opts.allowGlobal ?? []));
   checks.push(await otherSchemas(client, schemas, column));
-  if (opts.strict) checks.push(...await strictChecks(client, tables.filter((t) => t.protected), opts.allowGlobal ?? []));
+  if (opts.strict) {
+    checks.push(...await strictChecks(client, tables.filter((t) => t.protected), opts.allowGlobal ?? [], !!opts.allowQueryText));
+  }
   else checks.push(await queryText(client, false));
   return { checks, tables, excluded };
 }
@@ -310,7 +347,7 @@ async function writeProbe(client: pg.ClientBase, label: string, name: string, co
  * a view or materialized view whose chain down to a tenant table holds a
  * materialized view (no RLS at all) or a view that runs as an owner who skips
  * RLS (not security_invoker); a SECURITY DEFINER function owned by such a role
- * (executable, or fired as a trigger); a rule on a relation the app can write.
+ * (executable, or run without an EXECUTE check: IMPLICIT); any rule.
  * ponytail: any such view in the chain counts, even one shadowed by a lower
  * definer view of a non-bypassing owner (a false fail, never a false pass).
  */
@@ -359,26 +396,25 @@ function bypassObjects(client: pg.ClientBase, column: string, allow: string[]): 
      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
      WHERE c.relkind = 'f' AND ${anyRole("has_any_column_privilege(m.oid, c.oid, 'SELECT')")}
      ORDER BY 1`, [column]);
-  // A rule's actions run with the table owner's privileges: a rule on a
-  // relation the app can write can read (or copy) what the app cannot.
+  // A rule's actions run with the table owner's privileges and can read (or
+  // copy) what the app cannot. Any rule counts: a write reaches a table
+  // through a view, a column grant or a cascade. Use a trigger instead.
   const { rows: rules } = await client.query(
     `SELECT rw.rulename || ' on ' || c.oid::regclass::text AS name FROM pg_rewrite rw JOIN pg_class c ON c.oid = rw.ev_class
      JOIN pg_namespace n ON n.oid = c.relnamespace
      WHERE rw.rulename <> '_RETURN' AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-       AND ${anyRole("has_table_privilege(m.oid, c.oid, 'INSERT, UPDATE, DELETE')")}
      ORDER BY 1`);
   // ponytail: a function body is opaque (plpgsql records no dependencies), so every
   // such function counts, the firewall's own aside. A LEAKPROOF function outside
   // pg_catalog runs before the RLS filter and can leak the rows it sees. A
-  // trigger or event trigger function needs no EXECUTE to run: it counts whatever
-  // its grants (any table: a cascade fires the triggers of tables the app cannot write).
+  // function PostgreSQL runs without an EXECUTE check (IMPLICIT) counts
+  // whatever its grants.
   const { rows: fns } = await client.query(
     `SELECT p.oid::regprocedure::text AS name, pg_get_userbyid(p.proowner) AS owner, p.proleakproof AS leakproof
      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace JOIN pg_roles r ON r.oid = p.proowner
      WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
        AND NOT (n.nspname = 'public' AND p.proname LIKE '#_firewall#_%' ESCAPE '#')
-       AND (${anyRole("has_function_privilege(m.oid, p.oid, 'EXECUTE')")}
-            OR p.oid IN (SELECT tgfoid FROM pg_trigger UNION SELECT evtfoid FROM pg_event_trigger))
+       AND (${anyRole("has_function_privilege(m.oid, p.oid, 'EXECUTE')")} OR p.oid IN ${IMPLICIT})
        AND (p.proleakproof OR (p.prosecdef AND ${BYPASSES}))
      ORDER BY 1`);
   // --allow-global clears only what may hold shared data by design: a function
@@ -387,7 +423,7 @@ function bypassObjects(client: pg.ClientBase, column: string, allow: string[]): 
   const list = [
     ...views.map((v) => `${v.matview ? "materialized view" : "view"} ${v.name} (owner ${v.owner})`),
     ...foreign.filter((f) => f.tenant || !allowedRel(allow, f.name)).map((f) => `foreign table ${f.name}`),
-    ...rules.map((r) => `rule ${r.name}`),
+    ...rules.map((r) => `rule ${r.name} (use a trigger)`),
     ...fns.filter((f) => !allowedFn(allow, f.name))
       .map((f) => `${f.leakproof ? "LEAKPROOF" : "SECURITY DEFINER"} function ${f.name} (owner ${f.owner})`),
   ];
@@ -410,10 +446,15 @@ function queryText(client: pg.ClientBase, strict: boolean): Promise<Check> {
     const { rows: [r] } = await client.query(
       `SELECT ${anyRole(`(has_table_privilege(m.oid, 'pg_catalog.pg_stat_activity', 'SELECT')
           OR has_function_privilege(m.oid, 'pg_catalog.pg_stat_get_activity(integer)', 'EXECUTE')
-          OR has_function_privilege(m.oid, 'pg_catalog.pg_stat_get_backend_activity(integer)', 'EXECUTE'))`)} AS can`);
+          OR has_function_privilege(m.oid, 'pg_catalog.pg_stat_get_backend_activity(integer)', 'EXECUTE')
+          OR EXISTS (SELECT 1 FROM pg_proc f WHERE f.proname = 'pg_stat_statements'
+                       AND has_function_privilege(m.oid, f.oid, 'EXECUTE'))
+          OR EXISTS (SELECT 1 FROM pg_class v WHERE v.relname = 'pg_stat_statements' AND v.relkind = 'v'
+                       AND has_table_privilege(m.oid, v.oid, 'SELECT')))`)} AS can`);
     return { ok: !r.can, detail: r.can
-      ? "yes: SQL one tenant runs can read the query text of another tenant's session, literal values included " +
-        "(send values as parameters; migrate --harden revokes it)" : "no (pg_stat_activity revoked)" };
+      ? "yes: SQL one tenant runs can read the query text of another tenant's session (pg_stat_activity, " +
+        "pg_stat_statements), literal values included (send values as parameters; migrate --harden revokes it, " +
+        "or --allow-query-text where only the provider can)" : "no (pg_stat_activity and pg_stat_statements revoked)" };
   };
   return strict ? guard("strict: cannot read other sessions' SQL", check)
                 : info("reads other sessions' SQL (info)", check);
@@ -428,11 +469,12 @@ function queryText(client: pg.ClientBase, strict: boolean): Promise<Check> {
  * sequence a protected table owns. Anything else (a table without the tenant
  * column, a log or history table, a reference table) needs --allow-global
  * schema.name, which says "this may be shared by all tenants". No large
- * object may be readable. And no SECURITY DEFINER function outside the
- * firewall's own may be executable, or fire as a trigger, unless allowlisted:
- * it runs as its owner, whatever it reads.
+ * object may be readable, nor other sessions' SQL. And no SECURITY DEFINER
+ * function outside the firewall's own may exist unless allowlisted: it runs as
+ * its owner, whatever it reads.
  */
-async function strictChecks(client: pg.ClientBase, protectedTables: TableReport[], allow: string[]): Promise<Check[]> {
+async function strictChecks(client: pg.ClientBase, protectedTables: TableReport[], allow: string[],
+                            allowQueryText: boolean): Promise<Check[]> {
   const readable = () => guard("strict: only tenant data readable", async () => {
     const { rows: rels } = await client.query(
       `SELECT c.oid::int AS oid, n.nspname AS nsp, c.relname AS rel, n.nspname || '.' || c.relname AS name,
@@ -470,7 +512,7 @@ async function strictChecks(client: pg.ClientBase, protectedTables: TableReport[
       if (seen.has(oid)) return true;
       seen.add(oid);
       const r = byOid.get(oid);
-      if (!r) return false;                                  // a system relation (pg_catalog): not tenant data
+      if (!r) return false;                                  // a system relation (pg_catalog): not known safe, allowlist the view
       if (r.kind !== "v" || !r.invoker) return safe.has(oid) || allowedRel(allow, r.name);
       const to = deps.get(oid) ?? [];
       return !r.calls_fn && to.length > 0 && to.every((t) => safeView(t, seen));
@@ -493,22 +535,22 @@ async function strictChecks(client: pg.ClientBase, protectedTables: TableReport[
       ? `${r.n} large object(s) readable${r.compat ? " (lo_compat_privileges is on)" : ""}: shared by all tenants (lo_unlink them, or revoke)`
       : "none" };
   });
+  // Every one, executable or not: PostgreSQL runs some (triggers, aggregate,
+  // range and index support, type I/O) without checking EXECUTE.
   const definer = () => guard("strict: no SECURITY DEFINER functions", async () => {
     const { rows } = await client.query(
       `SELECT p.oid::regprocedure::text AS sig
        FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
        WHERE p.prosecdef AND n.nspname NOT IN ('pg_catalog', 'information_schema')
          AND NOT (n.nspname = 'public' AND p.proname LIKE '#_firewall#_%' ESCAPE '#')
-         AND (${anyRole("has_function_privilege(m.oid, p.oid, 'EXECUTE')")}
-              OR p.oid IN (SELECT tgfoid FROM pg_trigger UNION SELECT evtfoid FROM pg_event_trigger))
        ORDER BY 1`);
     const bad = rows.filter((r) => !allowedFn(allow, r.sig)).map((r) => r.sig);
     return { ok: bad.length === 0, detail: bad.length
-      ? `executable or a trigger, runs as its owner: ${listed(bad)} (revoke EXECUTE and drop such triggers, or --allow-global 'schema.name(args)')`
+      ? `runs as its owner: ${listed(bad)} (drop it or make it SECURITY INVOKER, or --allow-global 'schema.name(args)')`
       : "none outside the firewall's own (or allowlisted)" };
   });
   // one client: one query at a time
-  return [await readable(), await largeObjects(), await definer(), await queryText(client, true)];
+  return [await readable(), await largeObjects(), await definer(), await queryText(client, !allowQueryText)];
 }
 
 /** Tables with the tenant column outside the scanned schemas that the role can read. */

@@ -45,7 +45,11 @@ Options:
   --allow-global <glob>  verify --strict: schema.name of a table, view or
                      sequence, or schema.name(argtypes) of a function, that the
                      app may reach without tenant scoping (shared reference
-                     data, say); repeatable
+                     data, say); repeatable. For array types, use * (app.f(*))
+  --allow-query-text verify --strict: accept that the role can read other
+                     sessions' SQL (managed PostgreSQL, where only the provider's
+                     superuser can revoke pg_stat_activity); send values as
+                     parameters
   --json             machine-readable output
   -h, --help
 
@@ -61,7 +65,7 @@ async function main(argv: string[]): Promise<number> {
       url: { type: "string" }, column: { type: "string" }, schema: { type: "string", multiple: true },
       "write-probe": { type: "boolean" }, "harden-signals": { type: "boolean" },
       harden: { type: "boolean" }, "app-role": { type: "string" },
-      "allow-global": { type: "string", multiple: true },
+      "allow-global": { type: "string", multiple: true }, "allow-query-text": { type: "boolean" },
       mode: { type: "string" }, context: { type: "string" }, tenant: { type: "string" },
       exclude: { type: "string", multiple: true },
       strict: { type: "boolean" }, json: { type: "boolean" }, help: { type: "boolean", short: "h" },
@@ -112,12 +116,13 @@ async function main(argv: string[]): Promise<number> {
     }
     if (command === "verify") {
       if (!values.tenant) { process.stderr.write("db-firewall verify: --tenant is required\n"); return 2; }
-      if (values["allow-global"]?.length && !values.strict) {
-        process.stderr.write("db-firewall verify: --allow-global needs --strict\n"); return 2;
+      if ((values["allow-global"]?.length || values["allow-query-text"]) && !values.strict) {
+        process.stderr.write("db-firewall verify: --allow-global and --allow-query-text need --strict\n"); return 2;
       }
       const result = await verify(client, { ...common, tenant: values.tenant, key: key!,
                                             writeProbe: values["write-probe"], strict: values.strict,
-                                            allowGlobal: values["allow-global"] });
+                                            allowGlobal: values["allow-global"],
+                                            allowQueryText: values["allow-query-text"] });
       const failed = result.checks.filter((c) => c.ok === false).length;
       const unsure = result.checks.filter((c) => c.ok === null).length;
       print(values.json, result, () => checksText(result.checks) + skippedText(result.excluded) +

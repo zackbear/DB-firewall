@@ -39,6 +39,9 @@ describe("usage", () => {
     assert.deepEqual(["app.b", "app.a", "app.^"].map((n) => globMatch("app.[^a]", n)), [false, true, true]);
     assert.deepEqual(["app.b", "app.a"].map((n) => globMatch("app.[!a]", n)), [true, false]);
     assert.equal(globMatch("app.f(*)", "app.f(text, integer)"), true);
+    // A leading "]" is literal, also after "!".
+    assert.deepEqual(["]", "a", "b"].map((n) => globMatch("[]a]", n)), [true, true, false]);
+    assert.deepEqual(["]", "a", "b"].map((n) => globMatch("[!]a]", n)), [false, false, true]);
   });
   it("ships the repository's migration unchanged", () => {
     assert.equal(readFileSync(new URL("../sql/001_postgresql.sql", import.meta.url), "utf8"),
@@ -504,6 +507,29 @@ describe("migrate, scan, verify", live, () => {
         () => failedWith("no RLS-bypassing views or functions", new RegExp(`view ${S}\\.ref_docs.*rule leak on ${S}\\.docs`),
                          "--allow-global", `${S}.ref_*`));
     });
+    it("an aggregate over a SECURITY DEFINER function fails, even with EXECUTE revoked (in both checks)", async () => {
+      await withChange(`CREATE FUNCTION ${S}.sfunc(text, text) RETURNS text LANGUAGE sql SECURITY DEFINER AS 'SELECT $1';
+          REVOKE EXECUTE ON FUNCTION ${S}.sfunc(text, text) FROM PUBLIC;
+          CREATE AGGREGATE ${S}.agg(text) (SFUNC = ${S}.sfunc, STYPE = text);`,
+        `DROP AGGREGATE ${S}.agg(text); DROP FUNCTION ${S}.sfunc(text, text);`, async () => {
+          await failedWith("strict: no SECURITY DEFINER functions", /sfunc\(text,text\)/);
+          await failedWith("no RLS-bypassing views or functions", /sfunc\(text,text\)/);
+        });
+    });
+    it("a rule fails even when the app writes only through a column grant or a view", async () => {
+      await withChange(`CREATE TABLE ${S}.audit2 (who text); CREATE TABLE ${S}.notes2 (body text);
+          GRANT INSERT (body) ON ${S}.notes2 TO ${ROLE};
+          CREATE RULE leak2 AS ON INSERT TO ${S}.notes2 DO ALSO SELECT who FROM ${S}.audit2;`,
+        `DROP TABLE ${S}.notes2, ${S}.audit2;`,
+        () => failedWith("no RLS-bypassing views or functions", /rule leak2 on/));
+    });
+    it("--allow-query-text accepts other sessions' SQL (an info line)", async () => {
+      await withChange("GRANT SELECT ON pg_catalog.pg_stat_activity TO PUBLIC", NO_ACTIVITY, async () => {
+        const r = await verifyStrict("--allow-query-text");
+        assert.equal(r.code, 0, failed(r.data.checks).join("; "));
+        assert.ok(r.data.checks.some((c) => c.check === "reads other sessions' SQL (info)"));
+      });
+    });
     it("a readable large object fails", async () => {
       await withChange(`SELECT lo_from_bytea(424242, 'tenant B contract'); ALTER LARGE OBJECT 424242 OWNER TO ${ROLE}`,
         "SELECT lo_unlink(424242)", () => failedWith("strict: no readable large objects", /^1 large object/));
@@ -540,6 +566,16 @@ describe("migrate, scan, verify", live, () => {
                  ALTER DEFAULT PRIVILEGES IN SCHEMA ${S} REVOKE ALL ON TABLES FROM ${ROLE};
                  DROP OWNED BY dbfw_cli_mid; DROP ROLE dbfw_cli_mid; ${RESTORE}`);
     }
+  });
+
+  it("migrate --harden refuses when the app role owns a domain, and verify fails on it", async () => {
+    await withChange(`CREATE DOMAIN ${S}.sec AS text; ALTER DOMAIN ${S}.sec OWNER TO ${ROLE}`, `DROP DOMAIN ${S}.sec`, async () => {
+      const v = await json(["verify", ...APP(), "--tenant", "A", ...clean]);
+      assert.ok(failed(v.data.checks).includes("-: owns no database objects"));
+      const r = await run(["migrate", "--url", ADMIN_URL, ...scope, "--mode", "restrictive", "--harden", "--app-role", ROLE]);
+      assert.equal(r.code, 2);
+      assert.match(r.stderr, new RegExp(`owner of type ${S}.sec`));
+    });
   });
 
   it("migrate --harden refuses when the app role owns a schema, and verify fails on it", async () => {

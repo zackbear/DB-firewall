@@ -518,14 +518,17 @@ $$;
 --     - TRIGGER and TRUNCATE on every table (a trigger function runs in other
 --       tenants' sessions; TRUNCATE ignores RLS), also in default privileges,
 --       so tables created later do not get them;
---     - pg_stat_activity, pg_stat_get_activity and pg_stat_get_backend_activity:
---       one shared role sees the SQL text of its other sessions, so one tenant
---       could read the literal values in another tenant's queries.
+--     - pg_stat_activity, pg_stat_get_activity and pg_stat_get_backend_activity,
+--       and pg_stat_statements when installed: one shared role sees the SQL
+--       text of its other sessions, so one tenant could read the literal
+--       values in another tenant's queries. Roles that only have pg_monitor
+--       lose pg_stat_activity too: grant it to them again.
 --     Database-wide, so off by default; needs a superuser. With dbfw.app_role
 --     it refuses (and the whole script changes nothing) when that role can act
---     as the owner of the database, a schema or a table (an owner can grant
+--     as the owner of the database or of any object in it (an owner can grant
 --     itself everything back), or still has one of these privileges afterwards
---     through a role it is a member of.
+--     through a role it is a member of. CASCADE also removes what the app role
+--     passed on with a grant option.
 DO $$
 DECLARE
     app TEXT := NULLIF(current_setting('dbfw.app_role', true), '');
@@ -545,22 +548,25 @@ BEGIN
         IF app_oid IS NULL THEN
             RAISE EXCEPTION 'DB Firewall: dbfw.app_role %: no such role (give the bare name, without quotes)', app;
         END IF;
+        -- Any object (pg_shdepend), as `verify` counts them: an owner can grant
+        -- itself everything back, or change what runs in other tenants'
+        -- sessions (a domain constraint, a function body).
         SELECT string_agg(o, ', ') INTO found FROM (
             SELECT 'database ' || quote_ident(datname) AS o FROM pg_catalog.pg_database
             WHERE datname = current_database() AND pg_catalog.pg_has_role(app_oid, datdba, 'MEMBER')
             UNION ALL
-            SELECT 'schema ' || quote_ident(nspname) FROM pg_catalog.pg_namespace
-            WHERE nspname NOT IN ('pg_catalog', 'information_schema') AND nspname NOT LIKE 'pg#_%' ESCAPE '#'
-              AND pg_catalog.pg_has_role(app_oid, nspowner, 'MEMBER')
-            UNION ALL
-            SELECT 'table ' || c.oid::pg_catalog.regclass::text FROM pg_catalog.pg_class c
-            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-            WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
-              AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg#_%' ESCAPE '#'
-              AND pg_catalog.pg_has_role(app_oid, c.relowner, 'MEMBER')
-            LIMIT 20) s;
+            (SELECT o.type || ' ' || o.identity FROM pg_catalog.pg_shdepend d
+             CROSS JOIN LATERAL pg_catalog.pg_identify_object(d.classid, d.objid, 0) o
+             WHERE d.dbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database())
+               AND d.deptype = 'o'
+               AND d.classid NOT IN ('pg_catalog.pg_largeobject'::pg_catalog.regclass,
+                                     'pg_catalog.pg_default_acl'::pg_catalog.regclass)
+               AND pg_catalog.pg_has_role(app_oid, d.refobjid, 'MEMBER')
+               AND COALESCE(o.schema, '') NOT LIKE 'pg#_temp#_%' ESCAPE '#'
+               AND COALESCE(o.schema, '') NOT LIKE 'pg#_toast#_temp#_%' ESCAPE '#'
+             ORDER BY 1 LIMIT 20)) s;
         IF found IS NOT NULL THEN
-            RAISE EXCEPTION 'DB Firewall: dbfw.harden: % can act as the owner of %: give them to another role first', app, found;
+            RAISE EXCEPTION 'DB Firewall: dbfw.harden: % can act as the owner of %: give them to another role first (ALTER ... OWNER TO)', app, found;
         END IF;
     END IF;
     -- Every grant to PUBLIC or the app role, by any grantor: a REVOKE removes
@@ -601,13 +607,27 @@ BEGIN
           AND ((da.defaclobjtype = 'r' AND a.privilege_type IN ('TRIGGER', 'TRUNCATE'))
                OR (da.defaclobjtype = 'n' AND a.privilege_type = 'CREATE'))
     LOOP
-        EXECUTE format('SET LOCAL ROLE %I', r.grantor);
-        EXECUTE r.cmd;
+        BEGIN
+            EXECUTE format('SET LOCAL ROLE %I', r.grantor);
+            EXECUTE r.cmd;
+        EXCEPTION WHEN insufficient_privilege THEN
+            RAISE EXCEPTION 'DB Firewall: dbfw.harden: % as its grantor % failed: % (grant % USAGE on that schema, or revoke it by hand)',
+                r.cmd, r.grantor, SQLERRM, r.grantor;
+        END;
         EXECUTE format('SET LOCAL ROLE %I', me);
     END LOOP;
     REVOKE SELECT ON pg_catalog.pg_stat_activity FROM PUBLIC;
     REVOKE EXECUTE ON FUNCTION pg_catalog.pg_stat_get_activity(integer),
                                pg_catalog.pg_stat_get_backend_activity(integer) FROM PUBLIC;
+    -- pg_stat_statements, when installed: its text keeps some literal values.
+    FOR r IN SELECT format('REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC', p.oid::pg_catalog.regprocedure) AS cmd
+             FROM pg_catalog.pg_proc p WHERE p.proname = 'pg_stat_statements'
+             UNION ALL
+             SELECT format('REVOKE SELECT ON %s FROM PUBLIC', c.oid::pg_catalog.regclass)
+             FROM pg_catalog.pg_class c WHERE c.relname = 'pg_stat_statements' AND c.relkind = 'v'
+    LOOP
+        EXECUTE r.cmd;
+    END LOOP;
     IF app_oid IS NOT NULL THEN
         -- What is left comes through roles the app role is a member of.
         SELECT string_agg(o, ', ') INTO found FROM (
@@ -627,11 +647,15 @@ BEGIN
               AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles m WHERE pg_catalog.pg_has_role(app_oid, m.oid, 'MEMBER')
                             AND pg_catalog.has_table_privilege(m.oid, c.oid, 'TRIGGER, TRUNCATE'))
             UNION ALL
-            SELECT 'pg_stat_activity'
+            SELECT 'pg_stat_activity or pg_stat_statements'
             WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_roles m WHERE pg_catalog.pg_has_role(app_oid, m.oid, 'MEMBER')
                             AND (pg_catalog.has_table_privilege(m.oid, 'pg_catalog.pg_stat_activity', 'SELECT')
                                  OR pg_catalog.has_function_privilege(m.oid, 'pg_catalog.pg_stat_get_activity(integer)', 'EXECUTE')
-                                 OR pg_catalog.has_function_privilege(m.oid, 'pg_catalog.pg_stat_get_backend_activity(integer)', 'EXECUTE')))
+                                 OR pg_catalog.has_function_privilege(m.oid, 'pg_catalog.pg_stat_get_backend_activity(integer)', 'EXECUTE')
+                                 OR EXISTS (SELECT 1 FROM pg_catalog.pg_proc f WHERE f.proname = 'pg_stat_statements'
+                                              AND pg_catalog.has_function_privilege(m.oid, f.oid, 'EXECUTE'))
+                                 OR EXISTS (SELECT 1 FROM pg_catalog.pg_class v WHERE v.relname = 'pg_stat_statements'
+                                              AND v.relkind = 'v' AND pg_catalog.has_table_privilege(m.oid, v.oid, 'SELECT'))))
             LIMIT 20) s;
         IF found IS NOT NULL THEN
             RAISE EXCEPTION 'DB Firewall: dbfw.harden: % still has %, through a role it is a member of: revoke it there, or end that membership', app, found;
