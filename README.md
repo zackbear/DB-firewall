@@ -179,7 +179,14 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
   connections fail. None of this reads another tenant's rows, but SQL one
   tenant's agent runs can see what another tenant's request is running, and
   stop it. Keep literal values out of SQL text (use parameters), and see
-  "What a pass means" in `packages/cli/README.md`.
+  "What a pass means" in `packages/cli/README.md`. To stop the signals, set
+  `engines.postgresql.harden_signals: true` (or `dbfw.harden_signals = on`, or
+  `npx db-firewall migrate --harden-signals`). The migration then revokes
+  `pg_terminate_backend` and `pg_cancel_backend` from `PUBLIC` in that
+  database. That covers every app and role in the database, so it is off by
+  default and needs a superuser; grant the functions back to admin roles that
+  need them. `verify` reports both, and the role's current defaults, as
+  information lines.
 * **The key in logs.** A key you pass in (`dbfw.tenant_key`,
   `DB_FIREWALL_TENANT_KEY` at migration time) is SQL text. If statement or
   parameter logging is on, it reaches the server log. `run_migration` and

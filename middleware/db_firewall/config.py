@@ -55,7 +55,7 @@ DEFAULT_CONFIG = {
     # audit.table_name for that engine.
     "engines": {
         "postgresql": {"use_rls": True, "schema": "public", "policy_mode": "permissive",
-                       "tenant_context": "signed"},
+                       "tenant_context": "signed", "harden_signals": False},
         "mysql": {"use_views": True, "schema": None},
         "sqlserver": {"use_rls": True, "schema": "dbo"},
         "oracle": {"use_vpd": True, "schema": None, "audit_table": "VPD_AUDIT_LOG"},
@@ -122,6 +122,9 @@ def validate_config(config: dict) -> None:
     if not isinstance(ctx, str) or ctx.lower() not in ("signed", "plain"):
         raise ValueError(f"DB Firewall: engines.postgresql.tenant_context must be signed "
                          f"or plain, got {ctx!r}")
+    harden = ((config.get("engines") or {}).get("postgresql") or {}).get("harden_signals", False)
+    if not isinstance(harden, bool):
+        raise ValueError(f"DB Firewall: engines.postgresql.harden_signals must be true or false, got {harden!r}")
     users = config.get("excluded_users") or []
     if not isinstance(users, list) or not all(isinstance(u, str) and u for u in users):
         raise ValueError("DB Firewall: excluded_users must be a list of user names")

@@ -167,6 +167,10 @@ engines:
     # DB_FIREWALL_TENANT_KEY, so SQL the app runs cannot switch tenants.
     # plain: app.current_tenant alone, which any SQL in the transaction can set.
     tenant_context: "signed"
+    # true: revoke pg_terminate_backend / pg_cancel_backend from PUBLIC in this
+    # database, so tenants sharing the app role cannot end each other's
+    # requests. Affects every app and role in the database; needs a superuser.
+    harden_signals: false
   mysql:
     use_views: true
     schema: null

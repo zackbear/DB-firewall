@@ -92,6 +92,28 @@ export async function roleChecks(client: pg.ClientBase): Promise<Check[]> {
     // a search_path the app role sets for itself (ALTER ROLE ... SET persists
     // across sessions, and no reset can undo it). The migration refuses planted
     // _firewall_* objects and pins search_path; nothing else should rely on that.
+    // Information, never a failure: what one shared role allows that no
+    // tenant check can see.
+    () => guard("signals other sessions (info)", async () => {
+      const { rows: [r] } = await client.query(
+        `SELECT ${anyRole(`EXISTS (SELECT 1 FROM pg_proc p WHERE p.pronamespace = 'pg_catalog'::regnamespace
+           AND p.proname IN ('pg_terminate_backend', 'pg_cancel_backend')
+           AND has_function_privilege(m.oid, p.oid, 'EXECUTE'))`)} AS can`);
+      return { ok: true, detail: r.can
+        ? "yes: SQL one tenant runs can end or cancel another tenant's requests (availability only); " +
+          "migrate --harden-signals revokes it" : "no (pg_terminate_backend / pg_cancel_backend revoked)" };
+    }),
+    () => guard("role defaults (info)", async () => {
+      const { rows: [r] } = await client.query(
+        `SELECT string_agg(ro.rolname || COALESCE(' in ' || d.datname, '') || ': ' || array_to_string(s.setconfig, ', '),
+                           '; ' ORDER BY ro.rolname) AS set
+         FROM pg_db_role_setting s JOIN pg_roles ro ON ro.oid = s.setrole
+         LEFT JOIN pg_database d ON d.oid = s.setdatabase
+         WHERE pg_has_role(current_user, s.setrole, 'MEMBER') AND (s.setdatabase = 0 OR d.datname = current_database())`);
+      return { ok: true, detail: (r.set ? `set: ${r.set}` : "none") +
+        " (the role can change its own with ALTER ROLE CURRENT_USER SET; no grant prevents it, " +
+        "and a bad value can break its later connections)" };
+    }),
     // TRIGGER on a table lets the app attach a deferred trigger: it fires at
     // COMMIT, after an in-transaction session reset (postgres.js), and can
     // leave state for the connection's next user.

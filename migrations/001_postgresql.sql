@@ -17,6 +17,7 @@
 -- sets them from your config. With psql, set them in the same session:
 --   psql -c "SET dbfw.tenant_column = 'org_id'" -c "SET dbfw.schema = 'app'" \
 --        -c "SET dbfw.context = 'signed'" -c "SET dbfw.tenant_key = '<hex>'" \
+--        -c "SET dbfw.harden_signals = 'off'" \
 --        -f migrations/001_postgresql.sql
 -- ============================================================================
 
@@ -477,6 +478,31 @@ BEGIN
         EXECUTE format('REVOKE %s%s ON %s FROM %s', r.priv,
                        CASE WHEN r.cols <> '' THEN ' (' || r.cols || ')' ELSE '' END, r.obj,
                        CASE r.grantee WHEN 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(r.grantee)) END);
+    END LOOP;
+END;
+$$;
+
+-- 9. Opt-in (dbfw.harden_signals = on): all tenants share one role, and a role
+--    may end or cancel its own other sessions, so SQL one tenant runs could
+--    stop another tenant's requests. This revokes pg_terminate_backend and
+--    pg_cancel_backend from PUBLIC in this database. That covers every app
+--    and role in the database, so it is off by default; it needs a superuser.
+--    Superusers keep both; grant them back to admin roles that need them.
+DO $$
+DECLARE
+    f REGPROCEDURE;
+BEGIN
+    IF lower(COALESCE(NULLIF(current_setting('dbfw.harden_signals', true), ''), 'off')) NOT IN ('on', 'true', '1') THEN
+        RETURN;
+    END IF;
+    IF NOT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN
+        RAISE EXCEPTION 'DB Firewall: dbfw.harden_signals needs a superuser (it changes pg_catalog functions)';
+    END IF;
+    FOR f IN SELECT p.oid FROM pg_proc p
+             WHERE p.pronamespace = 'pg_catalog'::regnamespace
+               AND p.proname IN ('pg_terminate_backend', 'pg_cancel_backend')
+    LOOP
+        EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC', f);
     END LOOP;
 END;
 $$;

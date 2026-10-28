@@ -17,6 +17,7 @@ Runs `migrations/001_postgresql.sql` (shipped unchanged in this package) as an a
 - `--column tenant_id`: the tenant column.
 - `--schema public`: the schema.
 - `--mode permissive|restrictive`: use `restrictive` when your app has RLS policies of its own (Supabase, Drizzle `pgPolicy`). The tenant policies are then AND-ed with them. See the main README, "Run the migration".
+- `--harden-signals`: revoke `pg_terminate_backend` and `pg_cancel_backend` from `PUBLIC` in this database, so tenants sharing the app role cannot end or cancel each other's requests. It covers every app and role in the database, so it is off by default and needs a superuser.
 - `--context signed|plain`: `signed` (default) makes the policies accept a tenant only with a signature made with the key for the current transaction, so SQL the app runs cannot switch tenants. `DB_FIREWALL_TENANT_KEY`, when set, is installed (or rotated to); otherwise the database keeps its key, or generates one on the first run (`db-firewall key` prints it). See the main README, "PostgreSQL tenant context".
 
 After the migration it prints the scan.
@@ -66,7 +67,7 @@ A pass means `verify` found no known leak path. It does not prove isolation. It 
 - **Copies made by triggers, rules or jobs** into a table the app can read, even a plain (not `SECURITY DEFINER`) trigger.
 - **Side channels** that RLS leaves open: a `UNIQUE` or foreign-key error, or timing, can show that another tenant has a value.
 - **Your app setting `app.current_tenant` itself.** `verify` assumes only the middleware (`withTenant`) sets it, from the authenticated session.
-- **What one role shares.** All tenants use one database role, so its sessions can read each other's current query text (`pg_stat_activity`) and end each other's backends. The role can also change its own defaults (`ALTER ROLE CURRENT_USER SET ...`) so its later connections fail. That is availability and metadata, not another tenant's rows.
+- **What one role shares.** All tenants use one database role, so its sessions can read each other's current query text (`pg_stat_activity`) and end each other's backends (`migrate --harden-signals` stops that). The role can also change its own defaults (`ALTER ROLE CURRENT_USER SET ...`) so its later connections fail. That is availability and metadata, not another tenant's rows. Two information lines in `verify` report whether the role can signal other sessions, and which role-level defaults are set; they never fail.
 - **Privileges granted later.** `verify` checks the database as it is when it runs. Run it in CI and after every change to grants.
 
 Run it in CI and after schema changes, and review triggers, rules and jobs that copy tenant rows.

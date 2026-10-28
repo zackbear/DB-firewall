@@ -25,6 +25,9 @@ Options:
                      the tenant per transaction with DB_FIREWALL_TENANT_KEY, so SQL
                      it runs cannot switch tenants. migrate installs that key when
                      set, else keeps the database's key or generates one.
+  --harden-signals   migrate: revoke pg_terminate_backend / pg_cancel_backend from
+                     PUBLIC in this database (needs a superuser), so tenants sharing
+                     the app role cannot end each other's requests
   --tenant <id>      verify: a tenant id that has rows in your data
   --write-probe      verify: also try a cross-tenant insert (rolled back, but it
                      fires BEFORE INSERT triggers and uses up a sequence value)
@@ -44,7 +47,7 @@ async function main(argv: string[]): Promise<number> {
     args: argv, allowPositionals: true,
     options: {
       url: { type: "string" }, column: { type: "string" }, schema: { type: "string", multiple: true },
-      "write-probe": { type: "boolean" },
+      "write-probe": { type: "boolean" }, "harden-signals": { type: "boolean" },
       mode: { type: "string" }, context: { type: "string" }, tenant: { type: "string" },
       exclude: { type: "string", multiple: true },
       strict: { type: "boolean" }, json: { type: "boolean" }, help: { type: "boolean", short: "h" },
@@ -72,7 +75,8 @@ async function main(argv: string[]): Promise<number> {
   try {
     if (command === "migrate") {
       for (const schema of values.schema?.length ? values.schema : ["public"]) {
-        await migrate(client, { schema, column: values.column, mode: values.mode, context });
+        await migrate(client, { schema, column: values.column, mode: values.mode, context,
+                                hardenSignals: values["harden-signals"] });
       }
       const result = await scan(client, common);
       print(values.json, { migrated: true, ...result }, () => `Migration applied. ` +

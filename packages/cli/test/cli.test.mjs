@@ -389,6 +389,31 @@ describe("migrate, scan, verify", live, () => {
       });
   });
 
+  it("the info lines report signals and role defaults, without failing", async () => {
+    await withChange(`ALTER ROLE ${ROLE} SET statement_timeout = '9s';`, `ALTER ROLE ${ROLE} RESET statement_timeout;`,
+      async () => {
+        const r = await json(["verify", ...APP(), "--tenant", "A", ...clean]);
+        assert.equal(r.code, 0, failed(r.data.checks).join("; "));
+        const info = Object.fromEntries(r.data.checks.filter((c) => c.check.endsWith("(info)")).map((c) => [c.check, c]));
+        assert.match(info["signals other sessions (info)"].detail, /^yes/);
+        assert.match(info["role defaults (info)"].detail, /statement_timeout=9s/);
+      });
+  });
+
+  it("migrate --harden-signals revokes backend signals (superuser), and verify sees it", async () => {
+    const restore = "GRANT EXECUTE ON FUNCTION pg_catalog.pg_terminate_backend(integer, bigint), " +
+                    "pg_catalog.pg_cancel_backend(integer) TO PUBLIC";
+    try {
+      assert.equal((await run(["migrate", "--url", ADMIN_URL, ...scope, "--mode", "restrictive", "--harden-signals"])).code, 0);
+      const [{ can }] = await sql(`SELECT has_function_privilege('${ROLE}', 'pg_catalog.pg_terminate_backend(integer, bigint)', 'EXECUTE') AS can`);
+      assert.equal(can, false);
+      const r = await json(["verify", ...APP(), "--tenant", "A", ...clean]);
+      assert.match(r.data.checks.find((c) => c.check === "signals other sessions (info)").detail, /^no/);
+    } finally {
+      await sql(restore);
+    }
+  });
+
   it("key prints the database's key", async () => {
     const r = await run(["key", "--url", ADMIN_URL]);
     assert.equal(r.code, 0);

@@ -98,6 +98,11 @@
       `"$user"`.
     - The limits of one shared role: query text in `pg_stat_activity`,
       `pg_terminate_backend`, and `ALTER ROLE` on itself.
+- Opt-in `harden_signals` (`dbfw.harden_signals`, `migrate --harden-signals`):
+  it revokes `pg_terminate_backend` / `pg_cancel_backend` from `PUBLIC` in the
+  database, so tenants sharing one role cannot end each other's requests. It
+  needs a superuser. `verify` adds two information lines: whether the role
+  can signal other sessions, and its role-level defaults.
 - **Upgrade:** set `DB_FIREWALL_TENANT_KEY` in the app before re-running the
   migration, or set `tenant_context: plain`. PostgreSQL 13+ for signed.
 

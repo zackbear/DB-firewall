@@ -399,3 +399,27 @@ def test_reset_drops_the_last_tenants_sequence_values():
     finally:
         with psycopg.connect(DSN, autocommit=True) as c:
             c.execute(f"DROP TABLE {SCHEMA}.seqd")
+
+
+def test_harden_signals_revokes_backend_signals_and_is_off_by_default():
+    sql = ("SELECT has_function_privilege(%s, 'pg_catalog.pg_terminate_backend(integer, bigint)', 'EXECUTE'), "
+           "has_function_privilege(%s, 'pg_catalog.pg_cancel_backend(integer)', 'EXECUTE')")
+    with psycopg.connect(DSN) as c:
+        assert c.execute(sql, (ROLE, ROLE)).fetchone() == (True, True)          # default: unchanged
+    cfg = _cfg()
+    cfg["engines"]["postgresql"]["harden_signals"] = True
+    try:
+        with psycopg.connect(DSN) as c:
+            run_migration(c, DBEngine.POSTGRESQL, cfg)
+        with psycopg.connect(DSN) as c:
+            assert c.execute(sql, (ROLE, ROLE)).fetchone() == (False, False)
+    finally:
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute("GRANT EXECUTE ON FUNCTION pg_catalog.pg_terminate_backend(integer, bigint), "
+                      "pg_catalog.pg_cancel_backend(integer) TO PUBLIC")
+
+
+def test_harden_signals_must_be_a_boolean():
+    from middleware.db_firewall.config import validate_config
+    with pytest.raises(ValueError, match="harden_signals"):
+        validate_config({"engines": {"postgresql": {"harden_signals": "yes"}}})
