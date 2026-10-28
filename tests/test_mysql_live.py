@@ -291,18 +291,28 @@ def _safe_failure(e):
     return isinstance(e, pymysql.err.MySQLError) and e.args and e.args[0] in SAFE_DB_ERRORS
 
 
-TABLES = ("orders", "vault", "notes", "plain")
+def _base_tables(cur, column=None):
+    """Every base table in the test schema except the firewall's own; with
+    column, only the tables that have it. Found at run time, so a table added
+    to the setup is covered without editing the test."""
+    sql = ("SELECT t.TABLE_NAME FROM information_schema.TABLES t WHERE t.TABLE_SCHEMA = DATABASE() "
+           "AND t.TABLE_TYPE = 'BASE TABLE' AND t.TABLE_NAME NOT LIKE '#_firewall#_%%' ESCAPE '#'"
+           " AND (%s IS NULL OR EXISTS (SELECT 1 FROM information_schema.COLUMNS c WHERE "
+           "c.TABLE_SCHEMA = t.TABLE_SCHEMA AND c.TABLE_NAME = t.TABLE_NAME AND c.COLUMN_NAME = %s))")
+    cur.execute(sql, (column, column))         # always parameterised: "%%" is a literal %
+    return sorted(r[0] for r in cur.fetchall())
 
 
-def _snapshot(cur, tables=TABLES):
+def _snapshot(cur, tables=None):
+    tables = tables or _base_tables(cur)
     state = {}
     for table in tables:
-        cur.execute(f"SELECT * FROM {table}")
+        cur.execute(f"SELECT * FROM `{table}`")
         state[table] = sorted(map(repr, cur.fetchall()))
     return state
 
 
-def _as_if_only_tenant_a(sql, read, tables=TABLES):
+def _as_if_only_tenant_a(sql, read, tables=None):
     """The oracle: run sql raw (no middleware) on a copy of the data where only
     tenant A's rows exist, as tenant A, then roll back. What protect() returns
     or leaves behind for tenant A must equal this. No transform of B's data
@@ -311,8 +321,8 @@ def _as_if_only_tenant_a(sql, read, tables=TABLES):
     cur = c.cursor()
     try:
         cur.execute("SET @_fw_tenant_id = '__BYPASS__'")      # raw admin session: triggers allow
-        for table in ("orders", "vault"):
-            cur.execute(f"DELETE FROM {table} WHERE org_id IS NULL OR NOT (BINARY org_id = 'A')")
+        for table in _base_tables(cur, "org_id"):
+            cur.execute(f"DELETE FROM `{table}` WHERE org_id IS NULL OR NOT (BINARY org_id = 'A')")
         cur.execute("SET @_fw_tenant_id = 'A'")
         try:
             cur.execute(sql)
@@ -350,7 +360,7 @@ def test_corpus_read(rewriter, who, user, password, label, sql, cfg):
 @pytest.mark.parametrize("label,sql", WRITES, ids=[w[0] for w in WRITES])
 def test_corpus_write(rewriter, who, user, password, label, sql, cfg):
     cfg["rewriter"] = rewriter
-    tables = TABLES if who == "admin" else ("orders",)   # the app can read and write only orders
+    tables = None if who == "admin" else ("orders",)   # admin: every table; the app reads and writes only orders
     c = _connect(user, password)
     ran = False
     try:

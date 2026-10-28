@@ -69,6 +69,9 @@ WRITES = [
     ("HANDLER", "HANDLER orders OPEN"),
     ("MariaDB executable comment delete", "/*M!DELETE FROM orders*/"),
     ("copy every tenant into notes", "INSERT INTO notes (id, body) SELECT id, org_id FROM orders"),
+    ("copy every tenant into another protected table",
+     "INSERT INTO a_table_name_that_is_longer_than_fifty_seven_characters_xyz (id, org_id) "
+     "SELECT id, 'A' FROM orders"),
     ("copy B into notes by subquery",
      "INSERT INTO notes (id, body) SELECT 7, (SELECT org_id FROM orders WHERE id = 2) FROM orders"),
 ]
