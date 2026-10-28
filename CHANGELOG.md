@@ -11,12 +11,13 @@
     tables the migration skips, and excluded tables are listed. `--strict`
     exits 1 when a table is unprotected or none is found.
   - `verify` connects as the app's role and tests the behaviour. It fails on:
-    a role it can use that skips RLS (also through `SET ROLE` or
-    inheritance), write access to the bypass list, table ownership,
+    a role it is a member of that skips RLS, write access to the bypass list
+    (column grants included), ownership of `public` (the database owner on
+    PG15+) or of a firewall object, table ownership,
     `TRUNCATE`, rows visible without a tenant or from another tenant, a
-    tenant with no rows, definer views, materialized views and
-    `SECURITY DEFINER` functions over tenant tables, and readable tenant
-    tables in other schemas. Read-only by default. `--write-probe` adds a
+    tenant with no rows, definer views (followed through view chains),
+    materialized views and `SECURITY DEFINER` functions in any schema, and
+    readable tenant tables in other schemas. Read-only by default. `--write-probe` adds a
     rolled-back cross-tenant insert. Exit 3 when a check is inconclusive.
   - Live tests in the `typescript` CI job. Not yet published to npm.
 

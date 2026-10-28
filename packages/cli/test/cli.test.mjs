@@ -7,6 +7,7 @@ import { readFileSync } from "node:fs";
 import pg from "pg";
 
 const ADMIN_URL = process.env.DBFW_PG_URL;
+const DB = ADMIN_URL ? new URL(ADMIN_URL).pathname.slice(1) : "";
 if (!ADMIN_URL && process.env.DBFW_REQUIRE_LIVE) throw new Error("DBFW_REQUIRE_LIVE set but DBFW_PG_URL is not");
 const live = { skip: ADMIN_URL ? false : "DBFW_PG_URL not set" };
 const S = "cli_app", ROLE = "dbfw_cli", PW = "DbfwCli_2026x";
@@ -164,6 +165,37 @@ describe("migrate, scan, verify", live, () => {
      `CREATE SCHEMA ${S}_other; CREATE TABLE ${S}_other.docs (id int, tenant_id text);
       GRANT USAGE ON SCHEMA ${S}_other TO ${ROLE}; GRANT SELECT ON ${S}_other.docs TO ${ROLE};`,
      `DROP SCHEMA ${S}_other CASCADE;`],
+    // Round 2: ownership of public / the firewall objects, column grants, view chains, other schemas.
+    ["it owns the database (so schema public)", "-: does not own firewall objects",
+     `ALTER DATABASE ${DB} OWNER TO ${ROLE};`, `ALTER DATABASE ${DB} OWNER TO CURRENT_USER;`],
+    ["it owns a firewall function", "-: does not own firewall objects",
+     `ALTER FUNCTION public._firewall_is_bypass_role(text) OWNER TO ${ROLE};`,
+     `ALTER FUNCTION public._firewall_is_bypass_role(text) OWNER TO CURRENT_USER;`],
+    ["it has a column grant on the bypass list", "-: cannot write firewall tables",
+     `GRANT INSERT (role_name) ON public._firewall_bypass_roles TO ${ROLE};`,
+     `REVOKE INSERT (role_name) ON public._firewall_bypass_roles FROM ${ROLE};`],
+    ["a definer view is readable through a column grant", "-: no RLS-bypassing views or functions",
+     `CREATE VIEW ${S}.col_v AS SELECT * FROM ${S}.docs; GRANT SELECT (id) ON ${S}.col_v TO ${ROLE};`,
+     `DROP VIEW ${S}.col_v;`],
+    ["a view on a view", "-: no RLS-bypassing views or functions",
+     `CREATE VIEW ${S}.inner_v AS SELECT * FROM ${S}.docs; CREATE VIEW ${S}.outer_v AS SELECT * FROM ${S}.inner_v;
+      GRANT SELECT ON ${S}.outer_v TO ${ROLE};`, `DROP VIEW ${S}.outer_v; DROP VIEW ${S}.inner_v;`],
+    ["a materialized view over an invoker view", "-: no RLS-bypassing views or functions",
+     `CREATE VIEW ${S}.base_v WITH (security_invoker = true) AS SELECT * FROM ${S}.docs;
+      CREATE MATERIALIZED VIEW ${S}.mv AS SELECT * FROM ${S}.base_v; GRANT SELECT ON ${S}.mv TO ${ROLE};`,
+     `DROP MATERIALIZED VIEW ${S}.mv; DROP VIEW ${S}.base_v;`],
+    ["a view in another schema", "-: no RLS-bypassing views or functions",
+     `CREATE SCHEMA ${S}_other; CREATE VIEW ${S}_other.all_docs AS SELECT * FROM ${S}.docs;
+      GRANT USAGE ON SCHEMA ${S}_other TO ${ROLE}; GRANT SELECT ON ${S}_other.all_docs TO ${ROLE};`,
+     `DROP SCHEMA ${S}_other CASCADE;`],
+    ["a SECURITY DEFINER function in another schema", "-: no RLS-bypassing views or functions",
+     `CREATE SCHEMA ${S}_other; GRANT USAGE ON SCHEMA ${S}_other TO ${ROLE};
+      CREATE FUNCTION ${S}_other.dump() RETURNS SETOF ${S}.docs LANGUAGE sql SECURITY DEFINER AS 'SELECT * FROM ${S}.docs';`,
+     `DROP SCHEMA ${S}_other CASCADE;`],
+    ["a column grant on a tenant table in another schema", "-: no tenant tables in other schemas",
+     `CREATE SCHEMA ${S}_other; CREATE TABLE ${S}_other.copy (id int, tenant_id text);
+      GRANT USAGE ON SCHEMA ${S}_other TO ${ROLE}; GRANT SELECT (id) ON ${S}_other.copy TO ${ROLE};`,
+     `DROP SCHEMA ${S}_other CASCADE;`],
   ];
   for (const [why, check, apply, undo] of blockers) {
     it(`verify fails when ${why}`, async () => {
@@ -181,6 +213,28 @@ describe("migrate, scan, verify", live, () => {
       const r = await json(["verify", ...APP(), "--tenant", "A", ...clean]);
       assert.equal(r.code, 0, failed(r.data.checks).join("; "));
     });
+  });
+
+  it("security_invoker spelled 1 is an invoker view", async () => {
+    await withChange(`CREATE VIEW ${S}.vi1 WITH (security_invoker = 1) AS SELECT * FROM ${S}.docs;
+                      GRANT SELECT ON ${S}.vi1 TO ${ROLE};`, `DROP VIEW ${S}.vi1;`, async () => {
+      const r = await json(["verify", ...APP(), "--tenant", "A", ...clean]);
+      assert.equal(r.code, 0, failed(r.data.checks).join("; "));
+    });
+  });
+
+  it("partitions read through their parent pass", async () => {
+    await withChange(`CREATE TABLE ${S}.parts (id int, tenant_id text) PARTITION BY LIST (tenant_id);
+        CREATE TABLE ${S}.parts_a PARTITION OF ${S}.parts FOR VALUES IN ('A');
+        CREATE TABLE ${S}.parts_b PARTITION OF ${S}.parts FOR VALUES IN ('B');
+        INSERT INTO ${S}.parts VALUES (1, 'A'), (2, 'B'); GRANT SELECT ON ${S}.parts TO ${ROLE};`,
+      `DROP TABLE ${S}.parts;`, async () => {
+        assert.equal((await run(["migrate", "--url", ADMIN_URL, ...scope])).code, 0);
+        const r = await json(["verify", ...APP(), "--tenant", "A", ...clean]);
+        assert.equal(r.code, 0, failed(r.data.checks).join("; "));
+        const parts = r.data.checks.filter((c) => c.table === `${S}.parts_a`);
+        assert.deepEqual(parts.map((c) => c.check).slice(-1), ["not reachable by the role"]);
+      });
   });
 
   it("verify as a superuser fails the role check", async () => {
