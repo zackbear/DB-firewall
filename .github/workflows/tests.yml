@@ -32,8 +32,9 @@ jobs:
       - run: python -m pytest -q --cov=middleware --cov-report=term-missing --cov-fail-under=85
 
   live:
-    # MySQL and SQL Server: migrations, middleware, scanner and the attack corpus
-    # (tests/attack_corpus.py) against real servers, on every pull request.
+    # MySQL and SQL Server: migrations, middleware and scanner against real
+    # servers on every pull request; on MySQL also the attack corpus
+    # (tests/attack_corpus.py).
     runs-on: ubuntu-latest
     timeout-minutes: 20
     services:

@@ -12,7 +12,9 @@ on:
       - "tests/test_oracle_live.py"
       - "tests/live_setup/oracle_*.sql"
       - ".github/workflows/oracle-nightly.yml"
-      - "middleware/db_firewall/**"
+      - "middleware/**"
+      - "hooks/**"
+      - "requirements.txt"
 
 jobs:
   oracle:
@@ -41,12 +43,15 @@ jobs:
         run: |
           ORA=${{ job.services.oracle.id }}
           # The migration runs as SYS in the PDB, for the app schema, on ORG_ID.
-          { echo "ALTER SESSION SET CONTAINER = FREEPDB1;"; \
+          { echo "WHENEVER SQLERROR EXIT FAILURE"; echo "ALTER SESSION SET CONTAINER = FREEPDB1;"; \
             sed -e "s/^DEFINE SCHEMA_OWNER .*/DEFINE SCHEMA_OWNER   = 'DBFW'/" \
                 -e "s/^DEFINE TENANT_COLUMN .*/DEFINE TENANT_COLUMN   = 'ORG_ID'/" migrations/004_oracle.sql; \
             echo "EXIT"; } > /tmp/mig.sql
-          docker cp tests/live_setup/oracle_before.sql $ORA:/tmp/before.sql
-          docker cp tests/live_setup/oracle_after.sql $ORA:/tmp/after.sql
+          # sqlplus exits 0 on SQL errors unless told otherwise
+          for f in before after; do
+            { echo "WHENEVER SQLERROR EXIT FAILURE"; cat tests/live_setup/oracle_$f.sql; } > /tmp/$f.sql
+            docker cp /tmp/$f.sql $ORA:/tmp/$f.sql
+          done
           docker cp /tmp/mig.sql $ORA:/tmp/mig.sql
           docker exec $ORA sqlplus -s -L dbfw/DbfwApp_2026x@//localhost:1521/FREEPDB1 @/tmp/before.sql
           docker exec $ORA sqlplus -s -L / as sysdba @/tmp/mig.sql

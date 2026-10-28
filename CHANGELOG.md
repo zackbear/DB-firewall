@@ -12,7 +12,11 @@
 - **sqlglot is pinned** (`sqlglot==30.24.0`). The rewriter's safety depends on
   how sqlglot parses, so upgrade only when the suite and the corpus pass.
 - **`rewriter: regex` is deprecated** and will be removed in the next major
-  version. It logs a warning once per process.
+  version. **On MySQL and unrecognised engines it is now refused**
+  (`PermissionError`): the PR 11 review found two more cross-tenant reads
+  through it there (`... --id-2`, which MySQL does not read as a comment, and
+  a scalar subquery in the select list). On PostgreSQL, SQL Server and Oracle
+  it logs a `FutureWarning` once per process; RLS or VPD stands behind it.
 - **pytest 9.2 compatibility.** pytest 9.2 undoes a monkeypatch of a name
   that is not in the module's `__dict__` with `delattr`. For the package's
   log-once flags (`_warned_*`) that deleted the flag from its module, and later

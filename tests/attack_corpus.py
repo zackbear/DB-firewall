@@ -28,6 +28,12 @@ READS = [
     ("TABLE command", "TABLE orders"),
     ("derived then table", "SELECT * FROM (SELECT 1) t, orders"),
     ("executable comment widens WHERE", "SELECT id, org_id FROM orders WHERE id > 0 /*! OR 1=1 */"),
+    ("-- without space is not a comment", "SELECT id, org_id FROM orders --id-2"),
+    ("scalar subquery over a scoped FROM", "SELECT (SELECT org_id FROM orders WHERE id = 2) x FROM orders"),
+    ("versioned executable comment", "SELECT id FROM orders /*!80000 , (SELECT org_id FROM orders WHERE id = 2) */"),
+    ("MariaDB executable comment", "SELECT id, org_id FROM orders WHERE id > 0 /*M! OR 1=1 */"),
+    ("BINARY cast of the tenant", "SELECT id, BINARY org_id FROM orders"),
+    ("GROUP_CONCAT", "SELECT GROUP_CONCAT(org_id) FROM orders"),
 ]
 
 # (label, sql): writes and bypass attempts
@@ -47,4 +53,14 @@ WRITES = [
     ("delete all behind #", "DELETE FROM orders # x"),
     ("executable comment delete", "/*!DELETE FROM orders*/"),
     ("retag own row as B", "UPDATE orders SET org_id = 'B' WHERE id = 1"),
+    ("retag own row as C", "UPDATE orders SET org_id = 'C' WHERE id = 1"),
+    ("null the tenant", "UPDATE orders SET org_id = NULL WHERE id = 1"),
+    ("insert NULL tenant", "INSERT INTO orders VALUES (52, NULL)"),
+    ("set variable, backticked name", "SET @`_fw_tenant_id` = 'B'"),
+    ('set variable, double-quoted name', 'SET @"_fw_tenant_id" = \'B\''),
+    ("pool hook as the app user (mapped to B)", "CALL _firewall_init_connection()"),
+    ("PREPARE", "PREPARE s FROM 'SET @_fw_tenant_id = 1'"),
+    ("DO", "DO (SELECT 1)"),
+    ("HANDLER", "HANDLER orders OPEN"),
+    ("MariaDB executable comment delete", "/*M!DELETE FROM orders*/"),
 ]

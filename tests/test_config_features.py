@@ -393,24 +393,31 @@ class TestMySQLGuard:
         "SELECT * FROM (SELECT 1) t, orders",
         "SELECT id, org_id FROM (orders)",
         "SELECT o.id FROM (SELECT 1) t STRAIGHT_JOIN orders o",
-        "SELECT id, org_id FROM orders # x",
     ])
     def test_regex_refuses_shapes_that_hide_a_table(self, cfg, sql):
         from db_firewall.rewrite import rewrite_query
         cfg["rewriter"] = "regex"
-        with pytest.raises(PermissionError):
-            rewrite_query(sql, "A", cfg, None, DBEngine.MYSQL)
+        with pytest.raises(PermissionError, match="unsupported statement shape"):
+            rewrite_query(sql, "A", cfg, None, DBEngine.POSTGRESQL)
 
     def test_regex_still_scopes_plain_shapes(self, cfg):
         from db_firewall.rewrite import rewrite_query
         cfg["rewriter"] = "regex"
-        out = rewrite_query("SELECT a, f(b, c) FROM orders WHERE x IN (1, 2) LIMIT 1, 2",
-                            "A", cfg, None, DBEngine.MYSQL)
+        out = rewrite_query("SELECT a, f(b, c) FROM orders WHERE x IN (1, 2) LIMIT 1",
+                            "A", cfg, None, DBEngine.POSTGRESQL)
         assert "tenant_id = 'A'" in out
+
+    @pytest.mark.parametrize("engine", [DBEngine.MYSQL, DBEngine.UNKNOWN])
+    def test_regex_refused_where_no_database_layer(self, cfg, engine):
+        from db_firewall.rewrite import check_no_tenant, rewrite_query
+        cfg["rewriter"] = "regex"
+        with pytest.raises(PermissionError, match="refused on MySQL"):
+            rewrite_query("SELECT id FROM orders", "A", cfg, None, engine)
+        with pytest.raises(PermissionError, match="refused on MySQL"):
+            check_no_tenant("SELECT id FROM orders", cfg, None, engine)
 
     def test_unknown_engine_gets_the_mysql_check(self, cfg):
         from db_firewall.rewrite import rewrite_query
-        cfg["rewriter"] = "regex"
         with pytest.raises(PermissionError):
             rewrite_query("SET @_fw_tenänt_id = '__BYPASS__'", "A", cfg, None, DBEngine.UNKNOWN)
 
@@ -430,6 +437,6 @@ def test_regex_rewriter_warns_once(cfg, monkeypatch):
     from db_firewall import rewrite
     monkeypatch.setattr(rewrite, "_regex_warned", False)
     cfg["rewriter"] = "regex"
-    with pytest.warns(DeprecationWarning, match="deprecated"):
+    with pytest.warns(FutureWarning, match="deprecated"):
         rewrite.rewrite_query("SELECT 1", "A", cfg, None, DBEngine.POSTGRESQL)
     assert rewrite._regex_warned

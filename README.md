@@ -64,10 +64,9 @@ MySQL has no RLS. Its layer is views plus triggers, keyed on the user variable
 * On every engine the middleware refuses MySQL/MariaDB executable comments
   (`/*! ... */`, `/*M! ... */`): MySQL runs their text as SQL. On MySQL it
   also refuses `#` comments.
-* `rewriter: regex` on MySQL reads base tables with no database layer behind
-  it. It refuses comma joins, parenthesised or derived tables and
-  `STRAIGHT_JOIN`, because its table finder cannot see every table in those.
-  Use the default `ast` rewriter.
+* `rewriter: regex` is refused on MySQL and on engines `protect()` cannot
+  identify: it has had cross-tenant read bypasses, and on MySQL no database
+  layer stands behind base-table reads. Use the default `ast` rewriter.
 * Grants for the app user: `SELECT` on the `v_` views; `SELECT`, `INSERT`,
   `UPDATE`, `DELETE` on the base tables (the middleware's `UPDATE`/`DELETE`
   adds a `WHERE` on the tenant column, which needs `SELECT`; the triggers
@@ -184,7 +183,7 @@ Still **refused** (`PermissionError`, fail closed) because they cannot be proven
 
 **Driver entry points.** `ProtectedConnection` mediates `cursor()`, `execute()`, `executemany()`, `stream()`, `copy()` and `pipeline()`; `ProtectedCursor` mediates `execute()`, `executemany()`, `stream()` and `copy()`, all through one guard that applies the rewrite (tenant set) or the fail-closed check (no tenant). Any other attribute named like a SQL entry point (`execute*`, `copy*`, `executescript`, `callproc`, `exec_driver_sql`, …) raises `PermissionError` instead of being delegated, so a driver method the wrapper does not know cannot bypass it. The SQLAlchemy hook registers `before_cursor_execute` with `retval=True`, so the scoped statement is the one that executes.
 
-`rewriter: "regex"` (or `DB_FIREWALL_REWRITER=regex`) keeps the old dependency-free injector: it handles single-table statements and refuses every multi-scope shape above. It is deprecated and will be removed in the next major version: it had cross-tenant read bypasses that the `ast` rewriter did not (see CHANGELOG), and it logs a warning once per process. With `rewriter: "ast"` and sqlglot missing, `protect()`'d queries raise `ImportError` rather than silently downgrading.
+`rewriter: "regex"` (or `DB_FIREWALL_REWRITER=regex`) keeps the old dependency-free injector: it handles single-table statements and refuses every multi-scope shape above. It is deprecated and will be removed in the next major version: it had cross-tenant read bypasses that the `ast` rewriter did not (see CHANGELOG). It is refused on MySQL and on engines `protect()` cannot identify, and elsewhere it logs a warning once per process (RLS or VPD still stands behind it there). With `rewriter: "ast"` and sqlglot missing, `protect()`'d queries raise `ImportError` rather than silently downgrading.
 
 In both modes the database-native RLS/VPD policy remains the second layer: the rewriter can only narrow a query, never widen it, and a statement that slips past it unscoped still hits the row policy.
 

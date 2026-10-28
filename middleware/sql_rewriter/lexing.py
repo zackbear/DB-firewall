@@ -10,7 +10,7 @@ except ImportError:          # pragma: no cover - exercised only without sqlglot
 
 
 INSTALL_HINT = ("DB Firewall: the AST rewriter needs sqlglot "
-                "(pip install 'sqlglot>=25'); set rewriter: \"regex\" to opt out")
+                "(pip install -r requirements.txt, which pins the tested version)")
 
 DIALECTS = {"postgresql": "postgres", "mysql": "mysql", "sqlserver": "tsql",
             "oracle": "oracle", "sqlite": "sqlite"}

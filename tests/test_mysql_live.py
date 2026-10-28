@@ -280,6 +280,21 @@ def test_scanner(conn, cfg):
 # ---------------------------------------------------------------- attack corpus
 
 USERS = [("admin", None, None), ("app", "dbfw_app", APP_PW)]
+# Refusals that are safe: the middleware's PermissionError, missing privilege
+# (1142 table, 1143 column) and a trigger's SIGNAL (1644). Anything else fails.
+SAFE_DB_ERRORS = {1142, 1143, 1644}
+
+
+def _safe_failure(e):
+    if isinstance(e, PermissionError):
+        return True
+    return isinstance(e, pymysql.err.MySQLError) and e.args and e.args[0] in SAFE_DB_ERRORS
+
+
+def _leaks(rows):
+    """Tenant B is row (2, 'B'): any cell that is 2 or contains B is a leak
+    (catches b'B' from a BINARY cast and 'A,B' from GROUP_CONCAT)."""
+    return [r for r in rows if any(c == 2 or "B" in str(c) for c in r)]
 
 
 @pytest.mark.parametrize("rewriter", ["ast", "regex"])
@@ -292,10 +307,11 @@ def test_corpus_read(rewriter, who, user, password, label, sql, cfg):
         cur = protect(c, tenant_id="A", config=cfg).cursor()
         try:
             cur.execute(sql)
-            rows = cur.fetchall()
-        except Exception:               # refused, or the database rejected it: not a leak
+        except Exception as e:
+            assert _safe_failure(e), f"{label}: unexpected error {e!r}"
             return
-        assert not any("B" in map(str, row) for row in rows), f"{label}: returned {rows}"
+        rows = cur.fetchall()
+        assert not _leaks(rows), f"{label}: returned {rows}"
     finally:
         c.rollback()
         c.close()
@@ -310,13 +326,14 @@ def test_corpus_write(rewriter, who, user, password, label, sql, cfg):
     try:
         try:
             protect(c, tenant_id="A", config=cfg).cursor().execute(sql)
-        except Exception:               # refused, or the database rejected it
-            pass
+        except Exception as e:
+            assert _safe_failure(e), f"{label}: unexpected error {e!r}"
         raw = c.cursor()                # same session: sees its own uncommitted writes
         raw.execute("SELECT @_fw_tenant_id")          # MySQL folds the spellings to this one
         assert raw.fetchone() == ("A",), f"{label}: tenant variable changed"
-        raw.execute("SELECT id, org_id FROM orders WHERE BINARY org_id = 'B' ORDER BY id")
-        assert raw.fetchall() == ((2, "B"),), f"{label}: tenant B rows changed"
+        raw.execute("SELECT id, org_id FROM orders "
+                    "WHERE org_id IS NULL OR NOT (BINARY org_id = 'A') ORDER BY id")
+        assert raw.fetchall() == ((2, "B"),), f"{label}: rows outside tenant A changed"
     finally:
         c.rollback()
         c.close()

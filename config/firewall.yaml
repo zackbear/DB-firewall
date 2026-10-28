@@ -36,7 +36,8 @@ fail_mode: "closed"
 #             CTEs, UNION branches, joins, subqueries, UPDATE..FROM,
 #             DELETE..USING, INSERT..SELECT/VALUES (stamps the tenant column).
 #             Requires `pip install sqlglot`; raises ImportError if missing.
-#   "regex" → DEPRECATED legacy single-WHERE injector, no dependency. Refuses CTE/UNION/
+#   "regex" → DEPRECATED legacy single-WHERE injector, no dependency.
+#             Refused on MySQL and on engines protect() cannot identify. Refuses CTE/UNION/
 #             multi-table shapes outright (fail closed) instead of scoping them.
 # Env override: DB_FIREWALL_REWRITER=regex
 # ----------------------------------------------------------------------------

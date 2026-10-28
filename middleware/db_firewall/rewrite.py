@@ -209,11 +209,27 @@ def rewrite_query(sql: str, tenant_id: str, config: dict,
             protect_ops=protect,
             allow_tenant_placeholder=bool(config.get("allow_tenant_placeholder", False)))
 
-    _warn_regex_deprecated()
+    _check_regex_allowed(engine)
     return _rewrite_query_regex(sql, tenant_id, config, is_protected)
 
 
 _regex_warned = False
+
+
+# Engines where nothing in the database stands behind a missed rewrite: MySQL
+# base-table reads have no row-level layer, and an engine protect() cannot
+# identify may be MySQL. The regex rewriter is refused there. (engine=None is
+# a direct call that named no engine; protect() always passes one.)
+_REGEX_REFUSED_ENGINES = (DBEngine.MYSQL, DBEngine.UNKNOWN)
+
+
+def _check_regex_allowed(engine) -> None:
+    if engine in _REGEX_REFUSED_ENGINES:
+        raise PermissionError(
+            "DB Firewall: rewriter 'regex' is refused on MySQL and unrecognised engines "
+            "(it has had cross-tenant read bypasses and no database layer stands behind "
+            "it there). Use rewriter: ast (needs sqlglot).")
+    _warn_regex_deprecated()
 
 
 def _warn_regex_deprecated() -> None:
@@ -224,7 +240,7 @@ def _warn_regex_deprecated() -> None:
         msg = ("DB Firewall: rewriter 'regex' is deprecated and will be removed in the "
                "next major version; it has had cross-tenant bypasses the 'ast' rewriter "
                "did not. Use rewriter: ast (needs sqlglot).")
-        warnings.warn(msg, DeprecationWarning, stacklevel=3)
+        warnings.warn(msg, FutureWarning, stacklevel=3)     # shown by default, unlike DeprecationWarning
         logger.warning(msg)
 
 
@@ -258,7 +274,7 @@ def check_no_tenant(sql: str, config: dict, connection=None, engine: str = None)
         _sqlr.rewrite(sql, None, config.get("tenant_column", "tenant_id"),
                       _protected_predicate(config, connection, engine), engine)
         return
-    _warn_regex_deprecated()
+    _check_regex_allowed(engine)
     if _strip_sql(sql).lstrip().upper().startswith(_DML_STARTS + _UNSAFE_STARTS):
         raise PermissionError(_sqlr._NO_TENANT_MSG)
 
