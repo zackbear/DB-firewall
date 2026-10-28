@@ -196,6 +196,30 @@ describe("migrate, scan, verify", live, () => {
      `CREATE SCHEMA ${S}_other; CREATE TABLE ${S}_other.copy (id int, tenant_id text);
       GRANT USAGE ON SCHEMA ${S}_other TO ${ROLE}; GRANT SELECT (id) ON ${S}_other.copy TO ${ROLE};`,
      `DROP SCHEMA ${S}_other CASCADE;`],
+    // Round 3: SET-only roles, unreachable unprotected tables, matviews over functions,
+    // extension members, foreign tables, LEAKPROOF functions.
+    ["a SET-only role can write the bypass list", "-: cannot write firewall tables",
+     `CREATE ROLE dbfw_cli_w NOLOGIN; GRANT INSERT ON public._firewall_bypass_roles TO dbfw_cli_w;
+      GRANT dbfw_cli_w TO ${ROLE} WITH INHERIT FALSE;`,
+     `REVOKE dbfw_cli_w FROM ${ROLE}; REVOKE ALL ON public._firewall_bypass_roles FROM dbfw_cli_w; DROP ROLE dbfw_cli_w;`],
+    ["an unprotected table it has no grant on", `${S}.ledger: policies`,
+     `CREATE TABLE ${S}.ledger (id int, tenant_id text);`, `DROP TABLE ${S}.ledger;`],
+    ["a materialized view over a function", "-: no RLS-bypassing views or functions",
+     `CREATE FUNCTION ${S}.all_ids() RETURNS TABLE (id int) LANGUAGE sql STABLE AS 'SELECT id FROM ${S}.docs';
+      CREATE MATERIALIZED VIEW ${S}.ids_mv AS SELECT * FROM ${S}.all_ids(); GRANT SELECT ON ${S}.ids_mv TO ${ROLE};`,
+     `DROP MATERIALIZED VIEW ${S}.ids_mv; DROP FUNCTION ${S}.all_ids();`],
+    ["a SECURITY DEFINER function attached to an extension", "-: no RLS-bypassing views or functions",
+     `CREATE FUNCTION ${S}.export_docs() RETURNS SETOF ${S}.docs LANGUAGE sql SECURITY DEFINER AS 'SELECT * FROM ${S}.docs';
+      ALTER EXTENSION plpgsql ADD FUNCTION ${S}.export_docs();`,
+     `ALTER EXTENSION plpgsql DROP FUNCTION ${S}.export_docs(); DROP FUNCTION ${S}.export_docs();`],
+    ["a foreign table", "-: no RLS-bypassing views or functions",
+     `CREATE FOREIGN DATA WRAPPER dbfw_cli_fdw; CREATE SERVER dbfw_cli_srv FOREIGN DATA WRAPPER dbfw_cli_fdw;
+      CREATE FOREIGN TABLE ${S}.docs_remote (id int, tenant_id text) SERVER dbfw_cli_srv;
+      GRANT SELECT ON ${S}.docs_remote TO ${ROLE};`,
+     `DROP FOREIGN TABLE ${S}.docs_remote; DROP SERVER dbfw_cli_srv; DROP FOREIGN DATA WRAPPER dbfw_cli_fdw;`],
+    ["a LEAKPROOF function", "-: no RLS-bypassing views or functions",
+     `CREATE FUNCTION ${S}.peek(text) RETURNS boolean LANGUAGE sql LEAKPROOF AS 'SELECT true';`,
+     `DROP FUNCTION ${S}.peek(text);`],
   ];
   for (const [why, check, apply, undo] of blockers) {
     it(`verify fails when ${why}`, async () => {
@@ -233,7 +257,8 @@ describe("migrate, scan, verify", live, () => {
         const r = await json(["verify", ...APP(), "--tenant", "A", ...clean]);
         assert.equal(r.code, 0, failed(r.data.checks).join("; "));
         const parts = r.data.checks.filter((c) => c.table === `${S}.parts_a`);
-        assert.deepEqual(parts.map((c) => c.check).slice(-1), ["not reachable by the role"]);
+        assert.ok(parts.find((c) => c.check === "policies").ok);          // reference taken from the root
+        assert.match(parts.find((c) => c.check === "row checks").detail, /no direct reads/);
       });
   });
 

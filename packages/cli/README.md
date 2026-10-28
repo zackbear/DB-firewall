@@ -36,19 +36,19 @@ Lists every table in the schema that has the tenant column, and reports whether 
 Connect with your app's own URL and role, not an admin's. `verify` tests behaviour, not only the policies. It is read-only by default: each check runs in a transaction that is rolled back.
 
 1. **The role:** RLS applies to it and to every role it is a member of. None is a superuser, has `BYPASSRLS` or is in `_firewall_bypass_roles`.
-2. **Firewall objects:** the role cannot write `_firewall_bypass_roles` or `_firewall_tenant_map`, column grants included (else it could add itself as a bypass role). It cannot act as the owner of schema `public` or of any `_firewall_*` object (else it could drop and replace the bypass list). On PostgreSQL 15 and later the database owner owns `public`, so do not make the app role the database owner.
+2. **Firewall objects:** the role, and every role it can `SET ROLE` to, cannot write `_firewall_bypass_roles` or `_firewall_tenant_map`, column grants included (else it could add itself as a bypass role). It cannot act as the owner of schema `public` or of any `_firewall_*` object (else it could drop and replace the bypass list). On PostgreSQL 15 and later the database owner owns `public`, so do not make the app role the database owner.
 3. **Tables found:** at least one table has the tenant column.
-4. **Per table** (a table the role has no privileges on, such as a partition read through its parent, is reported as not reachable and needs no further checks):
+4. **Per table:**
    - the scan above passes;
    - the role does not own the table (an owner can turn RLS off);
    - the role has no `TRUNCATE` (RLS does not apply to it);
    - with no tenant, the role sees no rows;
    - as `--tenant`, every visible row belongs to that tenant.
 5. **Tenant has rows:** `--tenant` sees at least one row somewhere. A tenant with no rows proves nothing, so this fails.
-6. **Read paths RLS does not guard,** in any schema: no view or materialized view the role can read (a column grant is enough) whose chain down to a tenant table holds a materialized view or a view that runs as an owner who skips RLS (use `security_invoker = true`). No `SECURITY DEFINER` function owned by such a role that the app can execute. A function body is not inspected, so every such function counts, except the firewall's own and extension members.
+6. **Read paths RLS does not guard,** in any schema, for the role and every role it can `SET ROLE` to: no foreign table (RLS does not reach remote data). No materialized view with the tenant column or built over a function. No view or materialized view the role can read (a column grant is enough) whose chain down to a tenant table holds a materialized view or a view that runs as an owner who skips RLS (use `security_invoker = true`). No `SECURITY DEFINER` function owned by such a role that the app can execute. A function body is not inspected, so every such function counts, except the firewall's own. No `LEAKPROOF` function outside `pg_catalog` (it runs before the RLS filter and can leak the rows it sees).
 7. **Other schemas:** no table with the tenant column that the role can read (a column grant is enough) outside `--schema`.
 
-A table the role can reach but cannot `SELECT` the tenant column of gets no row checks, and that is reported as inconclusive. So is a row check whose query fails. A global check whose query fails counts as failed.
+A table no usable role can `SELECT` (such as a partition read through its parent) gets no row checks: there are no direct reads, and the other checks cover the rest. A table readable only after `SET ROLE` is inconclusive: run `verify` as that role. So is a row check whose query fails. A global check whose query fails counts as failed.
 
 `--write-probe` also tries, per table, to insert a row for another tenant, which RLS must refuse. It is rolled back, but it fires `BEFORE INSERT` triggers and uses up a sequence value, so it is off by default. A refusal by anything other than RLS is inconclusive.
 

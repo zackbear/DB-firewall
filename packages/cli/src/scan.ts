@@ -40,6 +40,8 @@ const SQL = `
                     AND a.attnum > 0 AND NOT a.attisdropped))
   SELECT t.relname AS table, t.relrowsecurity AS enabled, t.relforcerowsecurity AS forced,
     pg_get_userbyid((SELECT relowner FROM pg_class WHERE oid = t.oid)) AS owner,
+    (CASE WHEN (SELECT relispartition FROM pg_class WHERE oid = t.oid) THEN pg_partition_root(t.oid)
+          ELSE t.oid END)::regclass::text AS ref_rel,
     ARRAY(SELECT op FROM unnest(ARRAY['sel', 'ins', 'upd', 'del']) AS op
           WHERE NOT EXISTS (SELECT 1 FROM pg_policies p
                             WHERE p.schemaname = t.nspname AND p.tablename = t.relname
@@ -89,13 +91,13 @@ export function globMatch(pattern: string, name: string): boolean {
  * columns, read back, then rolled back. Exact comparison catches a changed
  * cast, constant or function overload.
  */
-async function reference(client: pg.ClientBase, schema: string, table: string, column: string):
+async function reference(client: pg.ClientBase, rel: string, column: string):
     Promise<[string | null, string | null]> {
   const pred = `${ident(column)} = NULLIF(current_setting('app.current_tenant', true), '') ` +
     "OR public._firewall_is_bypass_role(current_user::text)";
   await client.query("BEGIN");
   try {
-    await client.query(`CREATE TEMP TABLE _fw_ref (LIKE ${ident(schema)}.${ident(table)})`);
+    await client.query(`CREATE TEMP TABLE _fw_ref (LIKE ${rel})`);
     await client.query(`CREATE POLICY _fw_ref_p ON pg_temp._fw_ref USING (${pred}) WITH CHECK (${pred})`);
     const { rows } = await client.query(
       "SELECT qual FROM pg_policies WHERE tablename = '_fw_ref' AND policyname = '_fw_ref_p' " +
@@ -123,7 +125,7 @@ export async function scan(client: pg.ClientBase, opts: {
   for (const r of rows) {
     if (exclude.some((p) => globMatch(p, r.table))) { excluded.push(`${schema}.${r.table}`); continue; }
     const policies: [string, string, string[], string | null, string | null][] = r.policies;
-    const [ref, why] = policies.length ? await reference(client, schema, r.table, column) : [null, null];
+    const [ref, why] = policies.length ? await reference(client, r.ref_rel, column) : [null, null];
     const unverified = policies.length > 0 && ref === null;
     const altered = ref === null ? [] : policies.filter(([name, cmd, roles, qual, check]) => {
       const op = name.slice(name.lastIndexOf("_") + 1);

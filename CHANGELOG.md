@@ -16,8 +16,9 @@
     PG15+) or of a firewall object, table ownership,
     `TRUNCATE`, rows visible without a tenant or from another tenant, a
     tenant with no rows, definer views (followed through view chains),
-    materialized views and `SECURITY DEFINER` functions in any schema, and
-    readable tenant tables in other schemas. Read-only by default. `--write-probe` adds a
+    materialized views, foreign tables, `SECURITY DEFINER` and `LEAKPROOF`
+    functions in any schema, and readable tenant tables in other schemas.
+    Privileges count for every role the app can `SET ROLE` to. Read-only by default. `--write-probe` adds a
     rolled-back cross-tenant insert. Exit 3 when a check is inconclusive.
   - Live tests in the `typescript` CI job. Not yet published to npm.
 

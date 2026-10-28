@@ -14,6 +14,14 @@ const MARK = "__dbfw_verify_other__";
 const BYPASSES = "(r.rolsuper OR r.rolbypassrls OR public._firewall_is_bypass_role(r.rolname::text))";
 
 /**
+ * True when any role the app can use holds the privilege: itself, a role it
+ * inherits, or one it can SET ROLE to. expr names that role m.oid.
+ * ponytail: MEMBER also counts a grant WITH INHERIT FALSE, SET FALSE (a false fail).
+ */
+const anyRole = (expr: string) =>
+  `EXISTS (SELECT 1 FROM pg_roles m WHERE pg_has_role(current_user, m.oid, 'MEMBER') AND ${expr})`;
+
+/**
  * The role and every role it can SET ROLE to (or inherits): none may skip RLS.
  * Also: the app must not be able to write the firewall's own tables.
  */
@@ -36,8 +44,8 @@ export async function roleChecks(client: pg.ClientBase): Promise<Check[]> {
       const { rows } = await client.query(
         `SELECT t AS name FROM unnest(ARRAY['public._firewall_bypass_roles', 'public._firewall_tenant_map']) t
          WHERE to_regclass(t) IS NOT NULL
-           AND (has_any_column_privilege(current_user, t, 'INSERT') OR has_any_column_privilege(current_user, t, 'UPDATE')
-                OR has_table_privilege(current_user, t, 'DELETE, TRUNCATE'))`);
+           AND ${anyRole(`(has_any_column_privilege(m.oid, t, 'INSERT') OR has_any_column_privilege(m.oid, t, 'UPDATE')
+                           OR has_table_privilege(m.oid, t, 'DELETE, TRUNCATE'))`)}`);
       return { ok: rows.length === 0, detail: rows.length
         ? `can write ${rows.map((x) => x.name).join(", ")} (could add itself as a bypass role)` : "no write access" };
     }),
@@ -96,26 +104,24 @@ export async function verify(client: pg.ClientBase, opts: {
     // Privileges RLS does not cover: the owner can turn RLS off; TRUNCATE ignores it.
     const { rows: [priv] } = await client.query(
       `SELECT pg_has_role(current_user, c.relowner, 'MEMBER') AS owns,
-              has_table_privilege(current_user, c.oid, 'TRUNCATE') AS truncate,
+              ${anyRole("has_table_privilege(m.oid, c.oid, 'TRUNCATE')")} AS truncate,
               has_column_privilege(current_user, c.oid, $2, 'SELECT') AS can_select,
-              has_any_column_privilege(current_user, c.oid, 'SELECT') OR has_any_column_privilege(current_user, c.oid, 'INSERT')
-                OR has_any_column_privilege(current_user, c.oid, 'UPDATE')
-                OR has_table_privilege(current_user, c.oid, 'DELETE, TRUNCATE, REFERENCES, TRIGGER') AS any
+              ${anyRole("has_column_privilege(m.oid, c.oid, $2, 'SELECT')")} AS some_role_selects
        FROM pg_class c WHERE c.oid = $1::regclass`, [name, column]);
     checks.push({ table: label, check: "role does not own the table", ok: !priv.owns,
                   detail: priv.owns ? `owned by ${t.owner}, which this role can act as: it can disable RLS`
                                     : `owned by ${t.owner}` });
     checks.push({ table: label, check: "no TRUNCATE", ok: !priv.truncate,
                   detail: priv.truncate ? "TRUNCATE is granted and RLS does not apply to it" : "not granted" });
-    if (!priv.any) {
-      // e.g. a partition read through its parent, whose policies apply instead.
-      checks.push({ table: label, check: "not reachable by the role", ok: true, detail: "no privileges on it" });
-      continue;
-    }
     checks.push({ table: label, check: "policies", ok: t.protected,
                   detail: t.protected ? `${t.policy_mode} policies in place` : summary(t) });
     if (!priv.can_select) {
-      checks.push({ table: label, check: "row checks", ok: null, detail: `skipped: no SELECT on ${column}` });
+      // No direct reads (e.g. a partition read through its parent): the policies
+      // above and the view and function checks below cover the other paths.
+      checks.push(priv.some_role_selects
+        ? { table: label, check: "row checks", ok: null,
+            detail: `readable only after SET ROLE to another role: run verify as that role` }
+        : { table: label, check: "row checks", ok: true, detail: `no role it can use can SELECT ${column}: no direct reads` });
       continue;
     }
     try {
@@ -169,6 +175,7 @@ async function writeProbe(client: pg.ClientBase, label: string, name: string, co
 
 /**
  * Read paths RLS does not guard, in any schema, that the role can use:
+ * a foreign table; a LEAKPROOF function outside pg_catalog;
  * a view or materialized view whose chain down to a tenant table holds a
  * materialized view (no RLS at all) or a view that runs as an owner who skips
  * RLS (not security_invoker); a SECURITY DEFINER function owned by such a role.
@@ -196,25 +203,43 @@ function bypassObjects(client: pg.ClientBase, column: string): Promise<Check> {
      FROM chain c JOIN pg_class v ON v.oid = c.top JOIN pg_namespace n ON n.oid = v.relnamespace
      JOIN pg_class t ON t.oid = c.cur AND t.relkind IN ('r', 'p')
      WHERE c.bad AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-       AND has_any_column_privilege(current_user, v.oid, 'SELECT')
+       AND ${anyRole("has_any_column_privilege(m.oid, v.oid, 'SELECT')")}
        AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = t.oid AND a.attname = $1
                      AND a.attnum > 0 AND NOT a.attisdropped)
+     UNION
+     -- A materialized view with the tenant column, or built over a function (no table dependency).
+     SELECT n.nspname || '.' || v.relname, true, pg_get_userbyid(v.relowner)
+     FROM pg_class v JOIN pg_namespace n ON n.oid = v.relnamespace
+     WHERE v.relkind = 'm' AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+       AND ${anyRole("has_any_column_privilege(m.oid, v.oid, 'SELECT')")}
+       AND (EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = v.oid AND a.attname = $1
+                      AND a.attnum > 0 AND NOT a.attisdropped)
+            OR EXISTS (SELECT 1 FROM pg_rewrite rw JOIN pg_depend d ON d.objid = rw.oid
+                         AND d.classid = 'pg_rewrite'::regclass AND d.refclassid = 'pg_proc'::regclass
+                       JOIN pg_proc f ON f.oid = d.refobjid AND f.pronamespace <> 'pg_catalog'::regnamespace
+                       WHERE rw.ev_class = v.oid))
      ORDER BY 1`, [column]);
+  // Foreign tables: RLS does not reach the remote data, read as the mapped user.
+  const { rows: foreign } = await client.query(
+    `SELECT n.nspname || '.' || c.relname AS name FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE c.relkind = 'f' AND ${anyRole("has_any_column_privilege(m.oid, c.oid, 'SELECT')")}
+     ORDER BY 1`);
   // ponytail: a function body is opaque (plpgsql records no dependencies), so every
-  // such function counts; the firewall's own and extension members aside.
+  // such function counts, the firewall's own aside. A LEAKPROOF function outside
+  // pg_catalog runs before the RLS filter and can leak the rows it sees.
   const { rows: fns } = await client.query(
     `SELECT n.nspname || '.' || p.proname || '(' || pg_get_function_identity_arguments(p.oid) || ')' AS name,
-            pg_get_userbyid(p.proowner) AS owner
+            pg_get_userbyid(p.proowner) AS owner, p.proleakproof AS leakproof
      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace JOIN pg_roles r ON r.oid = p.proowner
-     WHERE p.prosecdef AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+     WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
        AND NOT (n.nspname = 'public' AND p.proname LIKE '#_firewall#_%' ESCAPE '#')
-       AND NOT EXISTS (SELECT 1 FROM pg_depend e WHERE e.classid = 'pg_proc'::regclass AND e.objid = p.oid
-                         AND e.deptype = 'e')
-       AND has_function_privilege(current_user, p.oid, 'EXECUTE') AND ${BYPASSES}
+       AND ${anyRole("has_function_privilege(m.oid, p.oid, 'EXECUTE')")}
+       AND (p.proleakproof OR (p.prosecdef AND ${BYPASSES}))
      ORDER BY 1`);
   const list = [
     ...views.map((v) => `${v.matview ? "materialized view" : "view"} ${v.name} (owner ${v.owner})`),
-    ...fns.map((f) => `SECURITY DEFINER function ${f.name} (owner ${f.owner})`),
+    ...foreign.map((f) => `foreign table ${f.name}`),
+    ...fns.map((f) => `${f.leakproof ? "LEAKPROOF" : "SECURITY DEFINER"} function ${f.name} (owner ${f.owner})`),
   ];
   return { ok: list.length === 0,
            detail: list.length ? `the role can read through: ${list.join("; ")}` : "none found" };
@@ -228,7 +253,7 @@ function otherSchemas(client: pg.ClientBase, schemas: string[], column: string):
     `SELECT n.nspname || '.' || c.relname AS name FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
      WHERE c.relkind IN ('r', 'p') AND NOT (n.nspname = ANY($1))
        AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg_toast%'
-       AND has_any_column_privilege(current_user, c.oid, 'SELECT')
+       AND ${anyRole("has_any_column_privilege(m.oid, c.oid, 'SELECT')")}
        AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attname = $2
                      AND a.attnum > 0 AND NOT a.attisdropped)
      ORDER BY 1`, [schemas, column]);
