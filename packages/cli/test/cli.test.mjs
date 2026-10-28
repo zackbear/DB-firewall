@@ -414,6 +414,65 @@ describe("migrate, scan, verify", live, () => {
     }
   });
 
+  describe("verify --strict (allowlist)", () => {
+    // The excluded tables are readable but outside the scan: allowlist them.
+    const strict = ["--strict", "--allow-global", `${S}.late`, "--allow-global", `${S}.open_t`];
+    it("passes when everything readable is protected tenant data", async () => {
+      const r = await json(["verify", ...APP(), "--tenant", "A", ...clean, ...strict]);
+      assert.equal(r.code, 0, failed(r.data.checks).join("; "));
+      assert.ok(r.data.checks.some((c) => c.check === "strict: only tenant data readable" && c.ok));
+    });
+    it("a readable table without the tenant column fails until allowlisted; invoker views over it too", async () => {
+      await withChange(`CREATE TABLE ${S}.settings (k text); GRANT SELECT ON ${S}.settings TO ${ROLE};
+          CREATE VIEW ${S}.my_docs WITH (security_invoker = true) AS SELECT * FROM ${S}.docs;
+          CREATE VIEW ${S}.all_settings WITH (security_invoker = true) AS SELECT * FROM ${S}.settings;
+          GRANT SELECT ON ${S}.my_docs, ${S}.all_settings TO ${ROLE};`,
+        `DROP VIEW ${S}.my_docs, ${S}.all_settings; DROP TABLE ${S}.settings;`, async () => {
+          const r = await json(["verify", ...APP(), "--tenant", "A", ...clean, ...strict]);
+          assert.equal(r.code, 1);
+          const d = r.data.checks.find((c) => c.check === "strict: only tenant data readable").detail;
+          assert.match(d, new RegExp(`${S}\\.all_settings, ${S}\\.settings`));
+          assert.doesNotMatch(d, /my_docs/);                            // an invoker view over protected data
+          const ok = await json(["verify", ...APP(), "--tenant", "A", ...clean, ...strict,
+                                 "--allow-global", `${S}.settings`]);
+          assert.equal(ok.code, 0, failed(ok.data.checks).join("; "));
+        });
+    });
+    it("a SECURITY DEFINER function fails until allowlisted (in both checks)", async () => {
+      await withChange(`CREATE FUNCTION ${S}.now_utc() RETURNS timestamptz LANGUAGE sql SECURITY DEFINER AS 'SELECT now()';`,
+        `DROP FUNCTION ${S}.now_utc();`, async () => {
+          const r = await json(["verify", ...APP(), "--tenant", "A", ...clean, ...strict]);
+          assert.ok(failed(r.data.checks).includes("-: strict: no SECURITY DEFINER functions"));
+          assert.ok(failed(r.data.checks).includes("-: no RLS-bypassing views or functions"));
+          const ok = await json(["verify", ...APP(), "--tenant", "A", ...clean, ...strict,
+                                 "--allow-global", `${S}.now_utc`]);
+          assert.equal(ok.code, 0, failed(ok.data.checks).join("; "));
+        });
+    });
+  });
+
+  it("migrate --harden --app-role removes what verify fails on", async () => {
+    const restore = "GRANT EXECUTE ON FUNCTION pg_catalog.pg_terminate_backend(integer, bigint), " +
+                    "pg_catalog.pg_cancel_backend(integer) TO PUBLIC";
+    await sql(`CREATE TABLE ${S}.notes (n text); GRANT SELECT, TRIGGER, TRUNCATE ON ${S}.notes TO ${ROLE};
+               GRANT CREATE ON SCHEMA ${S} TO ${ROLE}; GRANT CREATE ON DATABASE ${DB} TO ${ROLE};`);
+    try {
+      const before = await json(["verify", ...APP(), "--tenant", "A", ...clean]);
+      for (const c of ["-: cannot create in any schema", "-: cannot create triggers"]) {
+        assert.ok(failed(before.data.checks).includes(c), c);
+      }
+      const r = await run(["migrate", "--url", ADMIN_URL, ...scope, "--mode", "restrictive", "--harden", "--app-role", ROLE]);
+      assert.equal(r.code, 0, r.stderr);
+      const after = await json(["verify", ...APP(), "--tenant", "A", ...clean]);
+      assert.equal(after.code, 0, failed(after.data.checks).join("; "));
+      const [p] = await sql(`SELECT has_table_privilege('${ROLE}', '${S}.notes', 'SELECT') AS sel,
+                                    has_table_privilege('${ROLE}', '${S}.notes', 'TRUNCATE') AS trunc`);
+      assert.deepEqual({ ...p }, { sel: true, trunc: false });
+    } finally {
+      await sql(`DROP TABLE ${S}.notes; REVOKE CREATE ON DATABASE ${DB} FROM ${ROLE}; ${restore}`);
+    }
+  });
+
   it("key prints the database's key", async () => {
     const r = await run(["key", "--url", ADMIN_URL]);
     assert.equal(r.code, 0);

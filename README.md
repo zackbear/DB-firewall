@@ -172,6 +172,16 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
   table names in the app, or give the app role a `search_path` without
   `"$user"` (`ALTER ROLE app SET search_path = public`), so an object planted
   later cannot shadow a table.
+* **Strict mode and hardening.** `npx db-firewall verify --strict` makes the
+  check an allowlist: everything the app role can read must be protected
+  tenant data (protected tables, `security_invoker` views over them, their
+  sequences), and no `SECURITY DEFINER` function outside the firewall's may
+  be executable, unless you mark it shared with `--allow-global schema.name`.
+  `npx db-firewall migrate --harden --app-role <role>` (or
+  `engines.postgresql.harden: true` with `app_role`) revokes what `verify`
+  fails on that the migration can remove: `CREATE` on the database and every
+  schema, `TRIGGER` and `TRUNCATE` on every table, and the backend signals.
+  Both cover the whole database; `--harden` needs a superuser.
 * **One role for all tenants.** Sessions of the same role can read each
   other's current query text in `pg_stat_activity`, and can end or cancel each
   other's backends (`pg_terminate_backend`). An app role can also change its

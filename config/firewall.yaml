@@ -171,6 +171,11 @@ engines:
     # database, so tenants sharing the app role cannot end each other's
     # requests. Affects every app and role in the database; needs a superuser.
     harden_signals: false
+    # true: also revoke CREATE on the database and every schema, and TRIGGER
+    # and TRUNCATE on every table, from PUBLIC and app_role (what
+    # `db-firewall verify` fails on). Database-wide; needs a superuser.
+    harden: false
+    app_role: null
   mysql:
     use_views: true
     schema: null

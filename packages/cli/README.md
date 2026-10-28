@@ -18,6 +18,7 @@ Runs `migrations/001_postgresql.sql` (shipped unchanged in this package) as an a
 - `--schema public`: the schema.
 - `--mode permissive|restrictive`: use `restrictive` when your app has RLS policies of its own (Supabase, Drizzle `pgPolicy`). The tenant policies are then AND-ed with them. See the main README, "Run the migration".
 - `--harden-signals`: revoke `pg_terminate_backend` and `pg_cancel_backend` from `PUBLIC` in this database, so tenants sharing the app role cannot end or cancel each other's requests. It covers every app and role in the database, so it is off by default and needs a superuser.
+- `--harden --app-role <role>`: also revoke what `verify` fails on that the migration can remove, from `PUBLIC` and the app role: `CREATE` on the database and on every schema, `TRIGGER` and `TRUNCATE` on every table, and the backend signals (as `--harden-signals`). `SELECT`, `INSERT`, `UPDATE` and `DELETE` stay. It covers the whole database, so it is off by default and needs a superuser. Ownership is not changed: a role that owns a schema or table keeps an owner's rights. Run it again after granting new privileges (`GRANT ALL` includes `TRIGGER` and `TRUNCATE`).
 - `--context signed|plain`: `signed` (default) makes the policies accept a tenant only with a signature made with the key for the current transaction, so SQL the app runs cannot switch tenants. `DB_FIREWALL_TENANT_KEY`, when set, is installed (or rotated to); otherwise the database keeps its key, or generates one on the first run (`db-firewall key` prints it). See the main README, "PostgreSQL tenant context".
 
 After the migration it prints the scan.
@@ -59,12 +60,26 @@ A table no usable role can `SELECT` (such as a partition read through its parent
 
 `--write-probe` also tries, per table, to insert a row for another tenant, which RLS must refuse. It is rolled back, but it fires `BEFORE INSERT` triggers and uses up a sequence value, so it is off by default. A refusal by anything other than RLS is inconclusive.
 
+### Strict mode (`--strict`)
+
+The checks above look for known leak paths. `--strict` turns that into an allowlist, so unknown paths fail too. Everything a role the app can use can read must be protected tenant data:
+
+- a table the migration protects;
+- a `security_invoker` view whose chain reaches only protected tables (no materialized view, foreign table or definer view on the way);
+- a sequence a protected table owns (`serial`, identity).
+
+Anything else the app can read fails: a table without the tenant column (an audit log, a history table, a reference table), an invoker view over one, a standalone sequence, a foreign table. Also, no `SECURITY DEFINER` function outside the firewall's own may be executable, because it runs as its owner, whatever it reads.
+
+`--allow-global schema.name` (repeatable, `*` and `?` globs) marks a table, view, sequence or function as data every tenant may share, such as a list of countries. It also clears that object in the bypass-objects check, for example a platform's own definer functions. Allowlist deliberately: an allowlisted table that holds tenant data is a leak.
+
+Strict mode closes most of what "What a pass means" lists below: tenant data in tables without the tenant column, and copies into readable tables, now fail unless you allowlist them.
+
 ### What a pass means
 
 A pass means `verify` found no known leak path. It does not prove isolation. It does not see:
 
-- **Tenant data in tables without the tenant column,** such as child tables, audit logs or history tables. Give every table that holds tenant data the tenant column, so the migration protects it.
-- **Copies made by triggers, rules or jobs** into a table the app can read, even a plain (not `SECURITY DEFINER`) trigger.
+- **Tenant data in tables without the tenant column,** such as child tables, audit logs or history tables. Give every table that holds tenant data the tenant column, so the migration protects it. `--strict` fails on such tables unless you allowlist them.
+- **Copies made by triggers, rules or jobs** into a table the app can read, even a plain (not `SECURITY DEFINER`) trigger. `--strict` fails on the readable target unless it is protected or allowlisted.
 - **Side channels** that RLS leaves open: a `UNIQUE` or foreign-key error, or timing, can show that another tenant has a value.
 - **Your app setting `app.current_tenant` itself.** `verify` assumes only the middleware (`withTenant`) sets it, from the authenticated session.
 - **What one role shares.** All tenants use one database role, so its sessions can read each other's current query text (`pg_stat_activity`) and end each other's backends (`migrate --harden-signals` stops that). The role can also change its own defaults (`ALTER ROLE CURRENT_USER SET ...`) so its later connections fail. That is availability and metadata, not another tenant's rows. Two information lines in `verify` report whether the role can signal other sessions, and which role-level defaults are set; they never fail.

@@ -3,7 +3,7 @@
 // that is rolled back, and nothing is written unless --write-probe is given.
 import type pg from "pg";
 import { sign } from "./key.js";
-import { firewallObjects, ident, scan, withCatalogPath, type TableReport } from "./scan.js";
+import { firewallObjects, globMatch, ident, scan, withCatalogPath, type TableReport } from "./scan.js";
 
 /** ok: true pass, false fail, null inconclusive (counted separately, never as a pass). */
 export interface Check { table: string; check: string; ok: boolean | null; detail: string }
@@ -196,6 +196,8 @@ async function inTx<T>(client: pg.ClientBase, ctx: Ctx, fn: () => Promise<T>): P
 
 type VerifyOpts = {
   tenant: string; key: Buffer; schemas?: string[]; column?: string; exclude?: string[]; writeProbe?: boolean;
+  /** Allowlist mode: see strictChecks(). */
+  strict?: boolean; allowGlobal?: string[];
 };
 type VerifyResult = { checks: Check[]; tables: TableReport[]; excluded: string[] };
 
@@ -271,8 +273,12 @@ async function verifyTables(client: pg.ClientBase, opts: VerifyOpts): Promise<Ve
                   detail: `tenant ${opts.tenant} sees no rows in any table, so the row checks prove nothing: use a tenant that has data, and check that ` +
                           `DB_FIREWALL_TENANT_KEY is the database's key (db-firewall key)` });
   }
-  checks.push(await bypassObjects(client, column));
+  checks.push(await bypassObjects(client, column, opts.allowGlobal ?? []));
   checks.push(await otherSchemas(client, schemas, column));
+  if (opts.strict) {
+    const safe = new Set(tables.filter((t) => t.protected).map((t) => `${t.schema}.${t.table}`));
+    checks.push(...await strictChecks(client, safe, opts.allowGlobal ?? []));
+  }
   return { checks, tables, excluded };
 }
 
@@ -304,7 +310,7 @@ async function writeProbe(client: pg.ClientBase, label: string, name: string, co
  * ponytail: any such view in the chain counts, even one shadowed by a lower
  * definer view of a non-bypassing owner (a false fail, never a false pass).
  */
-function bypassObjects(client: pg.ClientBase, column: string): Promise<Check> {
+function bypassObjects(client: pg.ClientBase, column: string, allow: string[]): Promise<Check> {
   return guard("no RLS-bypassing views or functions", async () => {
   const { rows: views } = await client.query(
     `WITH RECURSIVE rel AS (
@@ -358,14 +364,86 @@ function bypassObjects(client: pg.ClientBase, column: string): Promise<Check> {
        AND ${anyRole("has_function_privilege(m.oid, p.oid, 'EXECUTE')")}
        AND (p.proleakproof OR (p.prosecdef AND ${BYPASSES}))
      ORDER BY 1`);
+  // --allow-global schema.name: the operator says this may be shared by all tenants.
+  const keep = (name: string) => !allowed(allow, name.replace(/\(.*$/, ""));
   const list = [
-    ...views.map((v) => `${v.matview ? "materialized view" : "view"} ${v.name} (owner ${v.owner})`),
-    ...foreign.map((f) => `foreign table ${f.name}`),
-    ...fns.map((f) => `${f.leakproof ? "LEAKPROOF" : "SECURITY DEFINER"} function ${f.name} (owner ${f.owner})`),
+    ...views.filter((v) => keep(v.name)).map((v) => `${v.matview ? "materialized view" : "view"} ${v.name} (owner ${v.owner})`),
+    ...foreign.filter((f) => keep(f.name)).map((f) => `foreign table ${f.name}`),
+    ...fns.filter((f) => keep(f.name))
+      .map((f) => `${f.leakproof ? "LEAKPROOF" : "SECURITY DEFINER"} function ${f.name} (owner ${f.owner})`),
   ];
   return { ok: list.length === 0,
            detail: list.length ? `the role can read through: ${list.join("; ")}` : "none found" };
   });
+}
+
+const allowed = (globs: string[], name: string) => globs.some((g) => globMatch(g, name));
+const listed = (names: string[]) => names.slice(0, 25).join(", ") + (names.length > 25 ? `, and ${names.length - 25} more` : "");
+
+/**
+ * --strict: an allowlist instead of a list of known leak paths. Everything a
+ * role the app can use can read must be protected tenant data: a protected
+ * table, a security_invoker view whose chain reaches only protected tables (no
+ * materialized views, foreign tables or definer views on the way), or a
+ * sequence a protected table owns. Anything else (a table without the tenant
+ * column, a log or history table, a reference table) needs --allow-global
+ * schema.name, which says "this may be shared by all tenants". And no SECURITY
+ * DEFINER function outside the firewall's own may be executable unless
+ * allowlisted: it runs as its owner, whatever it reads.
+ */
+async function strictChecks(client: pg.ClientBase, safe: Set<string>, allow: string[]): Promise<Check[]> {
+  const readable = () => guard("strict: only tenant data readable", async () => {
+    const { rows: rels } = await client.query(
+      `SELECT c.oid::int AS oid, n.nspname || '.' || c.relname AS name, c.relkind AS kind,
+              COALESCE((SELECT option_value::boolean FROM pg_options_to_table(c.reloptions)
+                        WHERE option_name = 'security_invoker'), false) AS invoker,
+              (SELECT n2.nspname || '.' || t.relname FROM pg_depend d JOIN pg_class t ON t.oid = d.refobjid
+                 JOIN pg_namespace n2 ON n2.oid = t.relnamespace
+               WHERE c.relkind = 'S' AND d.classid = 'pg_class'::regclass AND d.objid = c.oid
+                 AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a', 'i') LIMIT 1) AS owned_by,
+              ${anyRole(`CASE WHEN c.relkind = 'S' THEN has_sequence_privilege(m.oid, c.oid, 'SELECT, USAGE')
+                         ELSE has_any_column_privilege(m.oid, c.oid, 'SELECT') END`)} AS readable
+       FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+       WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f', 'S')
+         AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg#_%' ESCAPE '#'`);
+    const { rows: edges } = await client.query(
+      `SELECT DISTINCT rw.ev_class::int AS v, d.refobjid::int AS t FROM pg_rewrite rw
+       JOIN pg_depend d ON d.objid = rw.oid AND d.classid = 'pg_rewrite'::regclass
+                       AND d.refclassid = 'pg_class'::regclass AND d.refobjid <> rw.ev_class`);
+    const byOid = new Map<number, any>(rels.map((r) => [r.oid, r]));
+    const deps = new Map<number, number[]>();
+    for (const e of edges) deps.set(e.v, [...(deps.get(e.v) ?? []), e.t]);
+    // A view is safe when every view on its chain is security_invoker and every
+    // relation it reaches is protected (or itself allowed).
+    const safeView = (oid: number, seen = new Set<number>()): boolean => {
+      if (seen.has(oid)) return true;
+      seen.add(oid);
+      const r = byOid.get(oid);
+      if (!r) return false;                                  // a system relation (pg_catalog): not tenant data
+      if (r.kind !== "v" || !r.invoker) return safe.has(r.name) || allowed(allow, r.name);
+      return (deps.get(oid) ?? []).every((t) => safeView(t, seen));
+    };
+    const bad = rels.filter((r) => r.readable && !allowed(allow, r.name) && !(
+      safe.has(r.name) || (r.kind === "S" && r.owned_by && safe.has(r.owned_by)) || (r.kind === "v" && safeView(r.oid))))
+      .map((r) => r.name).sort();
+    return { ok: bad.length === 0, detail: bad.length
+      ? `readable but not protected tenant data: ${listed(bad)} (protect them, revoke, or --allow-global schema.name)`
+      : "everything readable is protected tenant data or allowlisted" };
+  });
+  const definer = () => guard("strict: no SECURITY DEFINER functions", async () => {
+    const { rows } = await client.query(
+      `SELECT n.nspname || '.' || p.proname AS name, p.oid::regprocedure::text AS sig
+       FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+       WHERE p.prosecdef AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+         AND NOT (n.nspname = 'public' AND p.proname LIKE '#_firewall#_%' ESCAPE '#')
+         AND ${anyRole("has_function_privilege(m.oid, p.oid, 'EXECUTE')")}
+       ORDER BY 1`);
+    const bad = rows.filter((r) => !allowed(allow, r.name)).map((r) => r.sig);
+    return { ok: bad.length === 0, detail: bad.length
+      ? `executable, runs as its owner: ${listed(bad)} (revoke EXECUTE, or --allow-global schema.name)`
+      : "none outside the firewall's own (or allowlisted)" };
+  });
+  return [await readable(), await definer()];   // one client: one query at a time
 }
 
 /** Tables with the tenant column outside the scanned schemas that the role can read. */

@@ -52,10 +52,13 @@ def _set_migration_settings(connection, cursor, engine: str, config: dict) -> No
                        "set_config('dbfw.policy_mode', %s, false), "
                        "set_config('dbfw.context', %s, false), "
                        "set_config('dbfw.tenant_key', %s, false), "
-                       "set_config('dbfw.harden_signals', %s, false)",
+                       "set_config('dbfw.harden_signals', %s, false), "
+                       "set_config('dbfw.harden', %s, false), "
+                       "set_config('dbfw.app_role', %s, false)",
                        (col, opts.get("schema") or "public", opts.get("policy_mode") or "permissive",
                         opts.get("tenant_context") or "signed", key.hex() if key else "",
-                        "on" if opts.get("harden_signals") else "off"))
+                        "on" if opts.get("harden_signals") else "off",
+                        "on" if opts.get("harden") else "off", opts.get("app_role") or ""))
     elif engine == DBEngine.MYSQL:
         cursor.execute("SET @dbfw_tenant_column = %s", (col,))
     elif engine == DBEngine.SQLSERVER:

@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-10-28: Strict mode and hardening (PR #15)
+
+- **`db-firewall verify --strict`:** an allowlist instead of a list of known
+  leak paths. Everything a role the app can use can read must be protected
+  tenant data: a protected table, a `security_invoker` view whose chain
+  reaches only protected tables, or a sequence a protected table owns. No
+  `SECURITY DEFINER` function outside the firewall's may be executable.
+  `--allow-global schema.name` (repeatable, globs) marks shared data or
+  functions. It also clears them in the bypass-objects check, so platform
+  definer functions can be allowlisted. This closes the "tables without the
+  tenant column" and "copies into readable tables" gaps unless you
+  allowlist them.
+- **`migrate --harden --app-role <role>`** (`dbfw.harden`, `dbfw.app_role`,
+  `engines.postgresql.harden` / `app_role`): revokes, from `PUBLIC` and the
+  app role, `CREATE` on the database and every schema, `TRIGGER` and
+  `TRUNCATE` on every table, and the backend signals. It needs a superuser
+  and is off by default.
+
 ## 2026-10-28: Signed tenant context (PR #14), breaking
 
 - **PostgreSQL tenant context is signed by default** (`dbfw.context` /

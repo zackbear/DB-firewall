@@ -17,7 +17,8 @@
 -- sets them from your config. With psql, set them in the same session:
 --   psql -c "SET dbfw.tenant_column = 'org_id'" -c "SET dbfw.schema = 'app'" \
 --        -c "SET dbfw.context = 'signed'" -c "SET dbfw.tenant_key = '<hex>'" \
---        -c "SET dbfw.harden_signals = 'off'" \
+--        -c "SET dbfw.harden_signals = 'off'" -c "SET dbfw.harden = 'off'" \
+--        -c "SET dbfw.app_role = 'app'" \
 --        -f migrations/001_postgresql.sql
 -- ============================================================================
 
@@ -492,7 +493,8 @@ DO $$
 DECLARE
     f REGPROCEDURE;
 BEGIN
-    IF lower(COALESCE(NULLIF(current_setting('dbfw.harden_signals', true), ''), 'off')) NOT IN ('on', 'true', '1') THEN
+    IF lower(COALESCE(NULLIF(current_setting('dbfw.harden_signals', true), ''), 'off')) NOT IN ('on', 'true', '1')
+       AND lower(COALESCE(NULLIF(current_setting('dbfw.harden', true), ''), 'off')) NOT IN ('on', 'true', '1') THEN
         RETURN;
     END IF;
     IF NOT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN
@@ -503,6 +505,37 @@ BEGIN
                AND p.proname IN ('pg_terminate_backend', 'pg_cancel_backend')
     LOOP
         EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC', f);
+    END LOOP;
+END;
+$$;
+
+-- 10. Opt-in (dbfw.harden = on, which also does section 9): remove the
+--     privileges `db-firewall verify` fails on that this script can remove,
+--     from PUBLIC and from dbfw.app_role when set: CREATE on the database (new
+--     schemas, such as one named like the role, come first in the default
+--     search_path) and on every schema (planted objects and operators), and
+--     TRIGGER and TRUNCATE on every table (a trigger function runs in other
+--     tenants' sessions; TRUNCATE ignores RLS). Database-wide, so off by
+--     default; needs a superuser. Ownership is not changed: a role that owns a
+--     schema or table keeps what an owner has.
+DO $$
+DECLARE
+    r RECORD;
+    who TEXT;
+BEGIN
+    IF lower(COALESCE(NULLIF(current_setting('dbfw.harden', true), ''), 'off')) NOT IN ('on', 'true', '1') THEN
+        RETURN;
+    END IF;
+    IF NOT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN
+        RAISE EXCEPTION 'DB Firewall: dbfw.harden needs a superuser';
+    END IF;
+    who := 'PUBLIC' || COALESCE(', ' || quote_ident(NULLIF(current_setting('dbfw.app_role', true), '')), '');
+    EXECUTE format('REVOKE CREATE ON DATABASE %I FROM %s', current_database(), who);
+    FOR r IN SELECT nspname FROM pg_namespace
+             WHERE nspname NOT IN ('pg_catalog', 'information_schema') AND nspname NOT LIKE 'pg#_%' ESCAPE '#'
+    LOOP
+        EXECUTE format('REVOKE CREATE ON SCHEMA %I FROM %s', r.nspname, who);
+        EXECUTE format('REVOKE TRIGGER, TRUNCATE ON ALL TABLES IN SCHEMA %I FROM %s', r.nspname, who);
     END LOOP;
 END;
 $$;
