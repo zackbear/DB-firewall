@@ -40,7 +40,18 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: pip install -r requirements.txt pytest-cov flask starlette httpx sqlalchemy pymongo mongomock django
+      # The Node CLI, so tests/test_verify_corpus_live.py can check that the
+      # Python verify gives the same answers (DBFW_REQUIRE_PARITY: no skip).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: packages/cli/package-lock.json
+      - run: npm ci && npm run build
+        working-directory: packages/cli
       - run: python -m pytest -q --cov=middleware --cov-report=term-missing --cov-fail-under=85
+        env:
+          DBFW_REQUIRE_PARITY: "1"
 
   live:
     # MySQL and SQL Server: migrations, middleware and scanner against real

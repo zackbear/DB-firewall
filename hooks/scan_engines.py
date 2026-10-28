@@ -12,60 +12,16 @@ from typing import Dict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from middleware.db_firewall import DBEngine, _is_excluded_table, engine_options, placeholder  # noqa: E402
+from hooks import pg_checks  # noqa: E402
 
-# Exact schema.table match (pg_class + pg_namespace), so a same-named table
-# elsewhere cannot vouch for this one. Protected = RLS enabled AND forced
-# (owners bypass unforced RLS) AND all four firewall policies AND, for
-# permissive firewall policies, no other PERMISSIVE policy: PostgreSQL ORs
-# permissive policies, so one extra "USING (true)" opens every row. When all
-# four firewall policies are RESTRICTIVE (policy_mode: restrictive) they AND
-# with every other policy, so the app's permissive policies cannot widen past
-# the tenant and are allowed. Params: (schema, tenant column).
-_PG_SQL = """
-            WITH t AS (
-                SELECT c.oid, n.nspname, c.relname, c.relrowsecurity, c.relforcerowsecurity,
-                       'fw_' || left(md5(n.nspname || '.' || c.relname), 12) AS stem,
-                       'firewall_rls_' || c.relname AS legacy
-                FROM pg_class c
-                JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relkind IN ('r', 'p') AND n.nspname = %s
-                  AND EXISTS (SELECT 1 FROM pg_attribute a
-                              WHERE a.attrelid = c.oid AND a.attname = %s
-                                AND a.attnum > 0 AND NOT a.attisdropped)
-            )
-            SELECT t.relname, t.relrowsecurity, t.relforcerowsecurity,
-                   ARRAY(SELECT op FROM unnest(ARRAY['sel', 'ins', 'upd', 'del']) AS op
-                         WHERE NOT EXISTS (
-                             SELECT 1 FROM pg_policies p
-                             WHERE p.schemaname = t.nspname AND p.tablename = t.relname
-                               AND p.policyname IN (t.stem || '_' || op, t.legacy || '_' || op))),
-                   ARRAY(SELECT p.policyname FROM pg_policies p
-                         WHERE p.schemaname = t.nspname AND p.tablename = t.relname
-                           AND p.permissive = 'PERMISSIVE'
-                           AND p.policyname NOT IN (
-                               SELECT pre || '_' || op
-                               FROM unnest(ARRAY[t.stem, t.legacy]) AS pre,
-                                    unnest(ARRAY['sel', 'ins', 'upd', 'del']) AS op)),
-                   COALESCE((SELECT count(*) = 4 AND bool_and(p.permissive = 'RESTRICTIVE')
-                             FROM pg_policies p
-                             WHERE p.schemaname = t.nspname AND p.tablename = t.relname
-                               AND p.policyname IN (t.stem || '_sel', t.stem || '_ins',
-                                                    t.stem || '_upd', t.stem || '_del')), false),
-                   -- The firewall policies as they are now, for the shape check below.
-                   COALESCE((SELECT json_agg(json_build_array(p.policyname, p.cmd, p.roles,
-                                                              p.qual, p.with_check))
-                             FROM pg_policies p
-                             WHERE p.schemaname = t.nspname AND p.tablename = t.relname
-                               AND p.policyname IN (
-                                   SELECT pre || '_' || op
-                                   FROM unnest(ARRAY[t.stem, t.legacy]) AS pre,
-                                        unnest(ARRAY['sel', 'ins', 'upd', 'del']) AS op)), '[]'),
-                   EXISTS (SELECT 1 FROM pg_policies p
-                           WHERE p.schemaname = t.nspname AND p.tablename = t.relname
-                             AND p.policyname = t.stem || '_base')
-            FROM t
-            ORDER BY t.relname
-"""
+# PostgreSQL: the queries are in the shared checks file (checks/postgresql.sql),
+# which packages/cli (scan.ts) runs too. Protected = RLS enabled AND forced
+# (owners bypass unforced RLS) AND all four firewall policies AND their exact
+# shape AND, for permissive firewall policies, no other PERMISSIVE policy:
+# PostgreSQL ORs permissive policies, so one extra "USING (true)" opens every
+# row. When all four firewall policies are RESTRICTIVE (policy_mode:
+# restrictive) they AND with every other policy, so the app's permissive
+# policies cannot widen past the tenant and are allowed.
 
 _MYSQL_TABLES = """
     SELECT c.TABLE_SCHEMA, c.TABLE_NAME
@@ -125,8 +81,9 @@ def _pg_predicate(tenant_col: str, context: str) -> str:
             "OR (SELECT public._firewall_is_bypass_role(current_user::text))")
 
 
-def _pg_reference(cursor, schema: str, table: str, tenant_col: str, context: str = "signed"):
-    """The firewall predicate exactly as PostgreSQL deparses it for this table:
+def _pg_reference(cursor, ref_rel: str, tenant_col: str, context: str = "signed"):
+    """The firewall predicate exactly as PostgreSQL deparses it for ref_rel (a
+    regclass text: the table, or a partition's root):
     a policy with the migration's predicate on a temporary copy of the table's
     columns, read back from pg_policies, then rolled back. Comparing deparsed
     text exactly catches a changed cast, an overloaded function or a changed
@@ -136,12 +93,10 @@ def _pg_reference(cursor, schema: str, table: str, tenant_col: str, context: str
     autocommit = bool(getattr(getattr(cursor, "connection", None), "autocommit", False))
     cursor.execute("BEGIN" if autocommit else "SAVEPOINT _fw_ref")
     try:
-        cursor.execute(f"CREATE TEMP TABLE _fw_ref (LIKE {_pg_ident(schema)}.{_pg_ident(table)})")
+        cursor.execute(f"CREATE TEMP TABLE _fw_ref (LIKE {ref_rel})")
         cursor.execute(f"CREATE POLICY _fw_ref_p ON pg_temp._fw_ref USING ({pred}) WITH CHECK ({pred})")
-        cursor.execute("SELECT qual FROM pg_policies WHERE tablename = '_fw_ref' "
-                       "AND policyname = '_fw_ref_p' AND schemaname = pg_my_temp_schema()::regnamespace::text")
-        row = cursor.fetchone()
-        return (row[0], None) if row else (None, "no result")
+        rows = pg_checks.query(cursor, "reference_qual")
+        return (rows[0]["qual"], None) if rows else (None, "no result")
     except Exception as e:          # read-only transaction, no TEMP privilege, no SELECT ...
         return None, str(e).strip().splitlines()[0]
     finally:
@@ -181,14 +136,13 @@ def _pg_firewall_objects(cursor):
     for name, args, ret, body, lang, tail in _PG_FUNCTION_RE.findall(sql):
         sig = ", ".join(a.split()[1].lower() for a in args.split(",") if len(a.split()) > 1)
         sigs.append(f"{name}({sig})")
-        cursor.execute("SELECT prosrc, prosecdef, proconfig, provolatile, l.lanname, "
-                       "format_type(prorettype, NULL) FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang "
-                       "WHERE p.oid = to_regprocedure(%s)", (f"public.{name}({sig})",))
-        row = cursor.fetchone()
-        if not row:
+        rows = pg_checks.query(cursor, "fw_function", f"public.{name}({sig})")
+        if not rows:
             diff.append(f"{name} (missing)")
             continue
-        src, secdef, config, volatile, lanname, rettype = row
+        f = rows[0]
+        src, secdef, config, volatile, lanname, rettype = (f["prosrc"], f["prosecdef"], f["proconfig"],
+                                                           f["provolatile"], f["lanname"], f["ret"])
         path = re.search(r"SET search_path = ([^\n;]+?)\s*$", tail, re.M)
         what = [w for w, bad in (
             ("body", norm(src) != norm(body)),
@@ -198,20 +152,10 @@ def _pg_firewall_objects(cursor):
             ("language or return type", lanname != lang.lower() or rettype != ret.lower())) if bad]
         if what:
             diff.append(f"{name} ({', '.join(what)})")
-    cursor.execute("SELECT p.oid::regprocedure::text FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace "
-                   "AND p.proname LIKE '#_firewall#_%%' ESCAPE '#' "
-                   "AND NOT (p.proname || '(' || oidvectortypes(p.proargtypes) || ')') = ANY(%s) ORDER BY 1",
-                   (sigs,))
-    extra = [r[0] for r in cursor.fetchall()]
+    extra = [r["fn"] for r in pg_checks.query(cursor, "fw_extra", sigs)]
     if extra:
         diff.append("extra " + ", ".join(extra))
-    cursor.execute("SELECT pg_get_userbyid(o.owner), r.rolsuper, string_agg(o.name, ', ' ORDER BY o.name) FROM ("
-                   "SELECT relname::text AS name, relowner AS owner FROM pg_class "
-                   "WHERE relnamespace = 'public'::regnamespace AND relname LIKE '#_firewall#_%%' ESCAPE '#' "
-                   "UNION ALL SELECT proname::text, proowner FROM pg_proc "
-                   "WHERE pronamespace = 'public'::regnamespace AND proname LIKE '#_firewall#_%%' ESCAPE '#') o "
-                   "JOIN pg_roles r ON r.oid = o.owner GROUP BY o.owner, r.rolsuper ORDER BY count(*) DESC")
-    owners = cursor.fetchall()
+    owners = [(r["owner"], r["super"], r["objects"]) for r in pg_checks.query(cursor, "fw_owners")]
     if len(owners) > 1 and not all(sup for _, sup, _ in owners):
         diff.append("more than one owner (" + "; ".join(f"{o}: {objs}" for o, _, objs in owners)
                     + "): objects another role planted? drop those and re-run the migration")
@@ -237,9 +181,11 @@ def _scan_postgres_tables(cursor, tenant_col, excluded, opts) -> Dict[str, dict]
         objects = _pg_firewall_objects(cursor)
     except Exception as e:          # no migration yet, an aborted transaction ...
         objects = "could not be checked: " + str(e).strip().splitlines()[0]
-    cursor.execute(_PG_SQL, (opts.get("schema") or "public", tenant_col))
     schema = opts.get("schema") or "public"
-    for table, enabled, forced, missing, extra, restrictive, policies, base in cursor.fetchall():
+    for row in pg_checks.query(cursor, "scan_tables", schema, tenant_col):
+        table, enabled, forced, missing, extra, restrictive, policies, base = (
+            row["table"], row["enabled"], row["forced"], row["missing"], row["extra"],
+            row["restrictive"], row["policies"], row["base"])
         if _is_excluded_table(table, excluded):
             continue
         if isinstance(policies, str):
@@ -248,7 +194,7 @@ def _scan_postgres_tables(cursor, tenant_col, excluded, opts) -> Dict[str, dict]
         # signed). Policies in the other context count as altered, but the
         # report names the context they use.
         context = (opts.get("tenant_context") or "signed").lower()
-        reference, why = _pg_reference(cursor, schema, table, tenant_col, context) if policies else (None, None)
+        reference, why = _pg_reference(cursor, row["ref_rel"], tenant_col, context) if policies else (None, None)
         unverified = bool(policies) and reference is None
         # Without a reference the predicates cannot be checked: report that,
         # and fail closed, instead of calling every policy altered.
@@ -256,10 +202,11 @@ def _scan_postgres_tables(cursor, tenant_col, excluded, opts) -> Dict[str, dict]
         found = context if policies and not altered and not unverified else None
         if policies and altered and not unverified:
             other = "plain" if context == "signed" else "signed"
-            ref2, _ = _pg_reference(cursor, schema, table, tenant_col, other)
+            ref2, _ = _pg_reference(cursor, row["ref_rel"], tenant_col, other)
             found = other if ref2 is not None and not _pg_altered(policies, ref2) else "altered"
         missing, extra = sorted(missing), sorted(extra)
         results[table] = {
+            "schema": schema, "table": table, "owner": row["owner"],
             "has_tenant_col": True, "has_rls_policy": not missing,
             "missing_policies": missing, "extra_permissive_policies": extra,
             "rls_enabled": bool(enabled), "rls_forced": bool(forced),

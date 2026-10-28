@@ -363,6 +363,7 @@ In both modes the database-native RLS/VPD policy remains the second layer: the r
 | **LangChain** | Wrap the connection before passing to agent |
 | **TypeScript** (node-postgres, postgres.js, Drizzle, AI SDK) | [`@db-firewall/pg`](packages/ts/README.md): `withTenant`, `bindTenant`, `assertSafeRole` (PostgreSQL RLS) |
 | **Node CLI** (PostgreSQL) | [`npx db-firewall`](packages/cli/README.md) `migrate` / `scan` / `verify` (no Python needed) |
+| **Python verify** (PostgreSQL) | `python -m hooks.verify --dsn $APP_URL --tenant <id>`: the same checks as `db-firewall verify` (see "CI/CD Security Gate") |
 
 Web integrations take the tenant from a verified source: `tenant_id_source`, or
 by default `request.tenant_id` / the session (Django), `request.state.tenant_id`
@@ -464,6 +465,29 @@ RUN python -m hooks.scanner --dsn $DATABASE_URL --strict
 ```
 
 With `--strict` the scanner returns exit code 1 if ANY non-excluded table with the tenant column is missing protection: PostgreSQL RLS, MySQL views + triggers, a SQL Server security policy named `firewall_rls_<table>`, or an Oracle VPD policy (`FN_TENANT_ISOLATION`, enabled, covering SELECT/INSERT/UPDATE/DELETE with update check; DSN `oracle://user:pass@host:1521/service`, needs `oracledb`). On SQLite every such table is reported unprotected, and an engine the scanner does not know fails the run. `engines.<engine>.schema` sets the schema it checks on PostgreSQL, MySQL and Oracle; on SQL Server it checks all schemas. It reads the schema, not the rows, so empty tables are checked too. On MySQL it checks that the view and the three triggers exist, not what they contain. On PostgreSQL a table counts as protected only when row-level security is enabled AND forced (table owners bypass unforced RLS) and all four firewall policies (select, insert, update, delete) exist on that exact `<schema>.<table>`, with no other permissive policy (PostgreSQL ORs permissive policies, so one extra `USING (true)` opens every row). The JSON report lists `missing_policies`, `extra_permissive_policies` and `rls_forced`.
+
+### Verify (PostgreSQL)
+
+The scanner reads the policies. `verify` tests the isolation itself, as the
+app's own role: it connects with the app's URL, sets no tenant, an unsigned
+tenant and the signed `--tenant`, and counts what each sees; it checks the
+role, ownership, grants, and every read path RLS does not guard.
+
+```yaml
+- name: DB Firewall verify
+  env:
+    DB_FIREWALL_TENANT_KEY: ${{ secrets.DB_FIREWALL_TENANT_KEY }}
+  run: python -m hooks.verify --dsn $APP_URL --tenant <a tenant with rows> --strict
+```
+
+`python -m hooks.verify` and `npx db-firewall verify` are the same check:
+both run the shared check queries in `checks/postgresql.sql`, give the same
+checks, results and details, and take the same options (`--schema`,
+`--column`, `--exclude`, `--write-probe`, `--strict`, `--allow-global`,
+`--allow-query-text`, `--json`; `--dsn` here for `--url`). CI runs the attack
+corpus against both, and compares their output. Exit codes: 0 pass, 1 a check
+failed, 2 usage or connection error, 3 inconclusive. The checks, and what a
+pass does and does not mean, are in [packages/cli/README.md](packages/cli/README.md#verify).
 
 ---
 
@@ -617,7 +641,7 @@ below 85% coverage.
 another tenant's rows on PostgreSQL that the reviews found (definer views and
 functions, rules, ownership, functions PostgreSQL runs without an `EXECUTE`
 check, shared stores), and safe patterns that must pass. CI runs it on every
-version: `db-firewall verify` must fail each attack with the named check, and
+version: `db-firewall verify` and `python -m hooks.verify` must fail each attack with the named check, and
 an attack's leak query, when it has one, must really show data tenant A must
 not see on that version. Add every new bypass there before fixing it.
 

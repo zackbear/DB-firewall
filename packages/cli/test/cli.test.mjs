@@ -47,6 +47,15 @@ describe("usage", () => {
     assert.equal(readFileSync(new URL("../sql/001_postgresql.sql", import.meta.url), "utf8"),
                  readFileSync(new URL("../../../migrations/001_postgresql.sql", import.meta.url), "utf8"));
   });
+  it("ships the repository's shared checks unchanged, and they parse", async () => {
+    assert.equal(readFileSync(new URL("../sql/checks_postgresql.sql", import.meta.url), "utf8"),
+                 readFileSync(new URL("../../../checks/postgresql.sql", import.meta.url), "utf8"));
+    const { CHECKS, parseChecks } = await import("../dist/checks.js");
+    const c = CHECKS();
+    assert.equal(c.excluded[0], "_firewall_*");
+    assert.ok(c.checks.some((x) => x.name === "role") && c.queries.strict_readable);
+    assert.throws(() => parseChecks("-- @qery x\nSELECT 1"), /unknown line/);
+  });
 });
 
 describe("migrate, scan, verify", live, () => {
