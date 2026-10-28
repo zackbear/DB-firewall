@@ -377,3 +377,25 @@ def test_migration_revokes_trigger_and_truncate_on_protected_tables():
                           f"has_table_privilege(%s, '{SCHEMA}.docs', 'TRUNCATE'), "
                           f"has_table_privilege(%s, '{SCHEMA}.docs', 'SELECT')", (ROLE, ROLE, ROLE)).fetchone()
     assert privs == (False, False, True)
+
+
+def test_reset_drops_the_last_tenants_sequence_values():
+    """currval/lastval would show the next borrower the previous tenant's ids."""
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute(f"CREATE TABLE {SCHEMA}.seqd (id serial, tenant_id text)")
+        c.execute(f"GRANT SELECT, INSERT ON {SCHEMA}.seqd TO {ROLE}")
+        c.execute(f"GRANT USAGE ON SEQUENCE {SCHEMA}.seqd_id_seq TO {ROLE}")
+    _migrate()
+    try:
+        with psycopg.connect(DSN) as c:
+            c.execute(f"SET ROLE {ROLE}")
+            c.commit()
+            _set_context_postgres(c, "B")
+            c.execute(f"INSERT INTO {SCHEMA}.seqd (tenant_id) VALUES ('B')")
+            c.commit()
+            db_context.pool_checkin(c)
+            with pytest.raises(psycopg.errors.ObjectNotInPrerequisiteState):   # lastval not yet defined
+                c.execute("SELECT lastval()")
+    finally:
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"DROP TABLE {SCHEMA}.seqd")

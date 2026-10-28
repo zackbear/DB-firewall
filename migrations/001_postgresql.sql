@@ -184,7 +184,7 @@ $$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
 --     (another tenant) runs into: a temp view or function that shadows a
 --     table, a SQL-level prepared statement under a driver's statement name,
 --     a custom setting used as a drop box, a holdable cursor, a LISTEN, an
---     advisory lock (its keys can carry row data). This
+--     advisory lock (its keys can carry row data), currval/lastval. This
 --     clears them all. Prepared statements the driver made (protocol level,
 --     from_sql false) stay, so driver caches stay valid. RESET ALL also clears
 --     custom settings, which pg_settings cannot list. p_keep is the app's own
@@ -197,6 +197,7 @@ DECLARE
     r RECORD;
 BEGIN
     EXECUTE 'DISCARD TEMP';
+    EXECUTE 'DISCARD SEQUENCES';     -- currval/lastval: the last tenant's ids
     EXECUTE 'CLOSE ALL';
     EXECUTE 'UNLISTEN *';
     PERFORM pg_catalog.pg_advisory_unlock_all();

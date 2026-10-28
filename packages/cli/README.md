@@ -40,7 +40,7 @@ Lists every table in the schema that has the tenant column, and reports whether 
 
 Connect with your app's own URL and role, not an admin's, with `DB_FIREWALL_TENANT_KEY` set to the key the app uses (exit 2 without it). `verify` tests behaviour, not only the policies. It is read-only by default: each check runs in a transaction that is rolled back.
 
-1. **The role:** RLS applies to it and to every role it is a member of. None is a superuser, has `BYPASSRLS` or is in `_firewall_bypass_roles`.
+1. **The role:** RLS applies to it and to every role it is a member of. None is a superuser, has `BYPASSRLS`, is in `_firewall_bypass_roles`, or is a member of `pg_read_all_data`, `pg_write_all_data`, `pg_execute_server_program`, `pg_read_server_files` or `pg_write_server_files`. The last three run programs or read and write files as the server.
 2. **Firewall objects:** the functions the policies, the signing and the session reset use (`_firewall_is_bypass_role`, `_firewall_tenant`, `_firewall_sign`, `_firewall_nonce`, `_firewall_reset_session`, `_firewall_session_settings`) match the migration (body, `SECURITY DEFINER`, settings, volatility), and every `public._firewall_*` object has one owner. `scan` checks this too. Every function the migration creates is checked, and an extra `public._firewall_*` function fails. No role the app can use can `CREATE` in any schema (it could plant objects or operators, and reach them through a `search_path` it sets for itself with `ALTER ROLE ... SET`) or has `TRIGGER` on a table (a deferred trigger runs at COMMIT). No role the app can use can read `_firewall_keys` or execute `_firewall_sign` or `_firewall_set_tenant`. The role, and every role it can `SET ROLE` to, cannot write `_firewall_bypass_roles` or `_firewall_tenant_map`, column grants included (else it could add itself as a bypass role). It cannot act as the owner of schema `public` or of any `_firewall_*` object (else it could drop and replace the bypass list). On PostgreSQL 15 and later the database owner owns `public`, so do not make the app role the database owner.
 3. **Tables found:** at least one table has the tenant column.
 4. **Per table:**
@@ -66,6 +66,8 @@ A pass means `verify` found no known leak path. It does not prove isolation. It 
 - **Copies made by triggers, rules or jobs** into a table the app can read, even a plain (not `SECURITY DEFINER`) trigger.
 - **Side channels** that RLS leaves open: a `UNIQUE` or foreign-key error, or timing, can show that another tenant has a value.
 - **Your app setting `app.current_tenant` itself.** `verify` assumes only the middleware (`withTenant`) sets it, from the authenticated session.
+- **What one role shares.** All tenants use one database role, so its sessions can read each other's current query text (`pg_stat_activity`) and end each other's backends. The role can also change its own defaults (`ALTER ROLE CURRENT_USER SET ...`) so its later connections fail. That is availability and metadata, not another tenant's rows.
+- **Privileges granted later.** `verify` checks the database as it is when it runs. Run it in CI and after every change to grants.
 
 Run it in CI and after schema changes, and review triggers, rules and jobs that copy tenant rows.
 

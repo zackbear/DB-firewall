@@ -129,8 +129,9 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
   the function throws. After the transaction, so a deferred trigger that fires
   at COMMIT cannot undo it. Python's `release()` and `pool_checkin` run it on
   return. It drops
-  temp objects and SQL-level prepared statements, closes cursors, stops
-  `LISTEN`, releases advisory locks, and resets every setting. It then
+  temp objects and SQL-level prepared statements, drops `currval`/`lastval`,
+  closes cursors, stops `LISTEN`, releases advisory locks, and resets every
+  setting. It then
   restores the session settings and role the connection had before: in
   TypeScript from before the call, in Python from when the middleware first
   set a tenant on the connection. The driver's own prepared statements stay.
@@ -165,8 +166,20 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
   PostgreSQL 15). An app role can set its own defaults (`ALTER ROLE ... SET
   search_path`), which no reset undoes. Without `CREATE` it cannot plant
   anything for that path to reach, but it can still make its own connections
-  fail. `npx db-firewall verify` checks `CREATE` in every schema and `TRIGGER`
-  on every table.
+  fail. `npx db-firewall verify` checks `CREATE` on the database (a new schema
+  named like the role comes first in the default `search_path`, `"$user",
+  public`) and in every schema, and `TRIGGER` on every table. Schema-qualify
+  table names in the app, or give the app role a `search_path` without
+  `"$user"` (`ALTER ROLE app SET search_path = public`), so an object planted
+  later cannot shadow a table.
+* **One role for all tenants.** Sessions of the same role can read each
+  other's current query text in `pg_stat_activity`, and can end or cancel each
+  other's backends (`pg_terminate_backend`). An app role can also change its
+  own defaults (`ALTER ROLE CURRENT_USER SET ...`) so that its later
+  connections fail. None of this reads another tenant's rows, but SQL one
+  tenant's agent runs can see what another tenant's request is running, and
+  stop it. Keep literal values out of SQL text (use parameters), and see
+  "What a pass means" in `packages/cli/README.md`.
 * **The key in logs.** A key you pass in (`dbfw.tenant_key`,
   `DB_FIREWALL_TENANT_KEY` at migration time) is SQL text. If statement or
   parameter logging is on, it reaches the server log. `run_migration` and

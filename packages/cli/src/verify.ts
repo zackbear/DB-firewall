@@ -14,6 +14,12 @@ const MARK = "__dbfw_verify_other__";
 // A role that skips RLS: superuser, BYPASSRLS, or listed in _firewall_bypass_roles.
 const BYPASSES = "(r.rolsuper OR r.rolbypassrls OR public._firewall_is_bypass_role(r.rolname::text))";
 
+// Predefined roles that skip RLS in effect: they read every row (all_data),
+// or run programs / read and write files as the server (and so connect as
+// anyone it trusts).
+const PREDEFINED = ["pg_read_all_data", "pg_write_all_data", "pg_execute_server_program",
+                    "pg_read_server_files", "pg_write_server_files"];
+
 /**
  * True when any role the app can use holds the privilege: itself, a role it
  * inherits, or one it can SET ROLE to. expr names that role m.oid.
@@ -36,9 +42,15 @@ export async function roleChecks(client: pg.ClientBase): Promise<Check[]> {
         `SELECT r.rolname, r.rolname = current_user AS self, r.rolsuper, r.rolbypassrls,
                 public._firewall_is_bypass_role(r.rolname::text) AS fw
          FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'MEMBER') AND ${BYPASSES}`);
-      return rows.length
-        ? { ok: false, detail: rows.map((r) => r.self ? `role ${r.rolname} ${why(r)}`
-              : `is a member of ${r.rolname}, which ${why(r)}`).join("; ") + ": RLS does not apply" }
+      const { rows: pre } = await client.query(
+        `SELECT rolname FROM pg_roles WHERE rolname = ANY($1) AND pg_has_role(current_user, oid, 'MEMBER') ORDER BY 1`,
+        [PREDEFINED]);
+      const bad = [
+        ...rows.map((r) => r.self ? `role ${r.rolname} ${why(r)}` : `is a member of ${r.rolname}, which ${why(r)}`),
+        ...pre.map((r) => `is a member of ${r.rolname}, which reads or runs things as the server`),
+      ];
+      return bad.length
+        ? { ok: false, detail: bad.join("; ") + ": RLS does not apply" }
         : { ok: true, detail: "no role it can use skips RLS" };
     }),
     () => guard("cannot write firewall tables", async () => {
@@ -95,6 +107,15 @@ export async function roleChecks(client: pg.ClientBase): Promise<Check[]> {
         : "no TRIGGER on any table" };
     }),
     () => guard("cannot create in any schema", async () => {
+      // CREATE on the database makes new schemas, such as one named like the
+      // role: the default search_path ("$user", public) looks there first, so a
+      // view in it shadows a table for every session of the role.
+      const { rows: [db] } = await client.query(
+        `SELECT ${anyRole("has_database_privilege(m.oid, current_database(), 'CREATE')")} AS create_db`);
+      if (db.create_db) {
+        return { ok: false, detail: "a role it can use can CREATE schemas in this database " +
+                 "(REVOKE CREATE ON DATABASE ... FROM PUBLIC and the app role)" };
+      }
       const { rows } = await client.query(
         `SELECT n.nspname FROM pg_namespace n
          WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg#_toast%' ESCAPE '#'

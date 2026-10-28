@@ -84,6 +84,20 @@
     - A pg client that fn ends no longer crashes the process.
     - A transaction left aborted makes the call throw on Drizzle and
       postgres.js too.
+- From the independent final review:
+  - **`verify`:**
+    - It fails on `CREATE` on the database. A schema named like the role
+      comes first in the default `search_path`, and a view in it shadows a
+      table.
+    - It fails on membership in `pg_read_all_data`, `pg_write_all_data`,
+      `pg_execute_server_program`, `pg_read_server_files` and
+      `pg_write_server_files`.
+  - **The reset** also drops `currval`/`lastval` (`DISCARD SEQUENCES`).
+  - **Docs:**
+    - `search_path` guidance: schema-qualify table names, or leave out
+      `"$user"`.
+    - The limits of one shared role: query text in `pg_stat_activity`,
+      `pg_terminate_backend`, and `ALTER ROLE` on itself.
 - **Upgrade:** set `DB_FIREWALL_TENANT_KEY` in the app before re-running the
   migration, or set `tenant_context: plain`. PostgreSQL 13+ for signed.
 
