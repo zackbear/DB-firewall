@@ -291,10 +291,38 @@ def _safe_failure(e):
     return isinstance(e, pymysql.err.MySQLError) and e.args and e.args[0] in SAFE_DB_ERRORS
 
 
-def _leaks(rows):
-    """Tenant B is row (2, 'B'): any cell that is 2 or contains B is a leak
-    (catches b'B' from a BINARY cast and 'A,B' from GROUP_CONCAT)."""
-    return [r for r in rows if any(c == 2 or "B" in str(c) for c in r)]
+TABLES = ("orders", "vault", "notes", "plain")
+
+
+def _snapshot(cur, tables=TABLES):
+    state = {}
+    for table in tables:
+        cur.execute(f"SELECT * FROM {table}")
+        state[table] = sorted(map(repr, cur.fetchall()))
+    return state
+
+
+def _as_if_only_tenant_a(sql, read, tables=TABLES):
+    """The oracle: run sql raw (no middleware) on a copy of the data where only
+    tenant A's rows exist, as tenant A, then roll back. What protect() returns
+    or leaves behind for tenant A must equal this. No transform of B's data
+    (LOWER, HEX, GROUP_CONCAT, a copy into another table) can match it."""
+    c = _connect()
+    cur = c.cursor()
+    try:
+        cur.execute("SET @_fw_tenant_id = '__BYPASS__'")      # raw admin session: triggers allow
+        for table in ("orders", "vault"):
+            cur.execute(f"DELETE FROM {table} WHERE org_id IS NULL OR NOT (BINARY org_id = 'A')")
+        cur.execute("SET @_fw_tenant_id = 'A'")
+        try:
+            cur.execute(sql)
+            result = sorted(map(repr, cur.fetchall())) if read else _snapshot(cur, tables)
+        except Exception as e:
+            return ("error", repr(e))
+        return ("ok", result)
+    finally:
+        c.rollback()
+        c.close()
 
 
 @pytest.mark.parametrize("rewriter", ["ast", "regex"])
@@ -310,11 +338,11 @@ def test_corpus_read(rewriter, who, user, password, label, sql, cfg):
         except Exception as e:
             assert _safe_failure(e), f"{label}: unexpected error {e!r}"
             return
-        rows = cur.fetchall()
-        assert not _leaks(rows), f"{label}: returned {rows}"
+        rows = sorted(map(repr, cur.fetchall()))
     finally:
         c.rollback()
         c.close()
+    assert _as_if_only_tenant_a(sql, read=True) == ("ok", rows), f"{label}: returned {rows}"
 
 
 @pytest.mark.parametrize("rewriter", ["ast", "regex"])
@@ -322,10 +350,13 @@ def test_corpus_read(rewriter, who, user, password, label, sql, cfg):
 @pytest.mark.parametrize("label,sql", WRITES, ids=[w[0] for w in WRITES])
 def test_corpus_write(rewriter, who, user, password, label, sql, cfg):
     cfg["rewriter"] = rewriter
+    tables = TABLES if who == "admin" else ("orders",)   # the app can read and write only orders
     c = _connect(user, password)
+    ran = False
     try:
         try:
             protect(c, tenant_id="A", config=cfg).cursor().execute(sql)
+            ran = True
         except Exception as e:
             assert _safe_failure(e), f"{label}: unexpected error {e!r}"
         raw = c.cursor()                # same session: sees its own uncommitted writes
@@ -334,6 +365,10 @@ def test_corpus_write(rewriter, who, user, password, label, sql, cfg):
         raw.execute("SELECT id, org_id FROM orders "
                     "WHERE org_id IS NULL OR NOT (BINARY org_id = 'A') ORDER BY id")
         assert raw.fetchall() == ((2, "B"),), f"{label}: rows outside tenant A changed"
+        state = _snapshot(raw, tables) if ran else None
     finally:
-        c.rollback()
+        c.rollback()                    # before the oracle runs: no row locks held
         c.close()
+    if ran:                             # what it left must match a world without tenant B
+        state["orders"].remove(repr((2, "B")))
+        assert _as_if_only_tenant_a(sql, False, tables) == ("ok", state), f"{label}: state {state}"

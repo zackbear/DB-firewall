@@ -5,18 +5,25 @@
 - **CI runs the live suites** on MySQL 8.4 and SQL Server 2022 for every pull
   request, and on Oracle Database Free 23ai every night.
 - **Attack corpus** (`tests/attack_corpus.py`): the reads and writes the PR 10
-  reviews used to reach another tenant. `tests/test_mysql_live.py` runs each one
-  through `protect()` as tenant A, with both rewriters, as an admin and as the
-  app user with the README grants. Any row of tenant B returned or changed, or a
-  changed tenant variable, fails the build. Add each new bypass there first.
+  and PR 11 reviews used to reach another tenant. `tests/test_mysql_live.py`
+  runs each one through `protect()` as tenant A, with both rewriters, as an
+  admin and as the app user with the README grants, and compares the result
+  (or the state it leaves) with the same SQL run raw where only tenant A's rows
+  exist. A difference, a changed tenant B row or a changed tenant variable fails
+  the build. Add each new bypass there first.
 - **sqlglot is pinned** (`sqlglot==30.24.0`). The rewriter's safety depends on
   how sqlglot parses, so upgrade only when the suite and the corpus pass.
 - **`rewriter: regex` is deprecated** and will be removed in the next major
-  version. **On MySQL and unrecognised engines it is now refused**
-  (`PermissionError`): the PR 11 review found two more cross-tenant reads
-  through it there (`... --id-2`, which MySQL does not read as a comment, and
-  a scalar subquery in the select list). On PostgreSQL, SQL Server and Oracle
-  it logs a `FutureWarning` once per process; RLS or VPD stands behind it.
+  version. **It now runs only on PostgreSQL, SQL Server and Oracle**, where RLS
+  or VPD stands behind it, with a `FutureWarning` once per process. Everywhere
+  else it raises `PermissionError`: MySQL, SQLite, an unrecognised engine, and
+  a call that names no engine (the MCP wrapper). The PR 11 reviews found
+  cross-tenant reads through it on MySQL (`... --id-2`, which MySQL does not
+  read as a comment; a scalar subquery in the select list), on SQLite, and
+  through the MCP wrapper.
+- **pyodbc: the engine comes from the driver.** A pyodbc connection used to
+  count as SQL Server before the driver was asked, so pyodbc to MySQL got SQL
+  Server rules. It now uses `getinfo(SQL_DBMS_NAME)`; no answer means unknown.
 - **pytest 9.2 compatibility.** pytest 9.2 undoes a monkeypatch of a name
   that is not in the module's `__dict__` with `delattr`. For the package's
   log-once flags (`_warned_*`) that deleted the flag from its module, and later

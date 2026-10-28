@@ -1,7 +1,9 @@
 """
 Attacks that tried to reach tenant B as tenant A, collected from the PR 10
-reviews. Every entry must be refused, scoped, or fail: a run that returns a
-tenant B row, changes one, or turns on the bypass marker is a bypass.
+reviews. tests/test_mysql_live.py runs each through protect() as tenant A and
+compares the result, or the state it leaves, with the same SQL run raw where
+only tenant A's rows exist. Anything else (a tenant B value in any form, a
+changed B row, a changed tenant variable) is a bypass. Refusals are fine.
 
 Tables: orders(id, org_id) with rows (1, 'A') and (2, 'B'); notes has no
 tenant column. Add every new bypass here before fixing it.
@@ -34,6 +36,9 @@ READS = [
     ("MariaDB executable comment", "SELECT id, org_id FROM orders WHERE id > 0 /*M! OR 1=1 */"),
     ("BINARY cast of the tenant", "SELECT id, BINARY org_id FROM orders"),
     ("GROUP_CONCAT", "SELECT GROUP_CONCAT(org_id) FROM orders"),
+    ("LOWER of the tenant", "SELECT (SELECT LOWER(org_id) FROM orders WHERE id = 2) x FROM orders"),
+    ("HEX of the tenant", "SELECT (SELECT HEX(org_id) FROM orders WHERE id = 2) x FROM orders"),
+    ("CAST of the id", "SELECT (SELECT CAST(id AS CHAR) FROM orders WHERE id = 2) x FROM orders"),
 ]
 
 # (label, sql): writes and bypass attempts
@@ -63,4 +68,7 @@ WRITES = [
     ("DO", "DO (SELECT 1)"),
     ("HANDLER", "HANDLER orders OPEN"),
     ("MariaDB executable comment delete", "/*M!DELETE FROM orders*/"),
+    ("copy every tenant into notes", "INSERT INTO notes (id, body) SELECT id, org_id FROM orders"),
+    ("copy B into notes by subquery",
+     "INSERT INTO notes (id, body) SELECT 7, (SELECT org_id FROM orders WHERE id = 2) FROM orders"),
 ]

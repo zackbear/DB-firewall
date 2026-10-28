@@ -216,19 +216,19 @@ def rewrite_query(sql: str, tenant_id: str, config: dict,
 _regex_warned = False
 
 
-# Engines where nothing in the database stands behind a missed rewrite: MySQL
-# base-table reads have no row-level layer, and an engine protect() cannot
-# identify may be MySQL. The regex rewriter is refused there. (engine=None is
-# a direct call that named no engine; protect() always passes one.)
-_REGEX_REFUSED_ENGINES = (DBEngine.MYSQL, DBEngine.UNKNOWN)
+# The regex rewriter has had cross-tenant read bypasses, so it runs only where
+# row-level security in the database stands behind a missed rewrite. Everything
+# else is refused: MySQL and SQLite (no row-level layer), an engine protect()
+# cannot identify, and a direct call that names no engine (the MCP wrapper).
+_REGEX_ALLOWED_ENGINES = (DBEngine.POSTGRESQL, DBEngine.SQLSERVER, DBEngine.ORACLE)
 
 
 def _check_regex_allowed(engine) -> None:
-    if engine in _REGEX_REFUSED_ENGINES:
+    if engine not in _REGEX_ALLOWED_ENGINES:
         raise PermissionError(
-            "DB Firewall: rewriter 'regex' is refused on MySQL and unrecognised engines "
-            "(it has had cross-tenant read bypasses and no database layer stands behind "
-            "it there). Use rewriter: ast (needs sqlglot).")
+            f"DB Firewall: rewriter 'regex' is refused here (engine {engine!r}); it runs only "
+            "on PostgreSQL, SQL Server and Oracle, where RLS or VPD stands behind it. "
+            "Use rewriter: ast (needs sqlglot).")
     _warn_regex_deprecated()
 
 
