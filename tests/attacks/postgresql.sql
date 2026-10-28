@@ -264,6 +264,13 @@ CREATE TABLE {S}.mine (x int); ALTER TABLE {S}.mine OWNER TO {ROLE};
 -- @undo
 DROP TABLE {S}.mine;
 
+-- @attack it owns a table and revoked its own TRIGGER (an owner can grant it back)
+-- @check -: cannot create triggers
+-- @setup
+CREATE TABLE {S}.mine (x int); ALTER TABLE {S}.mine OWNER TO {ROLE}; REVOKE TRIGGER ON {S}.mine FROM {ROLE};
+-- @undo
+DROP TABLE {S}.mine;
+
 -- @attack a planted function shadows a catalog function through the role's search_path
 -- @check {S}.docs: no TRUNCATE
 -- @setup
