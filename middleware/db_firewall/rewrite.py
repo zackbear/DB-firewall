@@ -2,6 +2,7 @@
 
 import re
 import logging
+import warnings
 from typing import Dict, List
 
 try:                                    # package import (middleware.db_firewall)
@@ -208,7 +209,39 @@ def rewrite_query(sql: str, tenant_id: str, config: dict,
             protect_ops=protect,
             allow_tenant_placeholder=bool(config.get("allow_tenant_placeholder", False)))
 
+    _check_regex_allowed(engine)
     return _rewrite_query_regex(sql, tenant_id, config, is_protected)
+
+
+_regex_warned = False
+
+
+# The regex rewriter has had cross-tenant read bypasses, so it runs only where
+# row-level security in the database stands behind a missed rewrite. Everything
+# else is refused: MySQL and SQLite (no row-level layer), an engine protect()
+# cannot identify, and a direct call that names no engine (the MCP wrapper).
+_REGEX_ALLOWED_ENGINES = (DBEngine.POSTGRESQL, DBEngine.SQLSERVER, DBEngine.ORACLE)
+
+
+def _check_regex_allowed(engine) -> None:
+    if engine not in _REGEX_ALLOWED_ENGINES:
+        raise PermissionError(
+            f"DB Firewall: rewriter 'regex' is refused here (engine {engine!r}); it runs only "
+            "on PostgreSQL, SQL Server and Oracle, where RLS or VPD stands behind it. "
+            "Use rewriter: ast (needs sqlglot).")
+    _warn_regex_deprecated()
+
+
+def _warn_regex_deprecated() -> None:
+    """Once per process: the regex rewriter is deprecated and will be removed."""
+    global _regex_warned
+    if not _regex_warned:
+        _regex_warned = True
+        msg = ("DB Firewall: rewriter 'regex' is deprecated and will be removed in the "
+               "next major version; it has had cross-tenant bypasses the 'ast' rewriter "
+               "did not. Use rewriter: ast (needs sqlglot).")
+        warnings.warn(msg, FutureWarning, stacklevel=3)     # shown by default, unlike DeprecationWarning
+        logger.warning(msg)
 
 
 def _protected_predicate(config: dict, connection, engine):
@@ -241,6 +274,7 @@ def check_no_tenant(sql: str, config: dict, connection=None, engine: str = None)
         _sqlr.rewrite(sql, None, config.get("tenant_column", "tenant_id"),
                       _protected_predicate(config, connection, engine), engine)
         return
+    _check_regex_allowed(engine)
     if _strip_sql(sql).lstrip().upper().startswith(_DML_STARTS + _UNSAFE_STARTS):
         raise PermissionError(_sqlr._NO_TENANT_MSG)
 

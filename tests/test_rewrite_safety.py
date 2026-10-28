@@ -18,14 +18,14 @@ REGEX_CONFIG = dict(CONFIG, rewriter="regex")
 def test_rewrite_escapes_single_quote():
     out = rewrite_query("SELECT * FROM orders", "A' OR '1'='1", CONFIG)
     assert out == "SELECT * FROM orders WHERE orders.tenant_id = 'A'' OR ''1''=''1'"
-    out = rewrite_query("SELECT * FROM orders", "A' OR '1'='1", REGEX_CONFIG)
+    out = rewrite_query("SELECT * FROM orders", "A' OR '1'='1", REGEX_CONFIG, engine="postgresql")
     assert out == "SELECT * FROM orders WHERE tenant_id = 'A'' OR ''1''=''1'"
 
 
 def test_rewrite_plain_tenant_unchanged():
     assert rewrite_query("SELECT * FROM orders", "TENANT_A", CONFIG) == \
         "SELECT * FROM orders WHERE orders.tenant_id = 'TENANT_A'"
-    assert rewrite_query("SELECT * FROM orders", "TENANT_A", REGEX_CONFIG) == \
+    assert rewrite_query("SELECT * FROM orders", "TENANT_A", REGEX_CONFIG, engine="postgresql") == \
         "SELECT * FROM orders WHERE tenant_id = 'TENANT_A'"
 
 
@@ -33,7 +33,7 @@ def test_rewrite_plain_tenant_unchanged():
 @pytest.mark.parametrize("config", [CONFIG, REGEX_CONFIG], ids=["ast", "regex"])
 def test_rewrite_rejects_control_chars_and_empty(bad, config):
     with pytest.raises(ValueError):
-        rewrite_query("SELECT * FROM orders", bad, config)
+        rewrite_query("SELECT * FROM orders", bad, config, engine="postgresql")
 
 
 def test_validate_tenant_id_rejects_non_string():

@@ -23,6 +23,8 @@ pytest.importorskip("sqlglot")
 
 ROOT = os.path.join(os.path.dirname(__file__), '..')
 sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.dirname(__file__))
+from attack_corpus import READS, WRITES  # noqa: E402
 from hooks.scan_engines import scan_tables  # noqa: E402
 from middleware.db_firewall import (DBEngine, detect_engine, load_config, pool_checkin,  # noqa: E402
                                     protect, purge_audit, run_migration)
@@ -273,3 +275,110 @@ def test_scanner(conn, cfg):
     assert report[LONG]["protected"] is True                 # hashed name stem
     assert report["late_table"]["protected"] is False
     assert "plain" not in report and "notes" not in report
+
+
+# ---------------------------------------------------------------- attack corpus
+
+USERS = [("admin", None, None), ("app", "dbfw_app", APP_PW)]
+# Refusals that are safe: the middleware's PermissionError, missing privilege
+# (1142 table, 1143 column) and a trigger's SIGNAL (1644). Anything else fails.
+SAFE_DB_ERRORS = {1142, 1143, 1644}
+
+
+def _safe_failure(e):
+    if isinstance(e, PermissionError):
+        return True
+    return isinstance(e, pymysql.err.MySQLError) and e.args and e.args[0] in SAFE_DB_ERRORS
+
+
+def _base_tables(cur, column=None):
+    """Every base table in the test schema except the firewall's own; with
+    column, only the tables that have it. Found at run time, so a table added
+    to the setup is covered without editing the test."""
+    sql = ("SELECT t.TABLE_NAME FROM information_schema.TABLES t WHERE t.TABLE_SCHEMA = DATABASE() "
+           "AND t.TABLE_TYPE = 'BASE TABLE' AND t.TABLE_NAME NOT LIKE '#_firewall#_%%' ESCAPE '#'"
+           " AND (%s IS NULL OR EXISTS (SELECT 1 FROM information_schema.COLUMNS c WHERE "
+           "c.TABLE_SCHEMA = t.TABLE_SCHEMA AND c.TABLE_NAME = t.TABLE_NAME AND c.COLUMN_NAME = %s))")
+    cur.execute(sql, (column, column))         # always parameterised: "%%" is a literal %
+    return sorted(r[0] for r in cur.fetchall())
+
+
+def _snapshot(cur, tables=None):
+    tables = tables or _base_tables(cur)
+    state = {}
+    for table in tables:
+        cur.execute(f"SELECT * FROM `{table}`")
+        state[table] = sorted(map(repr, cur.fetchall()))
+    return state
+
+
+def _as_if_only_tenant_a(sql, read, tables=None):
+    """The oracle: run sql raw (no middleware) on a copy of the data where only
+    tenant A's rows exist, as tenant A, then roll back. What protect() returns
+    or leaves behind for tenant A must equal this. No transform of B's data
+    (LOWER, HEX, GROUP_CONCAT, a copy into another table) can match it."""
+    c = _connect()
+    cur = c.cursor()
+    try:
+        cur.execute("SET @_fw_tenant_id = '__BYPASS__'")      # raw admin session: triggers allow
+        for table in _base_tables(cur, "org_id"):
+            cur.execute(f"DELETE FROM `{table}` WHERE org_id IS NULL OR NOT (BINARY org_id = 'A')")
+        cur.execute("SET @_fw_tenant_id = 'A'")
+        try:
+            cur.execute(sql)
+            result = sorted(map(repr, cur.fetchall())) if read else _snapshot(cur, tables)
+        except Exception as e:
+            return ("error", repr(e))
+        return ("ok", result)
+    finally:
+        c.rollback()
+        c.close()
+
+
+@pytest.mark.parametrize("rewriter", ["ast", "regex"])
+@pytest.mark.parametrize("who,user,password", USERS, ids=[u[0] for u in USERS])
+@pytest.mark.parametrize("label,sql", READS, ids=[r[0] for r in READS])
+def test_corpus_read(rewriter, who, user, password, label, sql, cfg):
+    cfg["rewriter"] = rewriter
+    c = _connect(user, password)
+    try:
+        cur = protect(c, tenant_id="A", config=cfg).cursor()
+        try:
+            cur.execute(sql)
+        except Exception as e:
+            assert _safe_failure(e), f"{label}: unexpected error {e!r}"
+            return
+        rows = sorted(map(repr, cur.fetchall()))
+    finally:
+        c.rollback()
+        c.close()
+    assert _as_if_only_tenant_a(sql, read=True) == ("ok", rows), f"{label}: returned {rows}"
+
+
+@pytest.mark.parametrize("rewriter", ["ast", "regex"])
+@pytest.mark.parametrize("who,user,password", USERS, ids=[u[0] for u in USERS])
+@pytest.mark.parametrize("label,sql", WRITES, ids=[w[0] for w in WRITES])
+def test_corpus_write(rewriter, who, user, password, label, sql, cfg):
+    cfg["rewriter"] = rewriter
+    tables = None if who == "admin" else ("orders",)   # admin: every table; the app reads and writes only orders
+    c = _connect(user, password)
+    ran = False
+    try:
+        try:
+            protect(c, tenant_id="A", config=cfg).cursor().execute(sql)
+            ran = True
+        except Exception as e:
+            assert _safe_failure(e), f"{label}: unexpected error {e!r}"
+        raw = c.cursor()                # same session: sees its own uncommitted writes
+        raw.execute("SELECT @_fw_tenant_id")          # MySQL folds the spellings to this one
+        assert raw.fetchone() == ("A",), f"{label}: tenant variable changed"
+        raw.execute("SELECT id, org_id FROM orders "
+                    "WHERE org_id IS NULL OR NOT (BINARY org_id = 'A') ORDER BY id")
+        assert raw.fetchall() == ((2, "B"),), f"{label}: rows outside tenant A changed"
+        state = _snapshot(raw, tables) if ran else None
+    finally:
+        c.rollback()                    # before the oracle runs: no row locks held
+        c.close()
+    if ran:                             # what it left must match a world without tenant B
+        state["orders"].remove(repr((2, "B")))
+        assert _as_if_only_tenant_a(sql, False, tables) == ("ok", state), f"{label}: state {state}"

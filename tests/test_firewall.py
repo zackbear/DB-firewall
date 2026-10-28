@@ -82,7 +82,7 @@ class TestQueryRewriting:
         with pytest.raises(PermissionError, match="unsupported statement shape \(Create\)"):
             rewrite_query(sql, "TENANT_A", config)
         config["rewriter"] = "regex"             # legacy injector still passes it
-        assert rewrite_query(sql, "TENANT_A", config) == sql
+        assert rewrite_query(sql, "TENANT_A", config, engine="postgresql") == sql
 
     @pytest.mark.parametrize("sql", [
         "BEGIN", "START TRANSACTION", "COMMIT", "ROLLBACK", "SAVEPOINT s1",
@@ -335,15 +335,15 @@ class TestRegexRewriter:
         return config
 
     def test_simple_shapes(self, config):
-        assert rewrite_query("SELECT * FROM orders", "TENANT_A", config) == \
+        assert rewrite_query("SELECT * FROM orders", "TENANT_A", config, engine="postgresql") == \
             "SELECT * FROM orders WHERE tenant_id = 'TENANT_A'"
         assert rewrite_query("SELECT * FROM orders WHERE note = 'x WHERE y' AND s = 'a'",
-                             "TENANT_A", config) == \
+                             "TENANT_A", config, engine="postgresql") == \
             "SELECT * FROM orders WHERE tenant_id = 'TENANT_A' AND note = 'x WHERE y' AND s = 'a'"
         assert rewrite_query("SELECT * FROM orders -- WHERE tenant_id = 'TENANT_B'",
-                             "TENANT_A", config) == \
+                             "TENANT_A", config, engine="postgresql") == \
             "SELECT * FROM orders WHERE tenant_id = 'TENANT_A' -- WHERE tenant_id = 'TENANT_B'"
-        assert rewrite_query("/* hint */ SELECT * FROM orders", "TENANT_A", config) == \
+        assert rewrite_query("/* hint */ SELECT * FROM orders", "TENANT_A", config, engine="postgresql") == \
             "/* hint */ SELECT * FROM orders WHERE tenant_id = 'TENANT_A'"
 
     @pytest.mark.parametrize("sql", [
@@ -357,7 +357,7 @@ class TestRegexRewriter:
     ])
     def test_regex_refuses_multi_scope_shapes(self, config, sql):
         with pytest.raises(PermissionError, match="unsupported statement shape"):
-            rewrite_query(sql, "TENANT_A", config)
+            rewrite_query(sql, "TENANT_A", config, engine="postgresql")
 
 
 if __name__ == "__main__":

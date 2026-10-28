@@ -43,8 +43,10 @@ def detect_engine(connection) -> str:
     cls_name = type(connection).__name__
 
 
+    # pyodbc talks to any DBMS: ask the driver below, never assume SQL Server.
+    generic_odbc = "pyodbc" in module or "pyodbc" in cls_name
     for key, engine in _ENGINE_MAP.items():
-        if key in module or key in cls_name:
+        if key != "pyodbc" and (key in module or key in cls_name):
             return engine
 
     # Check pyodbc driver string
@@ -61,6 +63,9 @@ def detect_engine(connection) -> str:
                 return DBEngine.POSTGRESQL
         except Exception:
             pass
+    if generic_odbc:
+        logger.warning("DB Firewall: pyodbc connection did not report a known DBMS "
+                       "(getinfo(SQL_DBMS_NAME)); treated as unknown")
 
     logger.warning(f"DB Firewall: Unknown engine for {module}.{cls_name}")
     return DBEngine.UNKNOWN

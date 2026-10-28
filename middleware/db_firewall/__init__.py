@@ -49,7 +49,7 @@ _MISSING = object()
 # Names a submodule rebinds with `global` at run time (the log-once flags).
 # They are not copied onto the package, so reads stay live (module __getattr__).
 # tests/test_package_layout.py fails if a new `global` name is missing here.
-_LIVE = {"_warned_untrusted_header", "_warned_orphan_config"}
+_LIVE = {"_warned_untrusted_header", "_warned_orphan_config", "_regex_warned"}
 for _name in _LIVE:
     globals().pop(_name, None)
 
@@ -74,6 +74,9 @@ class _Package(types.ModuleType):
                 (old is not _MISSING and m.__dict__.get(name, _MISSING) is old)]
 
     def __setattr__(self, name, value):
+        if name in _LIVE:                       # remember what a later delete restores
+            owner = _OWNER[name]
+            _LIVE_SAVED.setdefault(name, []).append(owner.__dict__.get(name, _MISSING))
         # After a delete, restore to every module that held the name, not just the owner.
         for mod in _DELETED.pop(name, None) or self._holders(name):
             setattr(mod, name, value)
@@ -81,6 +84,20 @@ class _Package(types.ModuleType):
             super().__setattr__(name, value)
 
     def __delattr__(self, name):
+        if name in _LIVE:
+            # The package never holds a live flag, so a delete (pytest >= 9.2
+            # undoes a monkeypatch that way) restores the owner's earlier value
+            # instead of removing the flag the code reads with `global`.
+            saved = _LIVE_SAVED.get(name)
+            if not saved:
+                raise AttributeError(name)
+            prev = saved.pop()
+            owner = _OWNER[name]
+            if prev is _MISSING:
+                owner.__dict__.pop(name, None)
+            else:
+                setattr(owner, name, prev)
+            return
         holders = self._holders(name)
         for mod in holders:
             delattr(mod, name)
@@ -91,6 +108,7 @@ class _Package(types.ModuleType):
 
 
 _DELETED = {}       # name -> modules it was deleted from, for the undo
+_LIVE_SAVED = {}    # live flag -> owner values replaced through the package (a stack)
 
 
 sys.modules[__name__].__class__ = _Package

@@ -30,3 +30,52 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: pip install -r requirements.txt pytest-cov flask starlette httpx sqlalchemy pymongo mongomock django
       - run: python -m pytest -q --cov=middleware --cov-report=term-missing --cov-fail-under=85
+
+  live:
+    # MySQL and SQL Server: migrations, middleware and scanner against real
+    # servers on every pull request; on MySQL also the attack corpus
+    # (tests/attack_corpus.py).
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: DbfwCi_2026x
+          MYSQL_DATABASE: dbfw
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -pDbfwCi_2026x"
+          --health-interval 5s --health-timeout 5s --health-retries 30
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_PID: Developer
+          MSSQL_SA_PASSWORD: DbfwCi_2026x
+        ports: ["1433:1433"]
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P DbfwCi_2026x -Q 'SELECT 1'"
+          --health-interval 10s --health-timeout 10s --health-retries 30
+    env:
+      DBFW_MYSQL_DSN: "mysql://root:DbfwCi_2026x@127.0.0.1:3306/dbfw"
+      DBFW_MSSQL_DSN: "mssql://sa:DbfwCi_2026x@127.0.0.1:1433/dbfw"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements.txt pymysql pymssql
+      - name: Test data (MySQL, SQL Server)
+        run: |
+          docker exec -i ${{ job.services.mysql.id }} mysql -uroot -pDbfwCi_2026x dbfw < tests/live_setup/mysql_before.sql
+          MS=${{ job.services.mssql.id }}
+          SQLCMD="/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P DbfwCi_2026x -b"
+          docker exec $MS $SQLCMD -Q "IF DB_ID('dbfw') IS NULL CREATE DATABASE dbfw"
+          docker cp tests/live_setup/sqlserver_before.sql $MS:/tmp/before.sql
+          docker exec $MS $SQLCMD -d dbfw -i /tmp/before.sql
+      - name: Live suites (a skipped test fails the job)
+        run: |
+          set -o pipefail
+          python -m pytest -q -p no:cacheprovider -rs tests/test_mysql_live.py tests/test_sqlserver_live.py | tee live.txt
+          ! grep -qi "skipped" live.txt

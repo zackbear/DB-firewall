@@ -393,24 +393,47 @@ class TestMySQLGuard:
         "SELECT * FROM (SELECT 1) t, orders",
         "SELECT id, org_id FROM (orders)",
         "SELECT o.id FROM (SELECT 1) t STRAIGHT_JOIN orders o",
-        "SELECT id, org_id FROM orders # x",
     ])
     def test_regex_refuses_shapes_that_hide_a_table(self, cfg, sql):
         from db_firewall.rewrite import rewrite_query
         cfg["rewriter"] = "regex"
-        with pytest.raises(PermissionError):
-            rewrite_query(sql, "A", cfg, None, DBEngine.MYSQL)
+        with pytest.raises(PermissionError, match="unsupported statement shape"):
+            rewrite_query(sql, "A", cfg, None, DBEngine.POSTGRESQL)
 
     def test_regex_still_scopes_plain_shapes(self, cfg):
         from db_firewall.rewrite import rewrite_query
         cfg["rewriter"] = "regex"
-        out = rewrite_query("SELECT a, f(b, c) FROM orders WHERE x IN (1, 2) LIMIT 1, 2",
-                            "A", cfg, None, DBEngine.MYSQL)
+        out = rewrite_query("SELECT a, f(b, c) FROM orders WHERE x IN (1, 2) LIMIT 1",
+                            "A", cfg, None, DBEngine.POSTGRESQL)
         assert "tenant_id = 'A'" in out
+
+    @pytest.mark.parametrize("engine", [DBEngine.MYSQL, DBEngine.UNKNOWN, DBEngine.SQLITE, None])
+    def test_regex_refused_where_no_database_layer(self, cfg, engine):
+        from db_firewall.rewrite import check_no_tenant, rewrite_query
+        cfg["rewriter"] = "regex"
+        with pytest.raises(PermissionError, match="rewriter 'regex' is refused"):
+            rewrite_query("SELECT id FROM orders", "A", cfg, None, engine)
+        with pytest.raises(PermissionError, match="rewriter 'regex' is refused"):
+            check_no_tenant("SELECT id FROM orders", cfg, None, engine)
+
+    def test_mcp_wrapper_refuses_regex(self, cfg):
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+        from hooks.mcp_wrapper import intercept_sql_in_tool_call
+        cfg["rewriter"] = "regex"
+        msg = {"method": "tools/call", "params": {"name": "q", "arguments": {
+            "sql": "SELECT id, org_id FROM orders --id-2"}}}
+        with pytest.raises(PermissionError):
+            intercept_sql_in_tool_call(msg, "A", cfg)
+
+    @pytest.mark.parametrize("dbms,engine", [("MySQL", DBEngine.MYSQL), ("Microsoft SQL Server",
+                                             DBEngine.SQLSERVER), ("", DBEngine.UNKNOWN)])
+    def test_pyodbc_engine_comes_from_the_driver(self, dbms, engine):
+        conn = type("Connection", (), {"__module__": "pyodbc",
+                                       "getinfo": lambda self, k: dbms})()
+        assert db_firewall.detect_engine(conn) == engine
 
     def test_unknown_engine_gets_the_mysql_check(self, cfg):
         from db_firewall.rewrite import rewrite_query
-        cfg["rewriter"] = "regex"
         with pytest.raises(PermissionError):
             rewrite_query("SET @_fw_tenänt_id = '__BYPASS__'", "A", cfg, None, DBEngine.UNKNOWN)
 
@@ -424,3 +447,12 @@ class TestMySQLGuard:
         from db_firewall.rewrite import validate_tenant_id
         with pytest.raises(ValueError):
             validate_tenant_id(tenant)
+
+
+def test_regex_rewriter_warns_once(cfg, monkeypatch):
+    from db_firewall import rewrite
+    monkeypatch.setattr(rewrite, "_regex_warned", False)
+    cfg["rewriter"] = "regex"
+    with pytest.warns(FutureWarning, match="deprecated"):
+        rewrite.rewrite_query("SELECT 1", "A", cfg, None, DBEngine.POSTGRESQL)
+    assert rewrite._regex_warned
