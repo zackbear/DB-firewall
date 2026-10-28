@@ -127,17 +127,31 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
   `public._firewall_reset_session` after every call, also when the function
   throws. Python's `release()` and `pool_checkin` run it on return. It drops
   temp objects and SQL-level prepared statements, closes cursors, stops
-  `LISTEN`, and resets every setting, then restores the app's own
-  session-level settings and role. The driver's own prepared statements stay.
+  `LISTEN`, releases advisory locks, and resets every setting. It then
+  restores the session settings and role the connection had before: in
+  TypeScript from before the call, in Python from when the middleware first
+  set a tenant on the connection. The driver's own prepared statements stay.
+  When the function broke its transaction (left it aborted, released the
+  savepoint), the transaction is rolled back, the reset runs outside it, and
+  `withTenant` throws. node-postgres connections are then destroyed, also when
+  the function replaced a driver's prepared statement. In Python a reset that
+  fails closes the connection, and `pool_checkin` raises so the pool drops it.
+  The reset costs about 1 ms per call. [Inference] It was measured on localhost.
 * **The migration protects itself.** It binds every name and operator in
   `pg_catalog`, so a planted operator such as `public.=` for `varchar, text`
   cannot bind into a policy. It refuses to run when a `public._firewall_*`
   object belongs to a role that is neither the one running it nor a superuser,
-  because another role may have planted it to read the key. The scanners read
-  the policies the same way, and fail when a firewall function differs from
-  the migration or the firewall objects have more than one owner. Do not let
-  app roles `CREATE` in `public` (`REVOKE CREATE ON SCHEMA public FROM PUBLIC`,
-  the default since PostgreSQL 15). `npx db-firewall verify` checks this.
+  because another role may have planted it to read the key. It checks this
+  first and again as its last statement, in case an object was planted while
+  it waited on a lock. The scanners read the policies the same way. They fail
+  when any function the migration creates differs from it, when an extra
+  `public._firewall_*` function exists, or when the firewall objects have more
+  than one owner that is not a superuser. Do not let app roles `CREATE` in any
+  schema (`REVOKE CREATE ON SCHEMA public FROM PUBLIC` is the default since
+  PostgreSQL 15). An app role can set its own defaults (`ALTER ROLE ... SET
+  search_path`), which no reset undoes. Without `CREATE` it cannot plant
+  anything for that path to reach, but it can still make its own connections
+  fail. `npx db-firewall verify` checks `CREATE` in every schema.
 * **The key in logs.** A key you pass in (`dbfw.tenant_key`,
   `DB_FIREWALL_TENANT_KEY` at migration time) is SQL text. If statement or
   parameter logging is on, it reaches the server log. `run_migration` and

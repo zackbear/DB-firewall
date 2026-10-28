@@ -31,8 +31,10 @@ SET LOCAL search_path = pg_catalog, pg_temp;
 --    could create _firewall_keys first (and read the key this script then
 --    writes into it) or a _firewall_* function (and stay its owner through
 --    CREATE OR REPLACE). Every existing public._firewall_* object must belong
---    to the role running this script or to a superuser.
-DO $$
+--    to the role running this script or to a superuser. It runs first and
+--    again as the last statement: a role could plant one while this script
+--    waits on a lock (say, in section 6).
+CREATE OR REPLACE FUNCTION pg_temp._firewall_guard() RETURNS VOID AS $$
 DECLARE
     bad TEXT;
 BEGIN
@@ -52,7 +54,8 @@ BEGIN
         RAISE EXCEPTION 'DB Firewall: % not owned by % or a superuser. Another role may have planted them: drop them, or ALTER ... OWNER TO a trusted role, and re-run.', bad, current_user;
     END IF;
 END;
-$$;
+$$ LANGUAGE plpgsql;
+DO $$ BEGIN PERFORM pg_temp._firewall_guard(); END $$;
 
 -- 1. Tenant mapping table
 CREATE TABLE IF NOT EXISTS public._firewall_tenant_map (
@@ -180,7 +183,8 @@ $$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
 --     transaction can leave session state that the connection's next user
 --     (another tenant) runs into: a temp view or function that shadows a
 --     table, a SQL-level prepared statement under a driver's statement name,
---     a custom setting used as a drop box, a holdable cursor, a LISTEN. This
+--     a custom setting used as a drop box, a holdable cursor, a LISTEN, an
+--     advisory lock (its keys can carry row data). This
 --     clears them all. Prepared statements the driver made (protocol level,
 --     from_sql false) stay, so driver caches stay valid. RESET ALL also clears
 --     custom settings, which pg_settings cannot list. p_keep is the app's own
@@ -195,6 +199,7 @@ BEGIN
     EXECUTE 'DISCARD TEMP';
     EXECUTE 'CLOSE ALL';
     EXECUTE 'UNLISTEN *';
+    PERFORM pg_catalog.pg_advisory_unlock_all();
     FOR r IN SELECT s.name FROM pg_catalog.pg_prepared_statements s WHERE s.from_sql LOOP
         EXECUTE pg_catalog.format('DEALLOCATE %I', r.name);
     END LOOP;
@@ -206,12 +211,14 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- The settings set at session level (standard ones; pg_settings lists no
--- custom ones) and the role: what _firewall_reset_session restores. No SET
+-- custom ones; not transaction_*, which only a transaction's start may set)
+-- and the role: what _firewall_reset_session restores. No SET
 -- clause: inside the function it would show as a session-level search_path.
 CREATE OR REPLACE FUNCTION public._firewall_session_settings()
 RETURNS JSONB AS $$
     SELECT COALESCE(pg_catalog.jsonb_object_agg(s.name, s.setting)
-                        FILTER (WHERE s.source OPERATOR(pg_catalog.=) 'session'), '{}'::pg_catalog.jsonb)
+                        FILTER (WHERE s.source OPERATOR(pg_catalog.=) 'session'
+                                  AND NOT pg_catalog.starts_with(s.name, 'transaction_')), '{}'::pg_catalog.jsonb)
            OPERATOR(pg_catalog.||) pg_catalog.jsonb_build_object('role', pg_catalog.current_setting('role'))
     FROM pg_catalog.pg_settings s;
 $$ LANGUAGE sql STABLE;
@@ -458,5 +465,7 @@ BEGIN
     END LOOP;
 END;
 $$;
+
+DO $$ BEGIN PERFORM pg_temp._firewall_guard(); END $$;
 
 COMMIT;

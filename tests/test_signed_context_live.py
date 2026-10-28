@@ -275,3 +275,63 @@ def test_scanner_fails_when_a_firewall_function_was_changed():
         finally:
             _migrate()
     assert report["protected"] is False and "_firewall_tenant (body)" in report["predicate_check"]
+
+
+def test_checkin_restores_the_settings_from_before_not_the_agents():
+    """The reset restores the settings the connection had when the middleware
+    first set a tenant on it, not the ones SQL changed afterwards."""
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'sg_other') "
+                  "THEN CREATE ROLE sg_other NOLOGIN; END IF; END $$")
+        c.execute(f"GRANT sg_other TO {ROLE}")
+    try:
+        with psycopg.connect(DSN) as c:
+            c.execute(f"SET ROLE {ROLE}")
+            c.commit()
+            _set_context_postgres(c, "A")                                 # baseline: before any agent SQL
+            c.execute("SET search_path = sg_evil, public")
+            c.execute("SET statement_timeout = '4s'")
+            c.execute("SET ROLE sg_other")
+            c.commit()
+            db_context.pool_checkin(c)
+            state = c.execute("SELECT current_setting('search_path'), current_setting('statement_timeout'), "
+                              "current_user").fetchone()
+        assert state == ('"$user", public', "0", ROLE)
+    finally:
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"REVOKE sg_other FROM {ROLE}")
+            c.execute("DROP ROLE sg_other")
+
+
+def test_a_reset_the_agent_broke_closes_the_connection():
+    """SQL can leave a transaction_* setting the restore cannot apply inside a
+    transaction, or break the reset some other way. Check-in must then close
+    the connection and raise, never hand it on."""
+    with psycopg.connect(DSN) as c:
+        c.execute(f"SET ROLE {ROLE}")
+        c.commit()
+        _set_context_postgres(c, "A")
+        c.execute("PREPARE agent_plant AS SELECT 1")
+        c.execute("COMMIT")
+        c.execute("SET transaction_deferrable = on")                    # left for the restore
+        c.commit()
+        try:
+            db_context.pool_checkin(c)
+        except Exception:
+            assert c.closed
+        else:                                                            # the restore skipped it: clean
+            assert c.execute("SELECT count(*) FROM pg_prepared_statements WHERE from_sql").fetchone()[0] == 0
+    with psycopg.connect(DSN) as c:
+        c.execute(f"SET ROLE {ROLE}")
+        c.commit()
+        _set_context_postgres(c, "A")
+        c.commit()
+        # Make the reset itself fail: a snapshot that is not JSON.
+        orig = db_context._baseline
+        db_context._baseline = lambda conn: "not json"
+        try:
+            with pytest.raises(Exception):
+                db_context.pool_checkin(c)
+            assert c.closed
+        finally:
+            db_context._baseline = orig

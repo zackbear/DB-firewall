@@ -55,19 +55,31 @@ async function setTenant(run: Run, tenant: string): Promise<unknown> {
 }
 
 const SAVEPOINT = "_dbfw_fn";
+// Casts qualified: a temp type named jsonb would shadow the plain name.
 // $1::text: postgres.js would JSON-encode a jsonb-typed parameter a second time.
-const RESET = "SELECT public._firewall_reset_session($1::text::jsonb)";
+// planted: SQL-level prepared statements fn made, counted before the reset
+// drops them. A driver whose statement fn replaced now has a stale cache.
+const RESET = "WITH c AS MATERIALIZED (SELECT count(*) AS n FROM pg_catalog.pg_prepared_statements WHERE from_sql) " +
+  "SELECT c.n::int AS planted, public._firewall_reset_session($1::pg_catalog.text::pg_catalog.jsonb) FROM c";
+
+/** fn left the transaction unusable; it was rolled back and the session reset.
+ *  The connection should still be discarded where the driver allows it. */
+export class SessionResetError extends Error {}
 
 /**
  * In the open transaction: set the tenant, run body, then undo the session
  * state body left (public._firewall_reset_session: temp objects, SQL-level
- * prepared statements, custom settings, cursors, LISTEN), on success and on
- * error, so the connection's next user (another tenant) cannot run into it.
- * body runs in a savepoint, so the reset also runs after a failed statement.
- * If the reset fails the backend is ended: a connection that may carry another
- * tenant's traps must not go back to a pool.
+ * prepared statements, custom settings, cursors, LISTEN, advisory locks), on
+ * success and on error, so the connection's next user (another tenant) cannot
+ * run into it. body runs in a savepoint, so the reset also runs after a failed
+ * statement. When body broke the transaction (left it aborted, released the
+ * savepoint), the transaction is rolled back, the reset runs outside it, and
+ * SessionResetError is thrown. terminate: end the backend if even that fails
+ * (postgres.js recovers; node-postgres would crash on the error event, so its
+ * adapter destroys the client instead).
  */
-export async function scoped<T>(run: Run, tenant: string, body: () => Promise<T>): Promise<T> {
+export async function scoped<T>(run: Run, tenant: string, body: () => Promise<T>,
+                                terminate = false, onPlanted?: () => void): Promise<T> {
   const snapshot = await setTenant(run, tenant);
   // Drivers differ: pg parses jsonb, postgres.js returns it as text.
   const keep = typeof snapshot === "string" ? snapshot : JSON.stringify(snapshot);
@@ -76,20 +88,30 @@ export async function scoped<T>(run: Run, tenant: string, body: () => Promise<T>
   try {
     result = await body();
   } catch (err) {
-    await reset(run, keep, true);
+    await reset(run, keep, true, terminate, onPlanted);
     throw err;
   }
-  await reset(run, keep, false);
+  await reset(run, keep, false, terminate, onPlanted);
   return result;
 }
 
-async function reset(run: Run, keep: string, failed: boolean): Promise<void> {
+async function reset(run: Run, keep: string, failed: boolean, terminate: boolean,
+                     onPlanted?: () => void): Promise<void> {
+  const once = async () => { const [r] = await run(RESET, [keep]); if (r?.planted > 0) onPlanted?.(); };
   try {
     if (failed) await run(`ROLLBACK TO SAVEPOINT ${SAVEPOINT}`);
-    await run(RESET, [keep]);
+    await once();
+    return;
   } catch (err) {
-    await run("SELECT pg_terminate_backend(pg_backend_pid())").catch(() => {});
-    if (!failed) throw new Error(`DB Firewall: could not reset the session; the connection was closed (${(err as Error).message})`);
+    onPlanted?.();                    // the connection is suspect either way
+    try {
+      await run("ROLLBACK");
+      await once();
+    } catch {
+      if (terminate) await run("SELECT pg_catalog.pg_terminate_backend(pg_catalog.pg_backend_pid())").catch(() => {});
+    }
+    throw new SessionResetError("DB Firewall: the function left the transaction unusable " +
+      `(${(err as Error).message}); it was rolled back and the session reset`);
   }
 }
 

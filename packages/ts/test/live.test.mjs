@@ -21,11 +21,20 @@ const docs = pgSchema(SCHEMA).table("docs", { id: integer("id"), tenantId: text(
 // statement, a custom setting as a drop box, a search_path. withTenant must
 // undo all of it, after fn returns and after fn throws.
 const PLANT = ["CREATE TEMP VIEW docs AS SELECT 99 AS id", "PREPARE agent_plant AS SELECT 1",
-               "SELECT set_config('rv.loot', 'B-secret', false)", "SET search_path = pg_temp, public"];
+               "SELECT set_config('rv.loot', 'B-secret', false)", "SET search_path = pg_temp, public",
+               "SELECT pg_advisory_lock(66, 2)"];
 const PROBE = "SELECT (SELECT count(*) FROM pg_class WHERE relnamespace = pg_my_temp_schema())::int AS temp, " +
   "(SELECT count(*) FROM pg_prepared_statements WHERE from_sql)::int AS prep, " +
-  "coalesce(current_setting('rv.loot', true), '') AS loot, current_setting('search_path') AS path";
-const CLEAN = { temp: 0, prep: 0, loot: "", path: '"$user", public' };
+  "coalesce(current_setting('rv.loot', true), '') AS loot, current_setting('search_path') AS path, " +
+  "(SELECT count(*) FROM pg_locks WHERE locktype = 'advisory')::int AS locks";
+const CLEAN = { temp: 0, prep: 0, loot: "", path: '"$user", public', locks: 0 };
+// fn breaks the transaction around the reset: leaves it aborted, releases its
+// savepoint and throws, or shadows the jsonb type the reset call casts to.
+const BREAKS = {
+  aborted: async (raw, h) => { await raw(h, "SELECT 1/0").catch(() => {}); },
+  released: async (raw, h) => { await raw(h, "RELEASE SAVEPOINT _dbfw_fn"); throw new Error("boom"); },
+  "temp type": async (raw, h) => { await raw(h, "CREATE TYPE pg_temp.jsonb AS (x int)"); },
+};
 async function assertResets(db, raw) {
   for (const fails of [false, true]) {
     const planted = withTenant(db, "A", async (h) => {
@@ -35,6 +44,13 @@ async function assertResets(db, raw) {
     if (fails) await assert.rejects(planted, /boom/); else await planted;
     const [state] = await withTenant(db, "B", (h) => raw(h, PROBE));
     assert.deepEqual({ ...state }, CLEAN, fails ? "after fn threw" : "after fn returned");
+  }
+  for (const [how, breakIt] of Object.entries(BREAKS)) {
+    const run = withTenant(db, "A", async (h) => { for (const q of PLANT) await raw(h, q); await breakIt(raw, h); });
+    if (how === "temp type") await run;
+    else await assert.rejects(run, how === "aborted" ? /unusable/ : /boom|unusable/, how);
+    const [state] = await withTenant(db, "B", (h) => raw(h, PROBE));
+    assert.deepEqual({ ...state }, CLEAN, `after fn ${how}`);
   }
 }
 

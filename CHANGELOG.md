@@ -47,6 +47,18 @@
   - **Key handling:** `migrate` turns statement and parameter logging off for
     its session when it runs as a superuser, and clears `dbfw.tenant_key`
     after a failed run.
+- From the second review round:
+  - **TS:** when `fn` breaks its transaction, the reset now runs after a
+    `ROLLBACK`. node-postgres connections are destroyed. Advisory locks are
+    released. The reset's casts are qualified.
+  - **Python:** the reset restores the settings from when the middleware
+    first set a tenant, not the ones agent SQL changed. A failed reset closes
+    the connection, and `pool_checkin` raises. `transaction_*` settings are
+    not restored.
+  - **Migration:** the owner guard also runs as the last statement.
+  - **Scanners:** they check every function the migration creates and flag
+    extra `_firewall_*` functions. Several superuser owners are accepted.
+    `verify` fails on `CREATE` in any schema.
 - **Upgrade:** set `DB_FIREWALL_TENANT_KEY` in the app before re-running the
   migration, or set `tenant_context: plain`. PostgreSQL 13+ for signed.
 

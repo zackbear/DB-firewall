@@ -163,34 +163,31 @@ def _pg_altered(policies, reference) -> list:
     return sorted(altered)
 
 
-# The functions the policies, the signing and the session reset depend on:
-# (name, migration args, catalog args). Same list as packages/cli/src/scan.ts.
-_PG_FUNCTIONS = (("_firewall_is_bypass_role", "p_role TEXT", "text"), ("_firewall_tenant", "", ""),
-                 ("_firewall_sign", "p_tenant TEXT", "text"), ("_firewall_nonce", "", ""),
-                 ("_firewall_reset_session", "p_keep JSONB", "jsonb"), ("_firewall_session_settings", "", ""))
+_PG_FUNCTION_RE = re.compile(r"CREATE OR REPLACE FUNCTION public\.(_firewall_\w+)\(([^)]*)\)\s*RETURNS (\w+) "
+                             r"AS \$\$(.*?)\$\$ LANGUAGE (\w+)([^;]*);", re.S)
 
 
 def _pg_firewall_objects(cursor):
-    """None when the firewall functions match the migration (body, SECURITY
-    DEFINER, settings, volatility, language) and every public._firewall_*
-    object has one owner; else the reason. The policies call these functions,
-    so a changed body opens every table while the policies still look exact,
-    and an object another role planted before the migration keeps its owner."""
+    """None when every function the migration creates matches it (body,
+    SECURITY DEFINER, settings, volatility, language, return type), no extra
+    public._firewall_* function exists, and the public._firewall_* objects have
+    one owner (or only superusers); else the reason. The policies call some of
+    these functions and others sign, so a changed body opens every table while
+    the policies still look exact. Same rules as packages/cli/src/scan.ts."""
     from middleware.db_firewall.migrate import MIGRATIONS_DIR
     sql = (MIGRATIONS_DIR / "001_postgresql.sql").read_text()
     norm = lambda x: " ".join(x.split())   # noqa: E731
-    diff = []
-    for name, args, sig in _PG_FUNCTIONS:
-        m = re.search(rf"FUNCTION public\.{name}\({re.escape(args)}\)\s*RETURNS (\w+) AS \$\$(.*?)\$\$ "
-                      r"LANGUAGE (\w+)([^;]*);", sql, re.S)
+    diff, sigs = [], []
+    for name, args, ret, body, lang, tail in _PG_FUNCTION_RE.findall(sql):
+        sig = ", ".join(a.split()[1].lower() for a in args.split(",") if len(a.split()) > 1)
+        sigs.append(f"{name}({sig})")
         cursor.execute("SELECT prosrc, prosecdef, proconfig, provolatile, l.lanname, "
                        "format_type(prorettype, NULL) FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang "
                        "WHERE p.oid = to_regprocedure(%s)", (f"public.{name}({sig})",))
         row = cursor.fetchone()
-        if not m or not row:
+        if not row:
             diff.append(f"{name} (missing)")
             continue
-        ret, body, lang, tail = m.groups()
         src, secdef, config, volatile, lanname, rettype = row
         path = re.search(r"SET search_path = ([^\n;]+?)\s*$", tail, re.M)
         what = [w for w, bad in (
@@ -201,15 +198,22 @@ def _pg_firewall_objects(cursor):
             ("language or return type", lanname != lang.lower() or rettype != ret.lower())) if bad]
         if what:
             diff.append(f"{name} ({', '.join(what)})")
-    cursor.execute("SELECT pg_get_userbyid(o.owner), string_agg(o.name, ', ' ORDER BY o.name) FROM ("
+    cursor.execute("SELECT p.oid::regprocedure::text FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace "
+                   "AND p.proname LIKE '#_firewall#_%%' ESCAPE '#' "
+                   "AND NOT (p.proname || '(' || oidvectortypes(p.proargtypes) || ')') = ANY(%s) ORDER BY 1",
+                   (sigs,))
+    extra = [r[0] for r in cursor.fetchall()]
+    if extra:
+        diff.append("extra " + ", ".join(extra))
+    cursor.execute("SELECT pg_get_userbyid(o.owner), r.rolsuper, string_agg(o.name, ', ' ORDER BY o.name) FROM ("
                    "SELECT relname::text AS name, relowner AS owner FROM pg_class "
                    "WHERE relnamespace = 'public'::regnamespace AND relname LIKE '#_firewall#_%%' ESCAPE '#' "
                    "UNION ALL SELECT proname::text, proowner FROM pg_proc "
                    "WHERE pronamespace = 'public'::regnamespace AND proname LIKE '#_firewall#_%%' ESCAPE '#') o "
-                   "GROUP BY o.owner ORDER BY count(*) DESC")
+                   "JOIN pg_roles r ON r.oid = o.owner GROUP BY o.owner, r.rolsuper ORDER BY count(*) DESC")
     owners = cursor.fetchall()
-    if len(owners) > 1:
-        diff.append("more than one owner (" + "; ".join(f"{o}: {objs}" for o, objs in owners)
+    if len(owners) > 1 and not all(sup for _, sup, _ in owners):
+        diff.append("more than one owner (" + "; ".join(f"{o}: {objs}" for o, _, objs in owners)
                     + "): objects another role planted? drop those and re-run the migration")
     return ("differ from the migration: " + "; ".join(diff)) if diff else None
 

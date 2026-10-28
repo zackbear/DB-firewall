@@ -246,8 +246,18 @@ describe("migrate, scan, verify", live, () => {
                             current_setting('app.tenant_sig', true) AS s) g
     WHERE sha256(convert_to(g.s, 'UTF8')) = sha256(convert_to(public._firewall_sign(g.t), 'UTF8'));
       $f$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp;`],
-    ["it can CREATE in public", "-: cannot create in public",
+    ["it can CREATE in public", "-: cannot create in any schema",
      `GRANT CREATE ON SCHEMA public TO ${ROLE};`, `REVOKE CREATE ON SCHEMA public FROM ${ROLE};`],
+    ["it can CREATE in its own schema", "-: cannot create in any schema",
+     `GRANT CREATE ON SCHEMA ${S} TO ${ROLE};`, `REVOKE CREATE ON SCHEMA ${S} FROM ${ROLE};`],
+    ["_firewall_auto_resolve was changed to sign any tenant", "-: firewall functions unchanged",
+     `ALTER FUNCTION public._firewall_auto_resolve() RENAME TO _firewall_auto_resolve_saved;
+      CREATE FUNCTION public._firewall_auto_resolve() RETURNS TEXT AS $f$ SELECT 'x'::text $f$ LANGUAGE sql;`,
+     `DROP FUNCTION public._firewall_auto_resolve();
+      ALTER FUNCTION public._firewall_auto_resolve_saved() RENAME TO _firewall_auto_resolve;`],
+    ["an extra _firewall_ function", "-: firewall functions unchanged",
+     `CREATE FUNCTION public._firewall_extra() RETURNS int LANGUAGE sql AS 'SELECT 1';`,
+     `DROP FUNCTION public._firewall_extra();`],
   ];
   for (const [why, check, apply, undo] of blockers) {
     it(`verify fails when ${why}`, async () => {

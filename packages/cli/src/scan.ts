@@ -126,57 +126,62 @@ async function reference(client: pg.ClientBase, rel: string, column: string, con
 
 export interface ScanResult { tables: TableReport[]; excluded: string[] }
 
-// The functions the policies, the signing and the session reset depend on:
-// name, migration args, catalog args.
-const FUNCTIONS: [string, string, string][] = [
-  ["_firewall_is_bypass_role", "p_role TEXT", "text"], ["_firewall_tenant", "", ""],
-  ["_firewall_sign", "p_tenant TEXT", "text"], ["_firewall_nonce", "", ""],
-  ["_firewall_reset_session", "p_keep JSONB", "jsonb"], ["_firewall_session_settings", "", ""],
-];
 const norm = (x: string) => x.replace(/\s+/g, " ").trim();
 
 /**
- * The policies call these functions, so a changed body (say, a session-setting
- * "maintenance switch") opens every table while the policies still look exact.
- * Each must match the migration (body, SECURITY DEFINER, settings,
- * volatility), and every public._firewall_* object must have one owner: an
- * object another role planted before the migration ran keeps that owner.
+ * Every function the migration creates must match it (body, SECURITY DEFINER,
+ * settings, volatility, language, return type), with no extra public._firewall_*
+ * function: the policies call some of them, others sign, and a changed body
+ * (say, a session-setting "maintenance switch") opens every table while the
+ * policies still look exact. Every public._firewall_* object must have one
+ * owner, or only superusers: an object another role planted keeps its owner.
  */
 export async function firewallObjects(client: pg.ClientBase): Promise<{ ok: boolean; detail: string }> {
   const sql = readFileSync(MIGRATION, "utf8");
+  const want = [...sql.matchAll(/CREATE OR REPLACE FUNCTION public\.(_firewall_\w+)\(([^)]*)\)\s*RETURNS (\w+) AS \$\$([\s\S]*?)\$\$ LANGUAGE (\w+)([^;]*);/g)]
+    .map(([, name, args, ret, body, lang, tail]) => ({
+      name: name!, sig: args!.split(",").map((a) => a.trim().split(/\s+/)[1]?.toLowerCase()).filter(Boolean).join(", "),
+      ret: ret!.toLowerCase(), body: body!, lang: lang!.toLowerCase(), tail: tail!,
+    }));
   const diff: string[] = [];
-  for (const [name, args, sig] of FUNCTIONS) {
-    const m = new RegExp(`FUNCTION public\\.${name}\\(${args}\\)\\s*RETURNS (\\w+) AS \\$\\$([\\s\\S]*?)\\$\\$ ` +
-                         "LANGUAGE (\\w+)([^;]*);").exec(sql);
+  for (const w of want) {
     const { rows: [f] } = await client.query(
       `SELECT prosrc, prosecdef, proconfig, provolatile, l.lanname, format_type(prorettype, NULL) AS ret
        FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang WHERE p.oid = to_regprocedure($1)`,
-      [`public.${name}(${sig})`]);
-    if (!m || !f) { diff.push(`${name} (missing)`); continue; }
-    const [, ret, body, lang, tail] = m;
-    const path = /SET search_path = ([^\n;]+?)\s*$/m.exec(tail!)?.[1];
+      [`public.${w.name}(${w.sig})`]);
+    if (!f) { diff.push(`${w.name} (missing)`); continue; }
+    const path = /SET search_path = ([^\n;]+?)\s*$/m.exec(w.tail)?.[1];
     const what = [
-      norm(f.prosrc) !== norm(body!) && "body",
-      f.prosecdef !== /SECURITY DEFINER/.test(tail!) && "SECURITY DEFINER",
+      norm(f.prosrc) !== norm(w.body) && "body",
+      f.prosecdef !== /SECURITY DEFINER/.test(w.tail) && "SECURITY DEFINER",
       JSON.stringify(f.proconfig) !== JSON.stringify(path ? [`search_path=${path}`] : null) && "settings",
-      f.provolatile !== (/STABLE/.test(tail!) ? "s" : /IMMUTABLE/.test(tail!) ? "i" : "v") && "volatility",
-      (f.lanname !== lang!.toLowerCase() || f.ret !== ret!.toLowerCase()) && "language or return type",
+      f.provolatile !== (/STABLE/.test(w.tail) ? "s" : /IMMUTABLE/.test(w.tail) ? "i" : "v") && "volatility",
+      (f.lanname !== w.lang || f.ret !== w.ret) && "language or return type",
     ].filter(Boolean);
-    if (what.length) diff.push(`${name} (${what.join(", ")})`);
+    if (what.length) diff.push(`${w.name} (${what.join(", ")})`);
   }
+  const { rows: extra } = await client.query(
+    `SELECT p.oid::regprocedure::text AS fn FROM pg_proc p
+     WHERE p.pronamespace = 'public'::regnamespace AND p.proname LIKE '#_firewall#_%' ESCAPE '#'
+       AND NOT (p.proname || '(' || oidvectortypes(p.proargtypes) || ')') = ANY($1)
+     ORDER BY 1`,
+    [want.map((w) => `${w.name}(${w.sig})`)]);
+  if (extra.length) diff.push(`extra ${extra.map((e) => e.fn).join(", ")}`);
   const { rows: owners } = await client.query(
-    `SELECT pg_get_userbyid(o.owner) AS owner, string_agg(o.name, ', ' ORDER BY o.name) AS objects
+    `SELECT pg_get_userbyid(o.owner) AS owner, r.rolsuper AS super, string_agg(o.name, ', ' ORDER BY o.name) AS objects
      FROM (SELECT relname::text AS name, relowner AS owner FROM pg_class
            WHERE relnamespace = 'public'::regnamespace AND relname LIKE '#_firewall#_%' ESCAPE '#'
            UNION ALL SELECT proname::text, proowner FROM pg_proc
            WHERE pronamespace = 'public'::regnamespace AND proname LIKE '#_firewall#_%' ESCAPE '#') o
-     GROUP BY o.owner ORDER BY count(*) DESC`);
-  if (owners.length > 1) {
+     JOIN pg_roles r ON r.oid = o.owner
+     GROUP BY o.owner, r.rolsuper ORDER BY count(*) DESC`);
+  const mixed = owners.length > 1 && owners.some((o) => !o.super);
+  if (mixed) {
     diff.push(`more than one owner (${owners.map((o) => `${o.owner}: ${o.objects}`).join("; ")}): ` +
               "objects another role planted? drop those and re-run migrate");
   }
   return { ok: diff.length === 0, detail: diff.length
-    ? `differ from the migration: ${diff.join("; ")}${owners.length > 1 ? "" : ": re-run migrate"}`
+    ? `differ from the migration: ${diff.join("; ")}${mixed ? "" : ": re-run migrate"}`
     : "match the migration, one owner" };
 }
 

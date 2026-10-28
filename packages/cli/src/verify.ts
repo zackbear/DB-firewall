@@ -75,15 +75,22 @@ export async function roleChecks(client: pg.ClientBase): Promise<Check[]> {
     }),
     // The policies call these (and they sign): see firewallObjects().
     () => guard("firewall functions unchanged", () => firewallObjects(client)),
-    // CREATE on public lets the app plant objects or operators that a later
-    // migration or query binds to (the migration refuses planted _firewall_*
-    // objects and pins search_path, but nothing else should depend on that).
-    () => guard("cannot create in public", async () => {
+    // CREATE in a schema lets the app plant objects or operators that a later
+    // migration or query binds to: a view named like a table, reached through
+    // a search_path the app role sets for itself (ALTER ROLE ... SET persists
+    // across sessions, and no reset can undo it). The migration refuses planted
+    // _firewall_* objects and pins search_path; nothing else should rely on that.
+    () => guard("cannot create in any schema", async () => {
       const { rows } = await client.query(
-        `SELECT 1 WHERE ${anyRole("has_schema_privilege(m.oid, 'public', 'CREATE')")}`);
+        `SELECT n.nspname FROM pg_namespace n
+         WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg#_toast%' ESCAPE '#'
+           AND n.nspname NOT LIKE 'pg#_temp#_%' ESCAPE '#'
+           AND ${anyRole("has_schema_privilege(m.oid, n.oid, 'CREATE')")}
+         ORDER BY 1`);
       return { ok: rows.length === 0, detail: rows.length
-        ? "a role it can use can CREATE in schema public: REVOKE CREATE ON SCHEMA public FROM PUBLIC (and the app role)"
-        : "no CREATE on public" };
+        ? `a role it can use can CREATE in ${rows.map((r) => r.nspname).join(", ")}: REVOKE CREATE ON SCHEMA ... ` +
+          "FROM PUBLIC and the app role (run migrations as another role)"
+        : "no CREATE in any schema" };
     }),
   ];
   const out: Check[] = [];

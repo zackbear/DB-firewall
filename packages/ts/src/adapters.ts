@@ -1,4 +1,4 @@
-import { CLEAR_TENANT, scoped } from "./sign.js";
+import { CLEAR_TENANT, SessionResetError, scoped } from "./sign.js";
 import { resolveTenant } from "./tenant.js";
 
 // Structural types: the package has no runtime dependency on any driver.
@@ -179,6 +179,7 @@ export async function withTenantPg<T>(
   const pooled = isPgPool(db) ? await db.connect() : undefined;
   const client: PgQueryable = pooled ?? db;
   let failed: Error | undefined;
+  let discard = false;
   try {
     try {
       await client.query("BEGIN");
@@ -188,10 +189,12 @@ export async function withTenantPg<T>(
     }
     try {
       const result = await scoped(async (text, values) => (await client.query(text, values)).rows, tenant,
-                                  () => withHandle(client, fn));
+                                  () => withHandle(client, fn), false,
+                                  () => { discard = true; });   // a driver statement may be stale
       await client.query("COMMIT");
       return result;
     } catch (err) {
+      if (err instanceof SessionResetError) failed = err;   // discard the connection
       await client.query("ROLLBACK").catch((e) => { failed = e as Error; });
       throw err;
     }
@@ -199,7 +202,8 @@ export async function withTenantPg<T>(
     if (!failed) {                    // pooled or not: no session-level tenant survives
       await client.query(CLEAR_TENANT).catch((e) => { failed = e as Error; });
     }
-    pooled?.release(failed);          // a failed ROLLBACK or clear destroys the connection
+    // A failed ROLLBACK, clear or reset, or a replaced prepared statement destroys the connection.
+    pooled?.release(failed ?? (discard ? new Error("DB Firewall: session tampered with") : undefined));
   }
 }
 
@@ -217,7 +221,7 @@ export async function withTenantPostgres<T>(
     return scoped((text, values) => tx.unsafe(text, values), tenant, () => withHandle(tx, async (h) => {
       const result: unknown = await fn(h);
       return (Array.isArray(result) ? await Promise.all(result) : result) as T;
-    }));
+    }), true);
   });
 }
 
