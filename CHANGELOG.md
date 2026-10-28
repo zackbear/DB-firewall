@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-10-28: Node CLI (PR #13)
+
+- **`db-firewall` CLI** (`packages/cli`, `npx db-firewall`), for PostgreSQL:
+  - `migrate` runs the repo's `001_postgresql.sql` (shipped unchanged) with
+    `--column`, `--schema` and `--mode permissive|restrictive`, then prints the
+    scan.
+  - `scan` ports the Python PostgreSQL scanner, including the exact-predicate
+    check. `--schema` is repeatable. The default exclusions are exactly the
+    tables the migration skips, and excluded tables are listed. `--strict`
+    exits 1 when a table is unprotected or none is found.
+  - `verify` connects as the app's role and tests the behaviour. It fails on:
+    a role it is a member of that skips RLS, write access to the bypass list
+    (column grants included), ownership of `public` (the database owner on
+    PG15+) or of a firewall object, table ownership,
+    `TRUNCATE`, rows visible without a tenant or from another tenant, a
+    tenant with no rows, definer views (followed through view chains),
+    materialized views, foreign tables, `SECURITY DEFINER` and `LEAKPROOF`
+    functions in any schema, and readable tenant tables in other schemas.
+    Privileges count for every role the app can `SET ROLE` to. It also fails
+    when `_firewall_is_bypass_role` differs from the migration. The README
+    says what a pass does not prove (copies, side channels, untagged tables). Read-only by default. `--write-probe` adds a
+    rolled-back cross-tenant insert. Exit 3 when a check is inconclusive.
+  - Live tests in the `typescript` CI job. Not yet published to npm.
+
 ## 2026-10-28: TypeScript package and restrictive policies (PR #12)
 
 - **`@db-firewall/pg`** (`packages/ts`): tenant isolation for TypeScript on
