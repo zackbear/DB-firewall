@@ -11,14 +11,21 @@ permissions:
 
 jobs:
   pytest:
+    name: pytest (Python ${{ matrix.python }}, PostgreSQL ${{ matrix.postgres }})
     runs-on: ubuntu-latest
     timeout-minutes: 15      # a hung test fails the job instead of stalling it
     strategy:
+      fail-fast: false
       matrix:
-        python: ["3.11", "3.13"]
+        # Each PostgreSQL version once, both Python versions twice.
+        include:
+          - { python: "3.11", postgres: "14" }
+          - { python: "3.13", postgres: "15" }
+          - { python: "3.11", postgres: "16" }
+          - { python: "3.13", postgres: "17" }
     services:
       postgres:
-        image: postgres:16
+        image: postgres:${{ matrix.postgres }}
         env:
           POSTGRES_DB: dbfw_test
           POSTGRES_HOST_AUTH_METHOD: trust     # tests log in as a password-less dbfw_app role
@@ -85,13 +92,18 @@ jobs:
           ! grep -qi "skipped" live.txt
 
   typescript:
-    # packages/ts (@db-firewall/pg) and packages/cli (db-firewall) against
-    # PostgreSQL with the real migration.
+    # packages/ts (@db-firewall/pg) and packages/cli (db-firewall, with the
+    # attack corpus) against PostgreSQL with the real migration.
+    name: typescript (PostgreSQL ${{ matrix.postgres }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: ["14", "15", "16", "17"]
     services:
       postgres:
-        image: postgres:16
+        image: postgres:${{ matrix.postgres }}
         env:
           POSTGRES_DB: dbfw_test
           POSTGRES_HOST_AUTH_METHOD: trust
