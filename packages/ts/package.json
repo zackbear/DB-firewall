@@ -1,0 +1,60 @@
+{
+  "name": "@db-firewall/pg",
+  "version": "0.1.0",
+  "description": "Tenant isolation for TypeScript AI agents on PostgreSQL: every transaction runs as one tenant, enforced by row-level security.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test --test-concurrency=1 \"test/**/*.test.mjs\"",
+    "prepack": "npm run build"
+  },
+  "keywords": [
+    "postgres",
+    "rls",
+    "row-level-security",
+    "multi-tenant",
+    "ai-agent",
+    "mcp",
+    "drizzle",
+    "ai-sdk"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zackbear/DB-firewall.git",
+    "directory": "packages/ts"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "@types/pg": "8.23.1",
+    "ai": "^7.0.155",
+    "drizzle-orm": "0.45.4",
+    "pg": "8.23.1",
+    "postgres": "3.4.9",
+    "typescript": "5.9.3",
+    "zod": "^4.6.7"
+  },
+  "peerDependencies": {
+    "drizzle-orm": ">=0.36"
+  },
+  "peerDependenciesMeta": {
+    "drizzle-orm": {
+      "optional": true
+    }
+  }
+}

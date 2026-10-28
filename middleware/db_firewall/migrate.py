@@ -35,9 +35,11 @@ def _set_migration_settings(connection, cursor, engine: str, config: dict) -> No
     """Pass the tenant column (and the PostgreSQL schema) to the script."""
     col = config.get("tenant_column", "tenant_id")
     if engine == DBEngine.POSTGRESQL:
-        schema = engine_options(config, engine).get("schema") or "public"
+        opts = engine_options(config, engine)
         cursor.execute("SELECT set_config('dbfw.tenant_column', %s, false), "
-                       "set_config('dbfw.schema', %s, false)", (col, schema))
+                       "set_config('dbfw.schema', %s, false), "
+                       "set_config('dbfw.policy_mode', %s, false)",
+                       (col, opts.get("schema") or "public", opts.get("policy_mode") or "permissive"))
     elif engine == DBEngine.MYSQL:
         cursor.execute("SET @dbfw_tenant_column = %s", (col,))
     elif engine == DBEngine.SQLSERVER:

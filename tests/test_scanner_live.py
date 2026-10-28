@@ -37,8 +37,11 @@ OPS = {"sel": "SELECT", "ins": "INSERT", "upd": "UPDATE", "del": "DELETE"}
 def _policies(c, schema, table, ops, legacy=False):
     stem = (f"firewall_rls_{table}" if legacy else
             c.execute("SELECT 'fw_' || left(md5(%s || '.' || %s), 12)", (schema, table)).fetchone()[0])
+    pred = ("tenant_id = NULLIF(current_setting('app.current_tenant', true), '') "   # the migration's
+            "OR public._firewall_is_bypass_role(current_user::text)")
     for suffix in ops:
-        clause = "WITH CHECK (true)" if suffix == "ins" else "USING (true)"
+        clause = {"ins": f"WITH CHECK ({pred})",
+                  "upd": f"USING ({pred}) WITH CHECK ({pred})"}.get(suffix, f"USING ({pred})")
         c.execute(f'CREATE POLICY "{stem}_{suffix}" ON {schema}.{table} FOR {OPS[suffix]} {clause}')
 
 

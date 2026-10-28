@@ -4,6 +4,7 @@ for every non-excluded table that has the tenant column.
 """
 
 import hashlib
+import json
 import os
 import sys
 from typing import Dict
@@ -13,9 +14,12 @@ from middleware.db_firewall import DBEngine, _is_excluded_table, engine_options,
 
 # Exact schema.table match (pg_class + pg_namespace), so a same-named table
 # elsewhere cannot vouch for this one. Protected = RLS enabled AND forced
-# (owners bypass unforced RLS) AND all four firewall policies AND no other
-# PERMISSIVE policy: PostgreSQL ORs permissive policies, so one extra
-# "USING (true)" opens every row. Params: (schema, tenant column).
+# (owners bypass unforced RLS) AND all four firewall policies AND, for
+# permissive firewall policies, no other PERMISSIVE policy: PostgreSQL ORs
+# permissive policies, so one extra "USING (true)" opens every row. When all
+# four firewall policies are RESTRICTIVE (policy_mode: restrictive) they AND
+# with every other policy, so the app's permissive policies cannot widen past
+# the tenant and are allowed. Params: (schema, tenant column).
 _PG_SQL = """
             WITH t AS (
                 SELECT c.oid, n.nspname, c.relname, c.relrowsecurity, c.relforcerowsecurity,
@@ -40,7 +44,24 @@ _PG_SQL = """
                            AND p.policyname NOT IN (
                                SELECT pre || '_' || op
                                FROM unnest(ARRAY[t.stem, t.legacy]) AS pre,
-                                    unnest(ARRAY['sel', 'ins', 'upd', 'del']) AS op))
+                                    unnest(ARRAY['sel', 'ins', 'upd', 'del']) AS op)),
+                   COALESCE((SELECT count(*) = 4 AND bool_and(p.permissive = 'RESTRICTIVE')
+                             FROM pg_policies p
+                             WHERE p.schemaname = t.nspname AND p.tablename = t.relname
+                               AND p.policyname IN (t.stem || '_sel', t.stem || '_ins',
+                                                    t.stem || '_upd', t.stem || '_del')), false),
+                   -- The firewall policies as they are now, for the shape check below.
+                   COALESCE((SELECT json_agg(json_build_array(p.policyname, p.cmd, p.roles,
+                                                              p.qual, p.with_check))
+                             FROM pg_policies p
+                             WHERE p.schemaname = t.nspname AND p.tablename = t.relname
+                               AND p.policyname IN (
+                                   SELECT pre || '_' || op
+                                   FROM unnest(ARRAY[t.stem, t.legacy]) AS pre,
+                                        unnest(ARRAY['sel', 'ins', 'upd', 'del']) AS op)), '[]'),
+                   EXISTS (SELECT 1 FROM pg_policies p
+                           WHERE p.schemaname = t.nspname AND p.tablename = t.relname
+                             AND p.policyname = t.stem || '_base')
             FROM t
             ORDER BY t.relname
 """
@@ -86,18 +107,81 @@ _ORACLE_SQL = """
 """
 
 
+_PG_CMD = {"sel": "SELECT", "ins": "INSERT", "upd": "UPDATE", "del": "DELETE"}
+
+
+def _pg_ident(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _pg_reference(cursor, schema: str, table: str, tenant_col: str):
+    """The firewall predicate exactly as PostgreSQL deparses it for this table:
+    a policy with the migration's predicate on a temporary copy of the table's
+    columns, read back from pg_policies, then rolled back. Comparing deparsed
+    text exactly catches a changed cast, an overloaded function or a changed
+    constant that a normalised comparison would miss. Returns (text, None),
+    or (None, reason) when it cannot be built."""
+    pred = (f"{_pg_ident(tenant_col)} = NULLIF(current_setting('app.current_tenant', true), '') "
+            "OR public._firewall_is_bypass_role(current_user::text)")
+    autocommit = bool(getattr(getattr(cursor, "connection", None), "autocommit", False))
+    cursor.execute("BEGIN" if autocommit else "SAVEPOINT _fw_ref")
+    try:
+        cursor.execute(f"CREATE TEMP TABLE _fw_ref (LIKE {_pg_ident(schema)}.{_pg_ident(table)})")
+        cursor.execute(f"CREATE POLICY _fw_ref_p ON pg_temp._fw_ref USING ({pred}) WITH CHECK ({pred})")
+        cursor.execute("SELECT qual FROM pg_policies WHERE tablename = '_fw_ref' "
+                       "AND policyname = '_fw_ref_p' AND schemaname = pg_my_temp_schema()::regnamespace::text")
+        row = cursor.fetchone()
+        return (row[0], None) if row else (None, "no result")
+    except Exception as e:          # read-only transaction, no TEMP privilege, no SELECT ...
+        return None, str(e).strip().splitlines()[0]
+    finally:
+        cursor.execute("ROLLBACK" if autocommit else "ROLLBACK TO SAVEPOINT _fw_ref")
+
+
+def _pg_altered(policies, reference) -> list:
+    """Firewall policies whose shape differs from what the migration creates:
+    another role than PUBLIC, another command, or a predicate whose deparsed
+    text is not exactly the reference."""
+    altered = []
+    for name, cmd, roles, qual, check in policies:
+        op = name.rsplit("_", 1)[-1]
+        want_qual = reference if op in ("sel", "upd", "del") else None
+        want_check = reference if op in ("ins", "upd") else None
+        if reference is None or roles != ["public"] or cmd != _PG_CMD[op] \
+                or qual != want_qual or check != want_check:
+            altered.append(name)
+    return sorted(altered)
+
+
 def _scan_postgres(cursor, tenant_col, excluded, opts) -> Dict[str, dict]:
     results = {}
     cursor.execute(_PG_SQL, (opts.get("schema") or "public", tenant_col))
-    for table, enabled, forced, missing, extra in cursor.fetchall():
+    schema = opts.get("schema") or "public"
+    for table, enabled, forced, missing, extra, restrictive, policies, base in cursor.fetchall():
         if _is_excluded_table(table, excluded):
             continue
+        if isinstance(policies, str):
+            policies = json.loads(policies)
+        reference, why = _pg_reference(cursor, schema, table, tenant_col) if policies else (None, None)
+        unverified = bool(policies) and reference is None
+        # Without a reference the predicates cannot be checked: report that,
+        # and fail closed, instead of calling every policy altered.
+        altered = _pg_altered(policies, reference) if reference is not None else []
         missing, extra = sorted(missing), sorted(extra)
         results[table] = {
             "has_tenant_col": True, "has_rls_policy": not missing,
             "missing_policies": missing, "extra_permissive_policies": extra,
             "rls_enabled": bool(enabled), "rls_forced": bool(forced),
-            "protected": bool(enabled) and bool(forced) and not missing and not extra,
+            "policy_mode": "restrictive" if restrictive else "permissive",
+            "altered_policies": altered,
+            "predicate_check": ("unavailable: " + str(why)
+                                + " (run the scanner outside a read-only transaction, with the "
+                                  "TEMP privilege and SELECT on the table)") if unverified else "ok",
+            # restrictive mode: "<stem>_base" (USING true) next to the app's own
+            # permissive policies ORs with them inside the tenant: re-run the migration.
+            "stale_base_policy": bool(base) and any(not e.endswith("_base") for e in extra),
+            "protected": bool(enabled) and bool(forced) and not missing and not altered
+                         and not unverified and (bool(restrictive) or not extra),
         }
     return results
 

@@ -16,6 +16,10 @@ on:
       - "hooks/**"
       - "requirements.txt"
 
+# The jobs only read the repository.
+permissions:
+  contents: read
+
 jobs:
   oracle:
     runs-on: ubuntu-latest

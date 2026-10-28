@@ -54,7 +54,7 @@ DEFAULT_CONFIG = {
     # (middleware-only). schema: what the scanner checks. audit_table: overrides
     # audit.table_name for that engine.
     "engines": {
-        "postgresql": {"use_rls": True, "schema": "public"},
+        "postgresql": {"use_rls": True, "schema": "public", "policy_mode": "permissive"},
         "mysql": {"use_views": True, "schema": None},
         "sqlserver": {"use_rls": True, "schema": "dbo"},
         "oracle": {"use_vpd": True, "schema": None, "audit_table": "VPD_AUDIT_LOG"},
@@ -113,6 +113,10 @@ def validate_config(config: dict) -> None:
                              f"{RESOLUTION_SOURCES}, got {entry!r}")
         if entry.get("table") is not None:
             check_table_name(entry["table"])
+    mode = ((config.get("engines") or {}).get("postgresql") or {}).get("policy_mode", "permissive")
+    if not isinstance(mode, str) or mode.lower() not in ("permissive", "restrictive"):
+        raise ValueError(f"DB Firewall: engines.postgresql.policy_mode must be permissive "
+                         f"or restrictive, got {mode!r}")
     users = config.get("excluded_users") or []
     if not isinstance(users, list) or not all(isinstance(u, str) and u for u in users):
         raise ValueError("DB Firewall: excluded_users must be a list of user names")

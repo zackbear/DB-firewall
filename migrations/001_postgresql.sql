@@ -152,8 +152,17 @@ DECLARE
     legacy_name TEXT;
     col TEXT := COALESCE(NULLIF(current_setting('dbfw.tenant_column', true), ''), 'tenant_id');
     sch TEXT := COALESCE(NULLIF(current_setting('dbfw.schema', true), ''), 'public');
+    -- dbfw.policy_mode: 'permissive' (default) or 'restrictive'. Restrictive
+    -- tenant policies AND with the app's own policies (Supabase, Drizzle
+    -- pgPolicy), so an app policy can never widen access past the tenant.
+    mode TEXT := lower(COALESCE(NULLIF(current_setting('dbfw.policy_mode', true), ''), 'permissive'));
+    kind TEXT;
     pred TEXT;
 BEGIN
+    IF mode NOT IN ('permissive', 'restrictive') THEN
+        RAISE EXCEPTION 'DB Firewall: dbfw.policy_mode must be permissive or restrictive, got %', mode;
+    END IF;
+    kind := CASE mode WHEN 'restrictive' THEN 'AS RESTRICTIVE' ELSE 'AS PERMISSIVE' END;
     FOR r IN
         SELECT c.table_schema, c.table_name
         FROM information_schema.columns c
@@ -199,16 +208,30 @@ BEGIN
         EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', policy_name || '_ins', r.table_schema, r.table_name);
         EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', policy_name || '_upd', r.table_schema, r.table_name);
         EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', policy_name || '_del', r.table_schema, r.table_name);
+        EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', policy_name || '_base', r.table_schema, r.table_name);
 
-        EXECUTE format('CREATE POLICY %I ON %I.%I FOR SELECT USING (%s)',
-                       policy_name || '_sel', r.table_schema, r.table_name, pred);
+        EXECUTE format('CREATE POLICY %I ON %I.%I %s FOR SELECT USING (%s)',
+                       policy_name || '_sel', r.table_schema, r.table_name, kind, pred);
         -- INSERT: new rows must carry the current tenant
-        EXECUTE format('CREATE POLICY %I ON %I.%I FOR INSERT WITH CHECK (%s)',
-                       policy_name || '_ins', r.table_schema, r.table_name, pred);
-        EXECUTE format('CREATE POLICY %I ON %I.%I FOR UPDATE USING (%s) WITH CHECK (%s)',
-                       policy_name || '_upd', r.table_schema, r.table_name, pred, pred);
-        EXECUTE format('CREATE POLICY %I ON %I.%I FOR DELETE USING (%s)',
-                       policy_name || '_del', r.table_schema, r.table_name, pred);
+        EXECUTE format('CREATE POLICY %I ON %I.%I %s FOR INSERT WITH CHECK (%s)',
+                       policy_name || '_ins', r.table_schema, r.table_name, kind, pred);
+        EXECUTE format('CREATE POLICY %I ON %I.%I %s FOR UPDATE USING (%s) WITH CHECK (%s)',
+                       policy_name || '_upd', r.table_schema, r.table_name, kind, pred, pred);
+        EXECUTE format('CREATE POLICY %I ON %I.%I %s FOR DELETE USING (%s)',
+                       policy_name || '_del', r.table_schema, r.table_name, kind, pred);
+
+        -- Restrictive policies only narrow: PostgreSQL also needs a permissive
+        -- policy to allow any row. A table with no permissive policy of its own
+        -- gets "<stem>_base" (USING true); the tenant policies still apply. A
+        -- table that has its own gets none, so those keep deciding which rows
+        -- of the tenant a user sees. Re-run after adding the first one.
+        IF mode = 'restrictive' AND NOT EXISTS (
+            SELECT 1 FROM pg_policies p
+            WHERE p.schemaname = r.table_schema AND p.tablename = r.table_name
+              AND p.permissive = 'PERMISSIVE') THEN
+            EXECUTE format('CREATE POLICY %I ON %I.%I AS PERMISSIVE FOR ALL USING (true) WITH CHECK (true)',
+                           policy_name || '_base', r.table_schema, r.table_name);
+        END IF;
 
         RAISE NOTICE 'DB Firewall: RLS applied to %.%', r.table_schema, r.table_name;
     END LOOP;

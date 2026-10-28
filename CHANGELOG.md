@@ -1,5 +1,42 @@
 # Changelog
 
+## 2026-10-28: TypeScript package and restrictive policies (PR #12)
+
+- **`@db-firewall/pg`** (`packages/ts`): tenant isolation for TypeScript on
+  PostgreSQL. `withTenant(db, tenantId, fn)` runs `fn` in one transaction with
+  `app.current_tenant` set for that transaction only, on node-postgres,
+  postgres.js or Drizzle, and fails closed without a tenant. `bindTenant(tools,
+  tenantId)` binds AI SDK tools (or any `{ execute }` set) to the server's
+  tenant, so the model cannot pick it. `assertSafeRole(db)` refuses a
+  superuser, a `BYPASSRLS` role or a bypass role. No runtime dependencies.
+  Tested live in CI with the real migration, including through the AI SDK's
+  `generateText`. Not yet published to npm. From the PR 12 review: only real
+  `pg.Pool` / `pg.Client`, postgres.js and Drizzle databases are accepted (a
+  pool wrapper such as pg-promise mixed connections and returned another
+  tenant's rows); the handle given to `fn`, and everything reached through it
+  (sessions, query builders, pending queries), stops working when `fn`
+  settles, including nested transactions, savepoints and event emitters;
+  listeners added inside `fn` are removed when it settles (event data stays
+  plain);
+  `release()`, `connect()` and `end()` on it are refused; a nested
+  call or a raw Drizzle transaction is refused; streaming tools stay in scope;
+  a session-level tenant is cleared on node-postgres.
+- **PostgreSQL `policy_mode: restrictive`** (`engines.postgresql.policy_mode`,
+  `dbfw.policy_mode`): the tenant policies are created `AS RESTRICTIVE`, so
+  they AND with the app's own RLS policies instead of being OR-ed with them.
+  A table with no permissive policy of its own gets `fw_<hash>_base`. The
+  scanner accepts other permissive policies when all four tenant policies are
+  restrictive, and reports `policy_mode`. The default stays `permissive`.
+- **Scanner (PostgreSQL): firewall policies are checked by shape**, not only by
+  name: each must apply to `PUBLIC`, cover its own command and use exactly the
+  predicate the migration creates, as PostgreSQL deparses it on a temporary
+  copy of the table (rolled back). When that is not possible (read-only
+  transaction, no `TEMP` privilege), `predicate_check` says why and the table
+  counts as unprotected. An altered policy is reported in `altered_policies` and the table
+  counts as unprotected. A policy left by an older migration counts as altered
+  unless it matches the current predicate: re-run the migration. `stale_base_policy` flags a base
+  policy left next to app policies in restrictive mode.
+
 ## 2026-10-28: live CI and attack corpus (PR #11)
 
 - **CI runs the live suites** on MySQL 8.4 and SQL Server 2022 for every pull

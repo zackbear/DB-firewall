@@ -27,9 +27,11 @@ export PYTHONPATH="$PWD/middleware:$PYTHONPATH"   # no pip package yet: import f
 ### 2. Run the migration for your database
 
 ```bash
-# PostgreSQL (or run_migration(conn), which passes tenant_column and schema from your config)
+# PostgreSQL (or run_migration(conn), which passes tenant_column, schema and
+# policy_mode from your config). policy_mode: restrictive when the app has RLS
+# policies of its own (Supabase, Drizzle pgPolicy); see below.
 psql -c "SET dbfw.tenant_column = 'tenant_id'" -c "SET dbfw.schema = 'public'" \
-     -f migrations/001_postgresql.sql
+     -c "SET dbfw.policy_mode = 'permissive'" -f migrations/001_postgresql.sql
 
 # MySQL (or run_migration(conn)). Step 2 creates the views and prints the
 # trigger DDL, which step 3 runs: MySQL cannot create a trigger from a routine.
@@ -97,6 +99,32 @@ MySQL has no RLS. Its layer is views plus triggers, keyed on the user variable
   (`v_<first 40>_<16 hex>`), so the names fit MySQL's 64 characters. A user
   with DDL rights could create a table named like another table's stem and
   take over its view and triggers; keep DDL away from app users.
+
+PostgreSQL policy mode (`engines.postgresql.policy_mode`, `dbfw.policy_mode`):
+
+* `permissive` (default): the four tenant policies are the table's only
+  policies. PostgreSQL ORs permissive policies, so any other permissive policy
+  on the table widens access; the scanner reports it as unprotected.
+* `restrictive`: the tenant policies are `AS RESTRICTIVE`, so they AND with the
+  app's own policies. App policies can narrow rows inside the tenant, never
+  widen past it, and the scanner accepts them. PostgreSQL needs one permissive
+  policy before it allows any row: a table with none of its own gets
+  `fw_<hash>_base` (`USING (true)`). Re-run the migration after adding the
+  first policy of your own to a table, so the base policy is removed; until
+  then it ORs with your policy inside the tenant, and the scanner reports
+  `stale_base_policy`. An app policy that covers only `SELECT` leaves no
+  permissive policy for writes, so they are refused.
+
+The scanner also checks each firewall policy's shape: it must apply to
+`PUBLIC`, cover its own command, and use exactly the predicate the migration
+creates. The scanner asks PostgreSQL to deparse that predicate on a temporary
+copy of the table (rolled back; needs the default `TEMP` privilege) and
+compares the text exactly, so a changed cast, constant or function overload
+shows up. When it cannot build that reference (a read-only transaction, no
+`TEMP` privilege, no `SELECT` on the table), the table is reported with
+`predicate_check: "unavailable: <reason>"` and counts as unprotected. A policy altered after the migration (`ALTER POLICY ... TO
+some_role`, `USING (true)`, `... IS NOT NULL`) is listed in
+`altered_policies` and the table counts as unprotected.
 
 Oracle: run as SYS. The logon/logoff triggers call the package, and any other
 DBA user needs a direct grant from the schema owner first (see section 6b of
@@ -210,6 +238,7 @@ In both modes the database-native RLS/VPD policy remains the second layer: the r
 | **Flask** | `flask_hooks(app, tenant_id_source=...)` |
 | **MCP Servers** | `mcp_wrapper.py` stdio proxy |
 | **LangChain** | Wrap the connection before passing to agent |
+| **TypeScript** (node-postgres, postgres.js, Drizzle, AI SDK) | [`@db-firewall/pg`](packages/ts/README.md): `withTenant`, `bindTenant`, `assertSafeRole` (PostgreSQL RLS) |
 
 Web integrations take the tenant from a verified source: `tenant_id_source`, or
 by default `request.tenant_id` / the session (Django), `request.state.tenant_id`
@@ -415,7 +444,8 @@ A failure to set the DB-side context raises when `fail_mode: closed` (the defaul
 
 ```bash
 db-firewall/
-├── .github/workflows/tests.yml   # CI: pytest on Python 3.11 + 3.13 against PostgreSQL 16
+├── .github/workflows/tests.yml   # CI: pytest (3.11, 3.13) on PostgreSQL 16; live MySQL + SQL Server; TypeScript
+├── .github/workflows/oracle-nightly.yml  # CI: Oracle Free, nightly and on Oracle/middleware PRs
 ├── adapters/                     # NoSQL: mongodb.py, redis.py, firestore.py, convex/ (see "NoSQL stores")
 ├── config/
 │   └── firewall.yaml             # Default configuration + documentation
@@ -435,6 +465,7 @@ db-firewall/
 │   ├── mcp_wrapper.py            # MCP server stdio proxy with SQL rewriting
 │   ├── scanner.py                # CI/CD security scanner (CLI)
 │   └── scan_engines.py           # per-engine checks (PostgreSQL, MySQL, SQL Server, Oracle, SQLite)
+├── packages/ts/                  # @db-firewall/pg: TypeScript tenant transactions + AI SDK tool binding
 ├── tests/                        # see "Running the tests"
 ├── requirements.txt              # core + test dependencies
 ├── requirements-adapters.txt     # optional NoSQL drivers

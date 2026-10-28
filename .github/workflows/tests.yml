@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# The jobs only read the repository.
+permissions:
+  contents: read
+
 jobs:
   pytest:
     runs-on: ubuntu-latest
@@ -79,3 +83,32 @@ jobs:
           set -o pipefail
           python -m pytest -q -p no:cacheprovider -rs tests/test_mysql_live.py tests/test_sqlserver_live.py | tee live.txt
           ! grep -qi "skipped" live.txt
+
+  typescript:
+    # packages/ts (@db-firewall/pg) against PostgreSQL with the real migration.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: dbfw_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    defaults:
+      run:
+        working-directory: packages/ts
+    env:
+      DBFW_PG_URL: "postgres://postgres@localhost:5432/dbfw_test"
+      DBFW_REQUIRE_LIVE: "1"          # a missing URL fails instead of skipping the live suites
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: packages/ts/package-lock.json
+      - run: npm ci
+      - run: npm test
