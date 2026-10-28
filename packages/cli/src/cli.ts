@@ -29,8 +29,10 @@ Options:
                      PUBLIC in this database (needs a superuser), so tenants sharing
                      the app role cannot end each other's requests
   --harden           migrate: also revoke CREATE on the database and every schema,
-                     and TRIGGER and TRUNCATE on every table, from PUBLIC and
-                     --app-role (what verify fails on); needs a superuser
+                     TRIGGER and TRUNCATE on every table (default privileges
+                     too), and pg_stat_activity, from PUBLIC and --app-role, by
+                     any grantor (what verify fails on); needs a superuser.
+                     Refuses if --app-role owns the database, a schema or a table
   --app-role <name>  migrate --harden: the app's role, revoked from as well
   --tenant <id>      verify: a tenant id that has rows in your data
   --write-probe      verify: also try a cross-tenant insert (rolled back, but it
@@ -40,9 +42,10 @@ Options:
   --strict           scan: exit 1 if any table is unprotected or none is found.
                      verify: also fail on anything the app role can read that is
                      not protected tenant data, and on SECURITY DEFINER functions
-  --allow-global <glob>  verify --strict: schema.name of a table, view, sequence
-                     or function the app may reach without tenant scoping
-                     (shared reference data, say); repeatable
+  --allow-global <glob>  verify --strict: schema.name of a table, view or
+                     sequence, or schema.name(argtypes) of a function, that the
+                     app may reach without tenant scoping (shared reference
+                     data, say); repeatable
   --json             machine-readable output
   -h, --help
 
@@ -109,6 +112,9 @@ async function main(argv: string[]): Promise<number> {
     }
     if (command === "verify") {
       if (!values.tenant) { process.stderr.write("db-firewall verify: --tenant is required\n"); return 2; }
+      if (values["allow-global"]?.length && !values.strict) {
+        process.stderr.write("db-firewall verify: --allow-global needs --strict\n"); return 2;
+      }
       const result = await verify(client, { ...common, tenant: values.tenant, key: key!,
                                             writeProbe: values["write-probe"], strict: values.strict,
                                             allowGlobal: values["allow-global"] });

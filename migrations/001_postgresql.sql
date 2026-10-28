@@ -509,34 +509,134 @@ BEGIN
 END;
 $$;
 
--- 10. Opt-in (dbfw.harden = on, which also does section 9): remove the
---     privileges `db-firewall verify` fails on that this script can remove,
---     from PUBLIC and from dbfw.app_role when set: CREATE on the database (new
---     schemas, such as one named like the role, come first in the default
---     search_path) and on every schema (planted objects and operators), and
---     TRIGGER and TRUNCATE on every table (a trigger function runs in other
---     tenants' sessions; TRUNCATE ignores RLS). Database-wide, so off by
---     default; needs a superuser. Ownership is not changed: a role that owns a
---     schema or table keeps what an owner has.
+-- 10. Opt-in (dbfw.harden = on, which also does section 9): remove what
+--     `db-firewall verify` fails on that this script can remove, from PUBLIC
+--     and from dbfw.app_role when set, whoever granted it:
+--     - CREATE on the database (new schemas, such as one named like the role,
+--       come first in the default search_path) and on every schema (planted
+--       objects and operators);
+--     - TRIGGER and TRUNCATE on every table (a trigger function runs in other
+--       tenants' sessions; TRUNCATE ignores RLS), also in default privileges,
+--       so tables created later do not get them;
+--     - pg_stat_activity, pg_stat_get_activity and pg_stat_get_backend_activity:
+--       one shared role sees the SQL text of its other sessions, so one tenant
+--       could read the literal values in another tenant's queries.
+--     Database-wide, so off by default; needs a superuser. With dbfw.app_role
+--     it refuses (and the whole script changes nothing) when that role can act
+--     as the owner of the database, a schema or a table (an owner can grant
+--     itself everything back), or still has one of these privileges afterwards
+--     through a role it is a member of.
 DO $$
 DECLARE
+    app TEXT := NULLIF(current_setting('dbfw.app_role', true), '');
+    app_oid OID;
+    me TEXT := current_user;
     r RECORD;
-    who TEXT;
+    found TEXT;
 BEGIN
     IF lower(COALESCE(NULLIF(current_setting('dbfw.harden', true), ''), 'off')) NOT IN ('on', 'true', '1') THEN
         RETURN;
     END IF;
-    IF NOT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN
+    IF NOT (SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user) THEN
         RAISE EXCEPTION 'DB Firewall: dbfw.harden needs a superuser';
     END IF;
-    who := 'PUBLIC' || COALESCE(', ' || quote_ident(NULLIF(current_setting('dbfw.app_role', true), '')), '');
-    EXECUTE format('REVOKE CREATE ON DATABASE %I FROM %s', current_database(), who);
-    FOR r IN SELECT nspname FROM pg_namespace
-             WHERE nspname NOT IN ('pg_catalog', 'information_schema') AND nspname NOT LIKE 'pg#_%' ESCAPE '#'
+    IF app IS NOT NULL THEN
+        SELECT oid INTO app_oid FROM pg_catalog.pg_roles WHERE rolname = app;
+        IF app_oid IS NULL THEN
+            RAISE EXCEPTION 'DB Firewall: dbfw.app_role %: no such role (give the bare name, without quotes)', app;
+        END IF;
+        SELECT string_agg(o, ', ') INTO found FROM (
+            SELECT 'database ' || quote_ident(datname) AS o FROM pg_catalog.pg_database
+            WHERE datname = current_database() AND pg_catalog.pg_has_role(app_oid, datdba, 'MEMBER')
+            UNION ALL
+            SELECT 'schema ' || quote_ident(nspname) FROM pg_catalog.pg_namespace
+            WHERE nspname NOT IN ('pg_catalog', 'information_schema') AND nspname NOT LIKE 'pg#_%' ESCAPE '#'
+              AND pg_catalog.pg_has_role(app_oid, nspowner, 'MEMBER')
+            UNION ALL
+            SELECT 'table ' || c.oid::pg_catalog.regclass::text FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg#_%' ESCAPE '#'
+              AND pg_catalog.pg_has_role(app_oid, c.relowner, 'MEMBER')
+            LIMIT 20) s;
+        IF found IS NOT NULL THEN
+            RAISE EXCEPTION 'DB Firewall: dbfw.harden: % can act as the owner of %: give them to another role first', app, found;
+        END IF;
+    END IF;
+    -- Every grant to PUBLIC or the app role, by any grantor: a REVOKE removes
+    -- only the grants of the role that runs it (a superuser's: the owner's), so
+    -- each runs as its grantor. CASCADE: also what the app role passed on with
+    -- a grant option.
+    FOR r IN
+        WITH g AS (SELECT 0::pg_catalog.oid AS oid UNION ALL SELECT app_oid WHERE app_oid IS NOT NULL),
+        acl AS (
+            SELECT format('DATABASE %I', d.datname) AS obj, a.* FROM pg_catalog.pg_database d,
+                   LATERAL pg_catalog.aclexplode(d.datacl) a
+            WHERE d.datname = current_database() AND a.privilege_type = 'CREATE'
+            UNION ALL
+            SELECT format('SCHEMA %I', n.nspname), a.* FROM pg_catalog.pg_namespace n,
+                   LATERAL pg_catalog.aclexplode(n.nspacl) a
+            WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg#_%' ESCAPE '#'
+              AND a.privilege_type = 'CREATE'
+            UNION ALL
+            SELECT format('TABLE %s', c.oid::pg_catalog.regclass), a.* FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace, LATERAL pg_catalog.aclexplode(c.relacl) a
+            WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg#_%' ESCAPE '#'
+              AND a.privilege_type IN ('TRIGGER', 'TRUNCATE'))
+        SELECT pg_catalog.pg_get_userbyid(acl.grantor) AS grantor,
+               format('REVOKE %s ON %s FROM %s CASCADE', acl.privilege_type, acl.obj,
+                      CASE WHEN acl.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_catalog.pg_get_userbyid(acl.grantee)) END) AS cmd
+        FROM acl WHERE acl.grantee IN (SELECT oid FROM g)
+        UNION ALL
+        -- Default privileges: tables (and schemas) created later.
+        SELECT me, format('ALTER DEFAULT PRIVILEGES FOR ROLE %I%s REVOKE %s ON %s FROM %s',
+                      pg_catalog.pg_get_userbyid(da.defaclrole),
+                      CASE WHEN da.defaclnamespace <> 0 THEN format(' IN SCHEMA %I', n.nspname) ELSE '' END,
+                      a.privilege_type, CASE da.defaclobjtype WHEN 'r' THEN 'TABLES' ELSE 'SCHEMAS' END,
+                      CASE WHEN a.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_catalog.pg_get_userbyid(a.grantee)) END)
+        FROM pg_catalog.pg_default_acl da LEFT JOIN pg_catalog.pg_namespace n ON n.oid = da.defaclnamespace,
+             LATERAL pg_catalog.aclexplode(da.defaclacl) a
+        WHERE a.grantee IN (SELECT oid FROM g)
+          AND ((da.defaclobjtype = 'r' AND a.privilege_type IN ('TRIGGER', 'TRUNCATE'))
+               OR (da.defaclobjtype = 'n' AND a.privilege_type = 'CREATE'))
     LOOP
-        EXECUTE format('REVOKE CREATE ON SCHEMA %I FROM %s', r.nspname, who);
-        EXECUTE format('REVOKE TRIGGER, TRUNCATE ON ALL TABLES IN SCHEMA %I FROM %s', r.nspname, who);
+        EXECUTE format('SET LOCAL ROLE %I', r.grantor);
+        EXECUTE r.cmd;
+        EXECUTE format('SET LOCAL ROLE %I', me);
     END LOOP;
+    REVOKE SELECT ON pg_catalog.pg_stat_activity FROM PUBLIC;
+    REVOKE EXECUTE ON FUNCTION pg_catalog.pg_stat_get_activity(integer),
+                               pg_catalog.pg_stat_get_backend_activity(integer) FROM PUBLIC;
+    IF app_oid IS NOT NULL THEN
+        -- What is left comes through roles the app role is a member of.
+        SELECT string_agg(o, ', ') INTO found FROM (
+            SELECT 'CREATE on database ' || quote_ident(current_database()) AS o
+            WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_roles m WHERE pg_catalog.pg_has_role(app_oid, m.oid, 'MEMBER')
+                            AND pg_catalog.has_database_privilege(m.oid, current_database(), 'CREATE'))
+            UNION ALL
+            SELECT 'CREATE on schema ' || quote_ident(n.nspname) FROM pg_catalog.pg_namespace n
+            WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg#_%' ESCAPE '#'
+              AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles m WHERE pg_catalog.pg_has_role(app_oid, m.oid, 'MEMBER')
+                            AND pg_catalog.has_schema_privilege(m.oid, n.oid, 'CREATE'))
+            UNION ALL
+            SELECT 'TRIGGER or TRUNCATE on ' || c.oid::pg_catalog.regclass::text FROM pg_catalog.pg_class c
+            JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relkind IN ('r', 'p', 'v', 'm', 'f')
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg#_%' ESCAPE '#'
+              AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles m WHERE pg_catalog.pg_has_role(app_oid, m.oid, 'MEMBER')
+                            AND pg_catalog.has_table_privilege(m.oid, c.oid, 'TRIGGER, TRUNCATE'))
+            UNION ALL
+            SELECT 'pg_stat_activity'
+            WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_roles m WHERE pg_catalog.pg_has_role(app_oid, m.oid, 'MEMBER')
+                            AND (pg_catalog.has_table_privilege(m.oid, 'pg_catalog.pg_stat_activity', 'SELECT')
+                                 OR pg_catalog.has_function_privilege(m.oid, 'pg_catalog.pg_stat_get_activity(integer)', 'EXECUTE')
+                                 OR pg_catalog.has_function_privilege(m.oid, 'pg_catalog.pg_stat_get_backend_activity(integer)', 'EXECUTE')))
+            LIMIT 20) s;
+        IF found IS NOT NULL THEN
+            RAISE EXCEPTION 'DB Firewall: dbfw.harden: % still has %, through a role it is a member of: revoke it there, or end that membership', app, found;
+        END IF;
+    END IF;
 END;
 $$;
 

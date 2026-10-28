@@ -440,14 +440,17 @@ def test_harden_revokes_create_trigger_and_truncate_for_the_app_role():
                 f"SELECT has_table_privilege(%s, '{SCHEMA}.notes', 'TRIGGER'), "
                 f"has_table_privilege(%s, '{SCHEMA}.notes', 'TRUNCATE'), "
                 f"has_table_privilege(%s, '{SCHEMA}.notes', 'SELECT'), has_schema_privilege(%s, '{SCHEMA}', 'CREATE'), "
-                "has_function_privilege(%s, 'pg_catalog.pg_terminate_backend(integer, bigint)', 'EXECUTE')",
-                (ROLE,) * 5).fetchone()
-        assert privs == (False, False, True, False, False)
+                "has_function_privilege(%s, 'pg_catalog.pg_terminate_backend(integer, bigint)', 'EXECUTE'), "
+                "has_table_privilege(%s, 'pg_catalog.pg_stat_activity', 'SELECT')",
+                (ROLE,) * 6).fetchone()
+        assert privs == (False, False, True, False, False, False)
     finally:
         with psycopg.connect(DSN, autocommit=True) as c:
             c.execute(f"DROP TABLE {SCHEMA}.notes")
             c.execute("GRANT EXECUTE ON FUNCTION pg_catalog.pg_terminate_backend(integer, bigint), "
-                      "pg_catalog.pg_cancel_backend(integer) TO PUBLIC")
+                      "pg_catalog.pg_cancel_backend(integer), pg_catalog.pg_stat_get_activity(integer), "
+                      "pg_catalog.pg_stat_get_backend_activity(integer) TO PUBLIC")
+            c.execute("GRANT SELECT ON pg_catalog.pg_stat_activity TO PUBLIC")
 
 
 @pytest.mark.parametrize("pg, match", [({"harden": "yes"}, "harden"), ({"app_role": ""}, "app_role")])

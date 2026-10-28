@@ -5,18 +5,31 @@
 - **`db-firewall verify --strict`:** an allowlist instead of a list of known
   leak paths. Everything a role the app can use can read must be protected
   tenant data: a protected table, a `security_invoker` view whose chain
-  reaches only protected tables, or a sequence a protected table owns. No
-  `SECURITY DEFINER` function outside the firewall's may be executable.
-  `--allow-global schema.name` (repeatable, globs) marks shared data or
-  functions. It also clears them in the bypass-objects check, so platform
-  definer functions can be allowlisted. This closes the "tables without the
-  tenant column" and "copies into readable tables" gaps unless you
-  allowlist them.
+  reaches only protected tables (it must read at least one table and call no
+  function outside `pg_catalog`), or a sequence a protected table owns. No
+  large object may be readable, and the role may not read other sessions' SQL
+  in `pg_stat_activity`. No `SECURITY DEFINER` function outside the
+  firewall's may be executable or fire as a trigger or event trigger.
+  `--allow-global` (repeatable, globs, needs `--strict`) marks shared data:
+  `schema.name` for a relation, `schema.name(argtypes)` for a function. In
+  the bypass-objects check it clears only functions and foreign tables
+  without the tenant column, never a view over a tenant table.
+- **verify, all modes:** fails on a rule on a relation the app can write (its
+  actions run as the owner), on a `SECURITY DEFINER` trigger function even
+  with `EXECUTE` revoked, and when a role the app can use owns the database,
+  a schema or a table (an owner can grant itself `CREATE` and `TRIGGER`
+  back). A new information line reports whether the role can read other
+  sessions' SQL. `--exclude` globs read `[^a]` as fnmatch does (a literal
+  `^`).
 - **`migrate --harden --app-role <role>`** (`dbfw.harden`, `dbfw.app_role`,
   `engines.postgresql.harden` / `app_role`): revokes, from `PUBLIC` and the
-  app role, `CREATE` on the database and every schema, `TRIGGER` and
-  `TRUNCATE` on every table, and the backend signals. It needs a superuser
-  and is off by default.
+  app role, by any grantor: `CREATE` on the database and every schema,
+  `TRIGGER` and `TRUNCATE` on every table and in default privileges,
+  `pg_stat_activity` with `pg_stat_get_activity` and
+  `pg_stat_get_backend_activity`, and the backend signals. It refuses, and
+  changes nothing, when the app role can act as the owner of the database, a
+  schema or a table, or still has one of these through a role it is a member
+  of. It needs a superuser and is off by default.
 
 ## 2026-10-28: Signed tenant context (PR #14), breaking
 

@@ -93,6 +93,7 @@ export function globMatch(pattern: string, name: string): boolean {
       const end = pattern.indexOf("]", i + 2);
       let body = pattern.slice(i + 1, end).replace(/\\/g, "\\\\");
       if (body.startsWith("!")) body = "^" + body.slice(1);
+      else if (body.startsWith("^")) body = "\\" + body;        // literal, as fnmatch reads it
       re += `[${body}]`;
       i = end;
     } else re += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
