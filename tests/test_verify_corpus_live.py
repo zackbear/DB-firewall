@@ -343,7 +343,7 @@ def test_checks_fail_closed():
 def test_allowlist_kinds():
     assert pyverify._allowed_fn(["app.f(*)"], "app.f(text)")
     assert not pyverify._allowed_fn(["app.*"], "app.f(text)")          # a relation entry never clears a function
-    assert not pyverify._allowed_rel(["app.f(*)"], "app.f")            # a function entry never clears a relation
+    assert not pyverify._allowed_rel(["app.f(*)"], "app.f(1)")         # a function entry never clears a relation
     assert pyverify._allowed_rel(["app.[!x]*"], "app.countries")
     assert not pyverify._allowed_rel(["app.[z-a]"], "app.b")           # a reversed range matches nothing
     with pytest.raises(ValueError, match="parameter"):
