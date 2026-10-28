@@ -425,7 +425,9 @@ DROP VIEW {S}.ref_docs;
 -- @leak SELECT string_agg(body, ',') FROM {S}.over_mv
 -- @setup
 CREATE ROLE {ROLE}_mvo NOLOGIN;
-CREATE MATERIALIZED VIEW {S}.hidden_mv AS SELECT * FROM {S}.docs; GRANT SELECT ON {S}.hidden_mv TO {ROLE}_mvo;
+-- Filled as the superuser (every tenant's rows), then owned by a role that does not skip RLS:
+-- only "a materialized view has no RLS" flags it.
+CREATE MATERIALIZED VIEW {S}.hidden_mv AS SELECT * FROM {S}.docs; ALTER MATERIALIZED VIEW {S}.hidden_mv OWNER TO {ROLE}_mvo;
 CREATE VIEW {S}.over_mv AS SELECT * FROM {S}.hidden_mv; ALTER VIEW {S}.over_mv OWNER TO {ROLE}_mvo;
 GRANT SELECT ON {S}.over_mv TO {ROLE};
 -- @undo
