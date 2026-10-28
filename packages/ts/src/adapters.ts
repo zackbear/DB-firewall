@@ -59,19 +59,60 @@ function isDrizzleTx(db: any): boolean {
 // commit the outer transaction early (pg).
 const handles = new WeakSet<object>();
 
+// Lifecycle calls fn must not make: releasing or ending the connection while
+// this function still owns it hands it to the next borrower mid-transaction.
+const BLOCKED = new Set<PropertyKey>(["release", "connect", "end"]);
+
 /**
- * Run fn with a handle that stops working when fn settles: a query fired
- * later (a timer, an un-awaited promise) throws instead of running on the
- * connection's next borrower. Query builders made inside fn must be awaited
- * inside fn.
+ * Run fn with a handle that stops working when fn settles. Everything reached
+ * through it (a property such as tx.session, a method result such as a Drizzle
+ * query builder or a pending postgres.js query) is wrapped the same way, so a
+ * query fired or awaited after fn settles throws instead of running on the
+ * connection's next borrower. Native promises pass through, so results (rows)
+ * stay usable after fn returns.
  */
 async function withHandle<H extends object, T>(target: H, fn: (h: H) => Promise<T>): Promise<T> {
-  const { proxy, revoke } = Proxy.revocable(target, {});
-  handles.add(proxy);
+  let open = true;
+  const wrapped = new WeakMap<object, any>();     // target -> its wrapper (stable identity)
+  const targets = new WeakMap<object, object>();  // wrapper -> target
+  const check = () => {
+    if (!open) throw new TypeError("DB Firewall: database handle used after withTenant() finished");
+  };
+  const wrap = (value: any): any => {
+    if (value === null || (typeof value !== "object" && typeof value !== "function")) return value;
+    if (Object.getPrototypeOf(value) === Promise.prototype) return value;   // results, not handles
+    const known = wrapped.get(value);
+    if (known) return known;
+    const proxy = new Proxy(value, {
+      get(t, key) {
+        check();
+        if (BLOCKED.has(key)) {
+          return () => { throw new TypeError(`DB Firewall: ${String(key)}() is not allowed inside withTenant()`); };
+        }
+        const v = Reflect.get(t, key, t);
+        if (typeof v !== "function") return wrap(v);
+        // Methods run on the real object (private state, Promise internals),
+        // and what they return is wrapped.
+        return (...args: unknown[]) => { check(); return wrap(Reflect.apply(v, t, args)); };
+      },
+      apply(t, thisArg, args) {
+        check();
+        const self = (thisArg && targets.get(thisArg)) ?? thisArg;
+        return wrap(Reflect.apply(t as (...a: unknown[]) => unknown, self, args));
+      },
+      set(t, key, v) { check(); return Reflect.set(t, key, v, t); },
+      has(t, key) { check(); return Reflect.has(t, key); },
+    });
+    wrapped.set(value, proxy);
+    targets.set(proxy, value);
+    return proxy;
+  };
+  const handle = wrap(target) as H;
+  handles.add(handle);
   try {
-    return await fn(proxy);
+    return await fn(handle);
   } finally {
-    revoke();
+    open = false;
   }
 }
 
@@ -121,7 +162,7 @@ export async function withTenantPg<T>(
       throw err;
     }
   } finally {
-    if (pooled && !failed) {
+    if (!failed) {                    // pooled or not: no session-level tenant survives
       await client.query(CLEAR_TENANT).catch((e) => { failed = e as Error; });
     }
     pooled?.release(failed);          // a failed ROLLBACK or clear destroys the connection

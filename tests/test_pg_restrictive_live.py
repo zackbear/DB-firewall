@@ -123,6 +123,10 @@ def _stem(table):
     "ALTER POLICY {p}_sel ON {t} TO pg_monitor",          # applies to another role only
     "ALTER POLICY {p}_sel ON {t} USING (true)",           # no longer reads the tenant
     "ALTER POLICY {p}_ins ON {t} WITH CHECK (true)",
+    # still mentions the setting, restricts nothing (PR 12 re-check)
+    "ALTER POLICY {p}_sel ON {t} USING (current_setting('app.current_tenant', true) IS NOT NULL)",
+    "ALTER POLICY {p}_upd ON {t} USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '') "
+    "OR true) WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant', true), '') OR true)",
 ])
 def test_scanner_flags_an_altered_firewall_policy(alter):
     t, p = f"{SCHEMA}.plain", _stem("plain")

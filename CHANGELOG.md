@@ -13,10 +13,11 @@
   `generateText`. Not yet published to npm. From the PR 12 review: only real
   `pg.Pool` / `pg.Client`, postgres.js and Drizzle databases are accepted (a
   pool wrapper such as pg-promise mixed connections and returned another
-  tenant's rows); the handle given to `fn` stops working when `fn` settles; a
-  nested call or a raw Drizzle transaction is refused; streaming tools stay in
-  scope; a session-level tenant is cleared before a pooled `pg` connection is
-  released.
+  tenant's rows); the handle given to `fn`, and everything reached through it
+  (sessions, query builders, pending queries), stops working when `fn`
+  settles; `release()`, `connect()` and `end()` on it are refused; a nested
+  call or a raw Drizzle transaction is refused; streaming tools stay in scope;
+  a session-level tenant is cleared on node-postgres.
 - **PostgreSQL `policy_mode: restrictive`** (`engines.postgresql.policy_mode`,
   `dbfw.policy_mode`): the tenant policies are created `AS RESTRICTIVE`, so
   they AND with the app's own RLS policies instead of being OR-ed with them.
@@ -24,9 +25,11 @@
   scanner accepts other permissive policies when all four tenant policies are
   restrictive, and reports `policy_mode`. The default stays `permissive`.
 - **Scanner (PostgreSQL): firewall policies are checked by shape**, not only by
-  name: each must apply to `PUBLIC`, cover its own command and read
-  `app.current_tenant`. An altered policy is reported in `altered_policies`
-  and the table counts as unprotected. `stale_base_policy` flags a base
+  name: each must apply to `PUBLIC`, cover its own command and use exactly the
+  predicate the migration creates (compared after normalising casts, case and
+  spacing). An altered policy is reported in `altered_policies` and the table
+  counts as unprotected. A policy left by an older migration counts as altered
+  unless it matches the current predicate: re-run the migration. `stale_base_policy` flags a base
   policy left next to app policies in restrictive mode.
 
 ## 2026-10-28: live CI and attack corpus (PR #11)

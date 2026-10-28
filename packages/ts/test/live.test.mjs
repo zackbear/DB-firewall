@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import pg from "pg";
 import postgres from "postgres";
 import { drizzle } from "drizzle-orm/node-postgres";
+import { integer, pgSchema, text } from "drizzle-orm/pg-core";
 import { sql as dsql } from "drizzle-orm";
 import {
   assertSafeRole, bindTenant, currentTenant, runWithTenant, validateTenantId,
@@ -13,6 +14,7 @@ import {
 import { ADMIN_URL, SCHEMA, adminQuery, appUrl, live, setup } from "./setup.mjs";
 const ids = (rows) => rows.map((r) => Number(r.id)).sort();
 const SELECT = `SELECT id FROM ${SCHEMA}.docs`;
+const docs = pgSchema(SCHEMA).table("docs", { id: integer("id"), tenantId: text("tenant_id") });
 
 describe("tenant ids", () => {
   for (const bad of ["", "a\u0000b", "a\nb", "a\\b", "__BYPASS__", "__bypass__", 7, undefined]) {
@@ -72,6 +74,15 @@ describe("node-postgres", live, () => {
   it("a nested call on the handle is refused", async () => {
     await assert.rejects(withTenant(pool, "A", (c) => withTenant(c, "B", async () => 1)), /nested/);
   });
+  it("release() inside fn is refused, and the connection stays ours", async () => {
+    await assert.rejects(withTenant(pool, "A", async (c) => { c.release(); }), /release\(\) is not allowed/);
+    assert.deepEqual(ids(await withTenant(pool, "A", async (c) => (await c.query(SELECT)).rows)), [1]);
+  });
+  it("raw objects reached through the handle stop working too", async () => {
+    let conn;
+    await withTenant(pool, "A", async (c) => { conn = c.connection; });
+    assert.throws(() => conn.query, TypeError);
+  });
   it("a session-level tenant set inside fn does not survive the release", async () => {
     await withTenant(pool, "A", (c) => c.query("SET app.current_tenant = 'B'"));
     assert.deepEqual(ids((await pool.query(SELECT)).rows), []);
@@ -109,6 +120,11 @@ describe("postgres.js", live, () => {
     assert.throws(() => kept.unsafe(SELECT), TypeError);
     await assert.rejects(withTenant(sql, "A", (tx) => withTenant(tx, "B", async () => 1)), /nested/);
   });
+  it("a query created inside fn and awaited after it is refused", async () => {
+    let pending;
+    await withTenant(sql, "A", async (tx) => { pending = tx`SELECT id FROM ts_app.docs`; });
+    await assert.rejects(Promise.resolve().then(() => pending), TypeError);
+  });
 });
 
 describe("Drizzle", live, () => {
@@ -133,6 +149,14 @@ describe("Drizzle", live, () => {
     assert.throws(() => kept.execute(dsql.raw(SELECT)), TypeError);
     await assert.rejects(withTenant(db, "A", (tx) => withTenant(tx, "B", async () => 1)), /nested/);
     await assert.rejects(db.transaction((tx) => withTenant(tx, "B", async () => 1)), /not a transaction/);
+  });
+  it("a query builder awaited inside fn works; one awaited after it is refused", async () => {
+    const rows = await withTenant(db, "A", async (tx) => tx.select({ id: docs.id }).from(docs));
+    assert.deepEqual(ids(rows), [1]);                          // results stay usable
+    let builder, session;
+    await withTenant(db, "A", async (tx) => { builder = tx.select().from(docs); session = tx.session; });
+    await assert.rejects(Promise.resolve().then(() => builder), TypeError);
+    assert.throws(() => session.execute, TypeError);
   });
 });
 

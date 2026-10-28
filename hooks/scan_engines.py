@@ -4,6 +4,8 @@ for every non-excluded table that has the tenant column.
 """
 
 import hashlib
+import json
+import re
 import os
 import sys
 from typing import Dict
@@ -49,17 +51,15 @@ _PG_SQL = """
                              WHERE p.schemaname = t.nspname AND p.tablename = t.relname
                                AND p.policyname IN (t.stem || '_sel', t.stem || '_ins',
                                                     t.stem || '_upd', t.stem || '_del')), false),
-                   -- A firewall policy that was altered: applies to a role other than
-                   -- PUBLIC, covers another command, or no longer reads the tenant.
-                   ARRAY(SELECT p.policyname FROM pg_policies p
-                         JOIN unnest(ARRAY['sel', 'ins', 'upd', 'del'],
-                                     ARRAY['SELECT', 'INSERT', 'UPDATE', 'DELETE']) AS o(op, cmd)
-                           ON p.policyname IN (t.stem || '_' || o.op, t.legacy || '_' || o.op)
-                         WHERE p.schemaname = t.nspname AND p.tablename = t.relname
-                           AND (p.roles <> '{public}'::name[] OR p.cmd <> o.cmd
-                                OR (o.op <> 'ins' AND COALESCE(p.qual, '') NOT LIKE '%%app.current_tenant%%')
-                                OR (o.op IN ('ins', 'upd')
-                                    AND COALESCE(p.with_check, '') NOT LIKE '%%app.current_tenant%%'))),
+                   -- The firewall policies as they are now, for the shape check below.
+                   COALESCE((SELECT json_agg(json_build_array(p.policyname, p.cmd, p.roles,
+                                                              p.qual, p.with_check))
+                             FROM pg_policies p
+                             WHERE p.schemaname = t.nspname AND p.tablename = t.relname
+                               AND p.policyname IN (
+                                   SELECT pre || '_' || op
+                                   FROM unnest(ARRAY[t.stem, t.legacy]) AS pre,
+                                        unnest(ARRAY['sel', 'ins', 'upd', 'del']) AS op)), '[]'),
                    EXISTS (SELECT 1 FROM pg_policies p
                            WHERE p.schemaname = t.nspname AND p.tablename = t.relname
                              AND p.policyname = t.stem || '_base')
@@ -108,10 +108,42 @@ _ORACLE_SQL = """
 """
 
 
+_PG_CMD = {"sel": "SELECT", "ins": "INSERT", "upd": "UPDATE", "del": "DELETE"}
+
+
+def _pg_norm(expr) -> str:
+    """Compare predicates as PostgreSQL deparses them, without the parts that
+    vary: case, casts, the public. prefix, spacing, brackets and quotes."""
+    s = (expr or "").lower()
+    s = re.sub(r"::(character varying|[a-z_]+)", "", s).replace("public.", "")
+    return re.sub(r'[\s()"]', "", s)
+
+
+def _pg_altered(policies, tenant_col) -> list:
+    """Firewall policies whose shape differs from what the migration creates:
+    another role than PUBLIC, another command, or another predicate. The
+    predicate must match exactly (after _pg_norm): one that only mentions
+    app.current_tenant (e.g. "... IS NOT NULL") restricts nothing."""
+    pred = _pg_norm(f"{tenant_col} = NULLIF(current_setting('app.current_tenant', true), '') "
+                    "OR _firewall_is_bypass_role(CURRENT_USER)")
+    altered = []
+    for name, cmd, roles, qual, check in policies:
+        op = name.rsplit("_", 1)[-1]
+        want_qual = pred if op in ("sel", "upd", "del") else ""
+        want_check = pred if op in ("ins", "upd") else ""
+        if (roles != ["public"] or cmd != _PG_CMD[op]
+                or _pg_norm(qual) != want_qual or _pg_norm(check) != want_check):
+            altered.append(name)
+    return sorted(altered)
+
+
 def _scan_postgres(cursor, tenant_col, excluded, opts) -> Dict[str, dict]:
     results = {}
     cursor.execute(_PG_SQL, (opts.get("schema") or "public", tenant_col))
-    for table, enabled, forced, missing, extra, restrictive, altered, base in cursor.fetchall():
+    for table, enabled, forced, missing, extra, restrictive, policies, base in cursor.fetchall():
+        if isinstance(policies, str):
+            policies = json.loads(policies)
+        altered = _pg_altered(policies, tenant_col)
         if _is_excluded_table(table, excluded):
             continue
         missing, extra = sorted(missing), sorted(extra)
@@ -120,7 +152,7 @@ def _scan_postgres(cursor, tenant_col, excluded, opts) -> Dict[str, dict]:
             "missing_policies": missing, "extra_permissive_policies": extra,
             "rls_enabled": bool(enabled), "rls_forced": bool(forced),
             "policy_mode": "restrictive" if restrictive else "permissive",
-            "altered_policies": sorted(altered),
+            "altered_policies": altered,
             # restrictive mode: "<stem>_base" (USING true) next to the app's own
             # permissive policies ORs with them inside the tenant: re-run the migration.
             "stale_base_policy": bool(base) and any(not e.endswith("_base") for e in extra),

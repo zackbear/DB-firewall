@@ -116,10 +116,11 @@ PostgreSQL policy mode (`engines.postgresql.policy_mode`, `dbfw.policy_mode`):
   permissive policy for writes, so they are refused.
 
 The scanner also checks each firewall policy's shape: it must apply to
-`PUBLIC`, cover its own command, and read `app.current_tenant`. A policy
-altered after the migration (`ALTER POLICY ... TO some_role`, `USING (true)`)
-is listed in `altered_policies` and the table counts as unprotected. This is a
-shape check, not a proof: the predicate text is matched, not evaluated.
+`PUBLIC`, cover its own command, and use exactly the predicate the migration
+creates (compared as PostgreSQL deparses it, ignoring casts, case and
+spacing). A policy altered after the migration (`ALTER POLICY ... TO
+some_role`, `USING (true)`, `... IS NOT NULL`) is listed in
+`altered_policies` and the table counts as unprotected.
 
 Oracle: run as SYS. The logon/logoff triggers call the package, and any other
 DBA user needs a direct grant from the schema owner first (see section 6b of
