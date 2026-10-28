@@ -120,7 +120,9 @@ The scanner also checks each firewall policy's shape: it must apply to
 creates. The scanner asks PostgreSQL to deparse that predicate on a temporary
 copy of the table (rolled back; needs the default `TEMP` privilege) and
 compares the text exactly, so a changed cast, constant or function overload
-shows up. A policy altered after the migration (`ALTER POLICY ... TO
+shows up. When it cannot build that reference (a read-only transaction, no
+`TEMP` privilege, no `SELECT` on the table), the table is reported with
+`predicate_check: "unavailable: <reason>"` and counts as unprotected. A policy altered after the migration (`ALTER POLICY ... TO
 some_role`, `USING (true)`, `... IS NOT NULL`) is listed in
 `altered_policies` and the table counts as unprotected.
 

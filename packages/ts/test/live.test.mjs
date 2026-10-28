@@ -78,15 +78,26 @@ describe("node-postgres", live, () => {
     await assert.rejects(withTenant(pool, "A", async (c) => { c.release(); }), /release\(\) is not allowed/);
     assert.deepEqual(ids(await withTenant(pool, "A", async (c) => (await c.query(SELECT)).rows)), [1]);
   });
-  it("an event listener gets a wrapped emitter", async () => {
-    let emitter;
+  it("an event listener gets a wrapped emitter and plain event data, and is removed after fn", async () => {
+    let emitter, calls = 0, notice;
     await withTenant(pool, "A", async (c) => {
-      c.on("notice", function () { emitter = this; });
+      c.on("notice", function (msg) { emitter = this; notice = msg; calls++; });
       await c.query("DO $$ BEGIN RAISE NOTICE 'hi'; END $$");
-      c.removeAllListeners?.("notice");
     });
-    assert.ok(emitter, "listener ran");
-    assert.throws(() => emitter.query, TypeError);
+    assert.equal(calls, 1);
+    assert.equal(notice.message, "hi");                      // event data stays usable
+    assert.throws(() => emitter.query, TypeError);           // the emitter does not
+    // The next borrower's notice must not reach the old listener (and must not crash).
+    await withTenant(pool, "B", (c) => c.query("DO $$ BEGIN RAISE NOTICE 'again'; END $$"));
+    assert.equal(calls, 1);
+  });
+  it("rows collected from query events stay usable after fn", async () => {
+    const rows = [];
+    await withTenant(pool, "A", (c) => new Promise((resolve, reject) => {
+      const q = c.query(new pg.Query(SELECT));
+      q.on("row", (row) => rows.push(row)).on("end", resolve).on("error", reject);
+    }));
+    assert.deepEqual(ids(rows), [1]);
   });
   it("raw objects reached through the handle stop working too", async () => {
     let conn;

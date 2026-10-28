@@ -119,8 +119,8 @@ def _pg_reference(cursor, schema: str, table: str, tenant_col: str):
     a policy with the migration's predicate on a temporary copy of the table's
     columns, read back from pg_policies, then rolled back. Comparing deparsed
     text exactly catches a changed cast, an overloaded function or a changed
-    constant that a normalised comparison would miss. None when it cannot be
-    built (the migration's functions are missing)."""
+    constant that a normalised comparison would miss. Returns (text, None),
+    or (None, reason) when it cannot be built."""
     pred = (f"{_pg_ident(tenant_col)} = NULLIF(current_setting('app.current_tenant', true), '') "
             "OR public._firewall_is_bypass_role(current_user::text)")
     autocommit = bool(getattr(getattr(cursor, "connection", None), "autocommit", False))
@@ -131,9 +131,9 @@ def _pg_reference(cursor, schema: str, table: str, tenant_col: str):
         cursor.execute("SELECT qual FROM pg_policies WHERE tablename = '_fw_ref' "
                        "AND policyname = '_fw_ref_p' AND schemaname = pg_my_temp_schema()::regnamespace::text")
         row = cursor.fetchone()
-        return row[0] if row else None
-    except Exception:
-        return None
+        return (row[0], None) if row else (None, "no result")
+    except Exception as e:          # read-only transaction, no TEMP privilege, no SELECT ...
+        return None, str(e).strip().splitlines()[0]
     finally:
         cursor.execute("ROLLBACK" if autocommit else "ROLLBACK TO SAVEPOINT _fw_ref")
 
@@ -158,12 +158,15 @@ def _scan_postgres(cursor, tenant_col, excluded, opts) -> Dict[str, dict]:
     cursor.execute(_PG_SQL, (opts.get("schema") or "public", tenant_col))
     schema = opts.get("schema") or "public"
     for table, enabled, forced, missing, extra, restrictive, policies, base in cursor.fetchall():
-        if isinstance(policies, str):
-            policies = json.loads(policies)
-        altered = _pg_altered(policies, _pg_reference(cursor, schema, table, tenant_col)) \
-            if policies else []
         if _is_excluded_table(table, excluded):
             continue
+        if isinstance(policies, str):
+            policies = json.loads(policies)
+        reference, why = _pg_reference(cursor, schema, table, tenant_col) if policies else (None, None)
+        unverified = bool(policies) and reference is None
+        # Without a reference the predicates cannot be checked: report that,
+        # and fail closed, instead of calling every policy altered.
+        altered = _pg_altered(policies, reference) if reference is not None else []
         missing, extra = sorted(missing), sorted(extra)
         results[table] = {
             "has_tenant_col": True, "has_rls_policy": not missing,
@@ -171,11 +174,14 @@ def _scan_postgres(cursor, tenant_col, excluded, opts) -> Dict[str, dict]:
             "rls_enabled": bool(enabled), "rls_forced": bool(forced),
             "policy_mode": "restrictive" if restrictive else "permissive",
             "altered_policies": altered,
+            "predicate_check": ("unavailable: " + str(why)
+                                + " (run the scanner outside a read-only transaction, with the "
+                                  "TEMP privilege and SELECT on the table)") if unverified else "ok",
             # restrictive mode: "<stem>_base" (USING true) next to the app's own
             # permissive policies ORs with them inside the tenant: re-run the migration.
             "stale_base_policy": bool(base) and any(not e.endswith("_base") for e in extra),
             "protected": bool(enabled) and bool(forced) and not missing and not altered
-                         and (bool(restrictive) or not extra),
+                         and not unverified and (bool(restrictive) or not extra),
         }
     return results
 

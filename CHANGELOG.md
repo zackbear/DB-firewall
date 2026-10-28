@@ -16,6 +16,8 @@
   tenant's rows); the handle given to `fn`, and everything reached through it
   (sessions, query builders, pending queries), stops working when `fn`
   settles, including nested transactions, savepoints and event emitters;
+  listeners added inside `fn` are removed when it settles (event data stays
+  plain);
   `release()`, `connect()` and `end()` on it are refused; a nested
   call or a raw Drizzle transaction is refused; streaming tools stay in scope;
   a session-level tenant is cleared on node-postgres.
@@ -28,7 +30,9 @@
 - **Scanner (PostgreSQL): firewall policies are checked by shape**, not only by
   name: each must apply to `PUBLIC`, cover its own command and use exactly the
   predicate the migration creates, as PostgreSQL deparses it on a temporary
-  copy of the table (rolled back). An altered policy is reported in `altered_policies` and the table
+  copy of the table (rolled back). When that is not possible (read-only
+  transaction, no `TEMP` privilege), `predicate_check` says why and the table
+  counts as unprotected. An altered policy is reported in `altered_policies` and the table
   counts as unprotected. A policy left by an older migration counts as altered
   unless it matches the current predicate: re-run the migration. `stale_base_policy` flags a base
   policy left next to app policies in restrictive mode.

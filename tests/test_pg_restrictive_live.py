@@ -148,6 +148,14 @@ def test_scanner_flags_an_altered_firewall_policy(alter):
     assert report["protected"] is False and report["altered_policies"]
 
 
+def test_scanner_says_when_it_cannot_check_predicates():
+    with psycopg.connect(DSN) as c:                       # a read-only transaction: no TEMP table
+        c.execute("SET TRANSACTION READ ONLY")
+        report = scan_tables(c, DBEngine.POSTGRESQL, _cfg("restrictive"))["plain"]
+    assert report["predicate_check"].startswith("unavailable")
+    assert report["altered_policies"] == [] and report["protected"] is False   # fail closed, not blamed
+
+
 def test_scanner_reports_a_stale_base_policy():
     with psycopg.connect(DSN, autocommit=True) as c:
         c.execute(f"CREATE POLICY app_late ON {SCHEMA}.plain USING (id = 1)")   # added after the run

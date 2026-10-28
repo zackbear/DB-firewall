@@ -62,11 +62,14 @@ const handles = new WeakSet<object>();
 // Lifecycle calls fn must not make: releasing or ending the connection while
 // this function still owns it hands it to the next borrower mid-transaction.
 const BLOCKED = new Set<PropertyKey>(["release", "connect", "end"]);
-// Methods that call back with driver objects (a nested Drizzle transaction, a
-// postgres.js savepoint, an event's emitter and payload): their callbacks get
-// wrapped arguments and `this`, so those objects stop working with the rest.
-const CALLBACK_METHODS = new Set<PropertyKey>([
-  "transaction", "savepoint", "on", "once", "addListener", "prependListener", "prependOnceListener",
+// Methods that call back with a handle (a nested Drizzle transaction, a
+// postgres.js savepoint): the callback gets wrapped arguments and `this`.
+const HANDLE_CALLBACKS = new Set<PropertyKey>(["transaction", "savepoint"]);
+// Event listeners added inside fn: `this` (the emitter) is wrapped, the event
+// data (rows, notices) stays plain, and the listener is removed when fn
+// settles, so it never runs for the connection's next borrower.
+const LISTENER_METHODS = new Set<PropertyKey>([
+  "on", "once", "addListener", "prependListener", "prependOnceListener",
 ]);
 
 /**
@@ -79,6 +82,7 @@ const CALLBACK_METHODS = new Set<PropertyKey>([
  */
 async function withHandle<H extends object, T>(target: H, fn: (h: H) => Promise<T>): Promise<T> {
   let open = true;
+  const listeners: Array<[any, unknown, (...a: unknown[]) => unknown]> = [];   // emitter, event, fn
   const wrapped = new WeakMap<object, any>();     // target -> its wrapper (stable identity)
   const targets = new WeakMap<object, object>();  // wrapper -> target
   const check = () => {
@@ -99,14 +103,23 @@ async function withHandle<H extends object, T>(target: H, fn: (h: H) => Promise<
         if (typeof v !== "function") return wrap(v);
         // Methods run on the real object (private state, Promise internals),
         // and what they return is wrapped.
-        const wrapCallbacks = CALLBACK_METHODS.has(key);
         return (...args: unknown[]) => {
           check();
-          const passed = wrapCallbacks ? args.map((a) => typeof a === "function"
-            ? function (this: unknown, ...cbArgs: unknown[]) {
-                return (a as (...x: unknown[]) => unknown).apply(wrap(this), cbArgs.map(wrap));
-              }
-            : a) : args;
+          let passed = args;
+          if (HANDLE_CALLBACKS.has(key)) {
+            passed = args.map((a) => typeof a === "function"
+              ? function (this: unknown, ...cbArgs: unknown[]) {
+                  return (a as (...x: unknown[]) => unknown).apply(wrap(this), cbArgs.map(wrap));
+                }
+              : a);
+          } else if (LISTENER_METHODS.has(key) && typeof args[1] === "function") {
+            const listener = args[1] as (...x: unknown[]) => unknown;
+            const bound = function (this: unknown, ...eventArgs: unknown[]) {
+              return listener.apply(wrap(this), eventArgs);
+            };
+            listeners.push([t, args[0], bound]);
+            passed = [args[0], bound, ...args.slice(2)];
+          }
           return wrap(Reflect.apply(v, t, passed));
         };
       },
@@ -134,6 +147,7 @@ async function withHandle<H extends object, T>(target: H, fn: (h: H) => Promise<
     return await fn(handle);
   } finally {
     open = false;
+    for (const [emitter, event, bound] of listeners) emitter.removeListener?.(event, bound);
   }
 }
 
