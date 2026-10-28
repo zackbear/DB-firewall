@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-10-28: one set of PostgreSQL checks, and `python -m hooks.verify` (PR #17)
+
+- **`checks/postgresql.sql`:** every query of `scan` and `verify` on
+  PostgreSQL, in one file: the global checks (`@check`, `@info`, each one row
+  of `ok` and `detail`), the queries the tools run with their own logic
+  (`@query`), and the tables the migration skips (`@excluded`). The Node CLI
+  ships it (`sql/checks_postgresql.sql`, copied at build) and the Python
+  tools read it, so a check changes in one place.
+- **`python -m hooks.verify`:** the Python verify, with the same checks,
+  options, output and exit codes as `npx db-firewall verify`. CI runs the
+  attack corpus against it on PostgreSQL 14 to 17, and checks that both tools
+  give the same checks, results and details on a failing database.
+- **Python scanner:** runs the shared queries. A partition's reference
+  predicate is built on its root, as in the Node CLI, and each table report
+  also has `schema`, `table` and `owner`.
+- **verify output:** "firewall functions unchanged" now comes after the
+  other role checks, and its detail ends "re-run the migration" (was "re-run
+  migrate") in both tools. The "cannot read the key or sign" items are sorted.
+- **`--allow-query-text`** accepts the views of the `pg_stat_statements`
+  extension itself, not any relation with that name.
+- **Globs:** `*` and `?` match a newline, and a reversed range (`[z-a]`) is
+  dropped, as in Python's `fnmatch`.
+- **Corpus:** 90 attacks and 6 safe patterns: the strict walk (blockers,
+  nested invoker views, system catalogs, sequences), a matview inside a view
+  chain, `TRUNCATE` through a role, an owned table, a planted function through
+  the role's `search_path`, the `pg_stat_statements` function, and definer
+  functions PostgreSQL runs as index support, type input, selectivity
+  estimators, planner support and text search parsers. The Python test also
+  compares both tools' output on every case.
+
 ## 2026-10-28: PostgreSQL 14 to 17 and the attack corpus in CI (PR #16)
 
 - **CI runs on PostgreSQL 14, 15, 16 and 17:** the Python suite (with the

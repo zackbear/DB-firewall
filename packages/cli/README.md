@@ -40,6 +40,8 @@ Lists every table in the schema that has the tenant column, and reports whether 
 
 ## verify
 
+The checks are the shared queries in `checks/postgresql.sql` (shipped as `sql/checks_postgresql.sql`); `python -m hooks.verify` in the repository runs the same file, with the same results.
+
 Connect with your app's own URL and role, not an admin's, with `DB_FIREWALL_TENANT_KEY` set to the key the app uses (exit 2 without it). `verify` tests behaviour, not only the policies. It is read-only by default: each check runs in a transaction that is rolled back.
 
 1. **The role:** RLS applies to it and to every role it is a member of. None is a superuser, has `BYPASSRLS`, is in `_firewall_bypass_roles`, or is a member of `pg_read_all_data`, `pg_write_all_data`, `pg_execute_server_program`, `pg_read_server_files` or `pg_write_server_files`. The last three run programs or read and write files as the server.

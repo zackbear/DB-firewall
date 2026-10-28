@@ -1,15 +1,15 @@
-// PostgreSQL scan: the same checks as hooks/scan_engines.py (_scan_postgres),
-// so TypeScript teams need no Python. Keep the two in step.
+// PostgreSQL scan: the queries are in the shared checks file, which
+// hooks/scan_engines.py (_scan_postgres) runs too, so TypeScript teams need no
+// Python. The logic around them is kept in step with the Python scanner.
 import { readFileSync } from "node:fs";
 import type pg from "pg";
+import { CHECKS, q } from "./checks.js";
 import { MIGRATION } from "./migrate.js";
 
-/** Exactly the tables migrations/001_postgresql.sql skips, so a table the
- *  migration protects is never skipped here. Skipped tables are reported. */
-export const DEFAULT_EXCLUDED = [
-  "_firewall_*", "schema_migrations", "alembic_version", "knex_migrations", "prisma_migrations",
-  "__diesel_schema_migrations", "flyway_schema_history",
-];
+/** Exactly the tables migrations/001_postgresql.sql skips (@excluded in the
+ *  checks file), so a table the migration protects is never skipped here.
+ *  Skipped tables are reported. */
+export const DEFAULT_EXCLUDED = CHECKS().excluded;
 
 export interface TableReport {
   schema: string;
@@ -41,42 +41,8 @@ export function predicate(column: string, context: Context): string {
       "OR (SELECT public._firewall_is_bypass_role(current_user::text))";
 }
 
-// Exact schema.table match. Protected = RLS enabled AND forced AND all four
-// firewall policies AND their exact shape AND, when they are permissive, no
-// other permissive policy (PostgreSQL ORs permissive policies).
-const SQL = `
-  WITH t AS (
-    SELECT c.oid, n.nspname, c.relname, c.relrowsecurity, c.relforcerowsecurity,
-           'fw_' || left(md5(n.nspname || '.' || c.relname), 12) AS stem,
-           'firewall_rls_' || c.relname AS legacy
-    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE c.relkind IN ('r', 'p') AND n.nspname = $1
-      AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attname = $2
-                    AND a.attnum > 0 AND NOT a.attisdropped))
-  SELECT t.relname AS table, t.relrowsecurity AS enabled, t.relforcerowsecurity AS forced,
-    pg_get_userbyid((SELECT relowner FROM pg_class WHERE oid = t.oid)) AS owner,
-    (CASE WHEN (SELECT relispartition FROM pg_class WHERE oid = t.oid) THEN pg_partition_root(t.oid)
-          ELSE t.oid END)::regclass::text AS ref_rel,
-    ARRAY(SELECT op FROM unnest(ARRAY['sel', 'ins', 'upd', 'del']) AS op
-          WHERE NOT EXISTS (SELECT 1 FROM pg_policies p
-                            WHERE p.schemaname = t.nspname AND p.tablename = t.relname
-                              AND p.policyname IN (t.stem || '_' || op, t.legacy || '_' || op))) AS missing,
-    ARRAY(SELECT p.policyname::text FROM pg_policies p
-          WHERE p.schemaname = t.nspname AND p.tablename = t.relname AND p.permissive = 'PERMISSIVE'
-            AND p.policyname NOT IN (SELECT pre || '_' || op FROM unnest(ARRAY[t.stem, t.legacy]) AS pre,
-                                     unnest(ARRAY['sel', 'ins', 'upd', 'del']) AS op)) AS extra,
-    COALESCE((SELECT count(*) = 4 AND bool_and(p.permissive = 'RESTRICTIVE') FROM pg_policies p
-              WHERE p.schemaname = t.nspname AND p.tablename = t.relname
-                AND p.policyname IN (t.stem || '_sel', t.stem || '_ins',
-                                     t.stem || '_upd', t.stem || '_del')), false) AS restrictive,
-    COALESCE((SELECT json_agg(json_build_array(p.policyname, p.cmd, p.roles, p.qual, p.with_check))
-              FROM pg_policies p
-              WHERE p.schemaname = t.nspname AND p.tablename = t.relname
-                AND p.policyname IN (SELECT pre || '_' || op FROM unnest(ARRAY[t.stem, t.legacy]) AS pre,
-                                     unnest(ARRAY['sel', 'ins', 'upd', 'del']) AS op)), '[]') AS policies,
-    EXISTS (SELECT 1 FROM pg_policies p WHERE p.schemaname = t.nspname AND p.tablename = t.relname
-              AND p.policyname = t.stem || '_base') AS base
-  FROM t ORDER BY t.relname`;
+// The tables and their policies: @query scan_tables.
+
 
 const CMD: Record<string, string> = { sel: "SELECT", ins: "INSERT", upd: "UPDATE", del: "DELETE" };
 
@@ -96,14 +62,16 @@ export function globMatch(pattern: string, name: string): boolean {
       if (pattern[j] === "]") j++;
       const end = pattern.indexOf("]", j);
       if (end < 0) { re += "\\["; continue; }
-      let body = pattern.slice(i + 1, end).replace(/\\/g, "\\\\");
+      // fnmatch drops a reversed range ([z-a]) instead of failing.
+      let body = pattern.slice(i + 1, end).replace(/(.)-(.)/g, (m, a, b) => (a > b ? "" : m)).replace(/\\/g, "\\\\");
       if (body.startsWith("!")) body = "^" + body.slice(1).replace(/[[\]]/g, "\\$&");
       else body = (body.startsWith("^") ? "\\" : "") + body.replace(/[[\]]/g, "\\$&");  // "^": a literal, as fnmatch reads it
       re += `[${body}]`;
       i = end;
     } else re += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
   }
-  try { return new RegExp(`^${re}$`).test(name); } catch { return false; }   // a reversed range ([z-a]): no match, as fnmatch
+  // "s": * and ? match a newline too, as in fnmatch.
+  try { return new RegExp(`^${re}$`, "s").test(name); } catch { return false; }
 }
 
 /**
@@ -119,9 +87,7 @@ async function reference(client: pg.ClientBase, rel: string, column: string, con
   try {
     await client.query(`CREATE TEMP TABLE _fw_ref (LIKE ${rel})`);
     await client.query(`CREATE POLICY _fw_ref_p ON pg_temp._fw_ref USING (${pred}) WITH CHECK (${pred})`);
-    const { rows } = await client.query(
-      "SELECT qual FROM pg_policies WHERE tablename = '_fw_ref' AND policyname = '_fw_ref_p' " +
-      "AND schemaname = pg_my_temp_schema()::regnamespace::text");
+    const { rows } = await client.query(q("reference_qual"));
     return rows[0] ? [rows[0].qual, null] : [null, "no result"];
   } catch (err) {
     return [null, String((err as Error).message).split("\n")[0] ?? "error"];
@@ -151,10 +117,7 @@ export async function firewallObjects(client: pg.ClientBase): Promise<{ ok: bool
     }));
   const diff: string[] = [];
   for (const w of want) {
-    const { rows: [f] } = await client.query(
-      `SELECT prosrc, prosecdef, proconfig, provolatile, l.lanname, format_type(prorettype, NULL) AS ret
-       FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang WHERE p.oid = to_regprocedure($1)`,
-      [`public.${w.name}(${w.sig})`]);
+    const { rows: [f] } = await client.query(q("fw_function"), [`public.${w.name}(${w.sig})`]);
     if (!f) { diff.push(`${w.name} (missing)`); continue; }
     const path = /SET search_path = ([^\n;]+?)\s*$/m.exec(w.tail)?.[1];
     const what = [
@@ -166,28 +129,16 @@ export async function firewallObjects(client: pg.ClientBase): Promise<{ ok: bool
     ].filter(Boolean);
     if (what.length) diff.push(`${w.name} (${what.join(", ")})`);
   }
-  const { rows: extra } = await client.query(
-    `SELECT p.oid::regprocedure::text AS fn FROM pg_proc p
-     WHERE p.pronamespace = 'public'::regnamespace AND p.proname LIKE '#_firewall#_%' ESCAPE '#'
-       AND NOT (p.proname || '(' || oidvectortypes(p.proargtypes) || ')') = ANY($1)
-     ORDER BY 1`,
-    [want.map((w) => `${w.name}(${w.sig})`)]);
+  const { rows: extra } = await client.query(q("fw_extra"), [want.map((w) => `${w.name}(${w.sig})`)]);
   if (extra.length) diff.push(`extra ${extra.map((e) => e.fn).join(", ")}`);
-  const { rows: owners } = await client.query(
-    `SELECT pg_get_userbyid(o.owner) AS owner, r.rolsuper AS super, string_agg(o.name, ', ' ORDER BY o.name) AS objects
-     FROM (SELECT relname::text AS name, relowner AS owner FROM pg_class
-           WHERE relnamespace = 'public'::regnamespace AND relname LIKE '#_firewall#_%' ESCAPE '#'
-           UNION ALL SELECT proname::text, proowner FROM pg_proc
-           WHERE pronamespace = 'public'::regnamespace AND proname LIKE '#_firewall#_%' ESCAPE '#') o
-     JOIN pg_roles r ON r.oid = o.owner
-     GROUP BY o.owner, r.rolsuper ORDER BY count(*) DESC`);
+  const { rows: owners } = await client.query(q("fw_owners"));
   const mixed = owners.length > 1 && owners.some((o) => !o.super);
   if (mixed) {
     diff.push(`more than one owner (${owners.map((o) => `${o.owner}: ${o.objects}`).join("; ")}): ` +
-              "objects another role planted? drop those and re-run migrate");
+              "objects another role planted? drop those and re-run the migration");
   }
   return { ok: diff.length === 0, detail: diff.length
-    ? `differ from the migration: ${diff.join("; ")}${mixed ? "" : ": re-run migrate"}`
+    ? `differ from the migration: ${diff.join("; ")}${mixed ? "" : ": re-run the migration"}`
     : "match the migration, one owner" };
 }
 
@@ -221,7 +172,7 @@ async function scanTables(client: pg.ClientBase, opts: {
   const exclude = opts.exclude ?? DEFAULT_EXCLUDED;
   const out: TableReport[] = [], excluded: string[] = [];
   for (const schema of schemas) {
-  const { rows } = await client.query(SQL, [schema, column]);
+  const { rows } = await client.query(q("scan_tables"), [schema, column]);
   for (const r of rows) {
     if (exclude.some((p) => globMatch(p, r.table))) { excluded.push(`${schema}.${r.table}`); continue; }
     const policies: [string, string, string[], string | null, string | null][] = r.policies;
