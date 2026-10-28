@@ -135,7 +135,9 @@ Run it from the repo root. It scopes every SQL-looking string in a `tools/call` 
   run: python -m hooks.scanner --dsn $DATABASE_URL --strict
 ```
 
-Run it from the repo root. It reads the schema (empty tables included) and lists every non-excluded table with the tenant column, in `engines.<engine>.schema` (defaults: PostgreSQL `public`, MySQL the current database, Oracle the connecting user; SQL Server: all schemas). Oracle passes with an enabled `FN_TENANT_ISOLATION` policy covering all four statement types. On PostgreSQL a table passes only when RLS is enabled AND forced, all four firewall policies (`_sel`, `_ins`, `_upd`, `_del`) exist on that exact `<schema>.<table>`, and no other permissive policy exists. `--strict` fails the build on any unprotected table; `--json` shows `rls_forced`, `missing_policies` and `extra_permissive_policies`. Run it locally first to review the output before adding it to CI.
+For a Node or TypeScript project on PostgreSQL, use the CLI instead (no Python): `npx db-firewall scan --url $DATABASE_URL --strict`, and after deploys `npx db-firewall verify --url $APP_URL --tenant <a real tenant id>`, which connects as the app's role and tests the isolation (see `packages/cli/README.md`).
+
+Run it from the repo root. It reads the schema (empty tables included) and lists every non-excluded table with the tenant column, in `engines.<engine>.schema` (defaults: PostgreSQL `public`, MySQL the current database, Oracle the connecting user; SQL Server: all schemas). Oracle passes with an enabled `FN_TENANT_ISOLATION` policy covering all four statement types. On PostgreSQL a table passes only when RLS is enabled AND forced, all four firewall policies (`_sel`, `_ins`, `_upd`, `_del`) exist on that exact `<schema>.<table>` with the migration's exact predicate, and (in permissive mode) no other permissive policy exists. `--strict` fails the build on any unprotected table; `--json` shows `rls_forced`, `missing_policies` and `extra_permissive_policies`. Run it locally first to review the output before adding it to CI.
 
 ## Step 5: Seed Tenant Mappings
 

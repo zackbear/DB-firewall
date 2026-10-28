@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-10-28: Node CLI (PR #13)
+
+- **`db-firewall` CLI** (`packages/cli`, `npx db-firewall`), for PostgreSQL:
+  - `migrate` runs the repo's `001_postgresql.sql` (shipped unchanged) with
+    `--column`, `--schema` and `--mode permissive|restrictive`, then prints the
+    scan.
+  - `scan` ports the Python PostgreSQL scanner, including the exact-predicate
+    check, with the same report fields. `--strict` exits 1 when a table is
+    unprotected.
+  - `verify` connects as the app's role and tests the behaviour: the role,
+    the policies, no rows without a tenant, only the tenant's rows with one,
+    and a refused cross-tenant insert. Every check is rolled back.
+  - Live tests in the `typescript` CI job. Not yet published to npm.
+
 ## 2026-10-28: TypeScript package and restrictive policies (PR #12)
 
 - **`@db-firewall/pg`** (`packages/ts`): tenant isolation for TypeScript on

@@ -239,6 +239,7 @@ In both modes the database-native RLS/VPD policy remains the second layer: the r
 | **MCP Servers** | `mcp_wrapper.py` stdio proxy |
 | **LangChain** | Wrap the connection before passing to agent |
 | **TypeScript** (node-postgres, postgres.js, Drizzle, AI SDK) | [`@db-firewall/pg`](packages/ts/README.md): `withTenant`, `bindTenant`, `assertSafeRole` (PostgreSQL RLS) |
+| **Node CLI** (PostgreSQL) | [`npx db-firewall`](packages/cli/README.md) `migrate` / `scan` / `verify` (no Python needed) |
 
 Web integrations take the tenant from a verified source: `tenant_id_source`, or
 by default `request.tenant_id` / the session (Django), `request.state.tenant_id`
@@ -466,6 +467,7 @@ db-firewall/
 │   ├── scanner.py                # CI/CD security scanner (CLI)
 │   └── scan_engines.py           # per-engine checks (PostgreSQL, MySQL, SQL Server, Oracle, SQLite)
 ├── packages/ts/                  # @db-firewall/pg: TypeScript tenant transactions + AI SDK tool binding
+├── packages/cli/                 # db-firewall: Node CLI (migrate, scan, verify) for PostgreSQL
 ├── tests/                        # see "Running the tests"
 ├── requirements.txt              # core + test dependencies
 ├── requirements-adapters.txt     # optional NoSQL drivers

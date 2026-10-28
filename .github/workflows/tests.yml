@@ -85,7 +85,8 @@ jobs:
           ! grep -qi "skipped" live.txt
 
   typescript:
-    # packages/ts (@db-firewall/pg) against PostgreSQL with the real migration.
+    # packages/ts (@db-firewall/pg) and packages/cli (db-firewall) against
+    # PostgreSQL with the real migration.
     runs-on: ubuntu-latest
     timeout-minutes: 10
     services:
@@ -109,6 +110,11 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: packages/ts/package-lock.json
+          cache-dependency-path: |
+            packages/ts/package-lock.json
+            packages/cli/package-lock.json
       - run: npm ci
       - run: npm test
+      - name: CLI (db-firewall migrate / scan / verify)
+        working-directory: packages/cli
+        run: npm ci && npm test
