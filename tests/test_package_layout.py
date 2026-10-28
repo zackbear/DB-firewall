@@ -45,6 +45,18 @@ def test_log_once_flags_read_live_and_restore(monkeypatch):
     web._warned_untrusted_header = False
 
 
+def test_log_once_flag_delete_restores_instead_of_removing():
+    """pytest >= 9.2 undoes a monkeypatch of a name missing from the target's
+    __dict__ with delattr. For a live flag that must restore the owner's value,
+    not remove the flag the code reads with `global`."""
+    web._warned_untrusted_header = True
+    db_firewall._warned_untrusted_header = False      # what monkeypatch.setattr does
+    assert web._warned_untrusted_header is False
+    delattr(db_firewall, "_warned_untrusted_header")  # what pytest 9.2's undo does
+    assert web._warned_untrusted_header is True
+    web._warned_untrusted_header = False
+
+
 def test_delete_reaches_owner(monkeypatch):
     with monkeypatch.context() as m:
         m.delattr(db_firewall, "TABLE_CACHE_TTL")

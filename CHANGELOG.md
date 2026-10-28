@@ -13,6 +13,11 @@
   how sqlglot parses, so upgrade only when the suite and the corpus pass.
 - **`rewriter: regex` is deprecated** and will be removed in the next major
   version. It logs a warning once per process.
+- **pytest 9.2 compatibility.** pytest 9.2 undoes a monkeypatch of a name
+  that is not in the module's `__dict__` with `delattr`. For the package's
+  log-once flags (`_warned_*`) that deleted the flag from its module, and later
+  code that reads it failed. A delete through the package now restores the
+  earlier value. Found when CI picked up pytest 9.2.0.
 
 ## 2026-10-26: config sections, migrations, Oracle (PR #10)
 
