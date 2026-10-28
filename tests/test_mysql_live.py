@@ -23,6 +23,8 @@ pytest.importorskip("sqlglot")
 
 ROOT = os.path.join(os.path.dirname(__file__), '..')
 sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.dirname(__file__))
+from attack_corpus import READS, WRITES  # noqa: E402
 from hooks.scan_engines import scan_tables  # noqa: E402
 from middleware.db_firewall import (DBEngine, detect_engine, load_config, pool_checkin,  # noqa: E402
                                     protect, purge_audit, run_migration)
@@ -273,3 +275,48 @@ def test_scanner(conn, cfg):
     assert report[LONG]["protected"] is True                 # hashed name stem
     assert report["late_table"]["protected"] is False
     assert "plain" not in report and "notes" not in report
+
+
+# ---------------------------------------------------------------- attack corpus
+
+USERS = [("admin", None, None), ("app", "dbfw_app", APP_PW)]
+
+
+@pytest.mark.parametrize("rewriter", ["ast", "regex"])
+@pytest.mark.parametrize("who,user,password", USERS, ids=[u[0] for u in USERS])
+@pytest.mark.parametrize("label,sql", READS, ids=[r[0] for r in READS])
+def test_corpus_read(rewriter, who, user, password, label, sql, cfg):
+    cfg["rewriter"] = rewriter
+    c = _connect(user, password)
+    try:
+        cur = protect(c, tenant_id="A", config=cfg).cursor()
+        try:
+            cur.execute(sql)
+            rows = cur.fetchall()
+        except Exception:               # refused, or the database rejected it: not a leak
+            return
+        assert not any("B" in map(str, row) for row in rows), f"{label}: returned {rows}"
+    finally:
+        c.rollback()
+        c.close()
+
+
+@pytest.mark.parametrize("rewriter", ["ast", "regex"])
+@pytest.mark.parametrize("who,user,password", USERS, ids=[u[0] for u in USERS])
+@pytest.mark.parametrize("label,sql", WRITES, ids=[w[0] for w in WRITES])
+def test_corpus_write(rewriter, who, user, password, label, sql, cfg):
+    cfg["rewriter"] = rewriter
+    c = _connect(user, password)
+    try:
+        try:
+            protect(c, tenant_id="A", config=cfg).cursor().execute(sql)
+        except Exception:               # refused, or the database rejected it
+            pass
+        raw = c.cursor()                # same session: sees its own uncommitted writes
+        raw.execute("SELECT @_fw_tenant_id")          # MySQL folds the spellings to this one
+        assert raw.fetchone() == ("A",), f"{label}: tenant variable changed"
+        raw.execute("SELECT id, org_id FROM orders WHERE BINARY org_id = 'B' ORDER BY id")
+        assert raw.fetchall() == ((2, "B"),), f"{label}: tenant B rows changed"
+    finally:
+        c.rollback()
+        c.close()

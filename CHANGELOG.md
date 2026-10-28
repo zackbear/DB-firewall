@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-10-28: live CI and attack corpus (PR #11)
+
+- **CI runs the live suites** on MySQL 8.4 and SQL Server 2022 for every pull
+  request, and on Oracle Database Free 23ai every night.
+- **Attack corpus** (`tests/attack_corpus.py`): the reads and writes the PR 10
+  reviews used to reach another tenant. `tests/test_mysql_live.py` runs each one
+  through `protect()` as tenant A, with both rewriters, as an admin and as the
+  app user with the README grants. Any row of tenant B returned or changed, or a
+  changed tenant variable, fails the build. Add each new bypass there first.
+- **sqlglot is pinned** (`sqlglot==30.24.0`). The rewriter's safety depends on
+  how sqlglot parses, so upgrade only when the suite and the corpus pass.
+- **`rewriter: regex` is deprecated** and will be removed in the next major
+  version. It logs a warning once per process.
+
 ## 2026-10-26: config sections, migrations, Oracle (PR #10)
 
 ### Upgrading

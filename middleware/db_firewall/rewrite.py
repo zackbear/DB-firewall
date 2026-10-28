@@ -2,6 +2,7 @@
 
 import re
 import logging
+import warnings
 from typing import Dict, List
 
 try:                                    # package import (middleware.db_firewall)
@@ -208,7 +209,23 @@ def rewrite_query(sql: str, tenant_id: str, config: dict,
             protect_ops=protect,
             allow_tenant_placeholder=bool(config.get("allow_tenant_placeholder", False)))
 
+    _warn_regex_deprecated()
     return _rewrite_query_regex(sql, tenant_id, config, is_protected)
+
+
+_regex_warned = False
+
+
+def _warn_regex_deprecated() -> None:
+    """Once per process: the regex rewriter is deprecated and will be removed."""
+    global _regex_warned
+    if not _regex_warned:
+        _regex_warned = True
+        msg = ("DB Firewall: rewriter 'regex' is deprecated and will be removed in the "
+               "next major version; it has had cross-tenant bypasses the 'ast' rewriter "
+               "did not. Use rewriter: ast (needs sqlglot).")
+        warnings.warn(msg, DeprecationWarning, stacklevel=3)
+        logger.warning(msg)
 
 
 def _protected_predicate(config: dict, connection, engine):
@@ -241,6 +258,7 @@ def check_no_tenant(sql: str, config: dict, connection=None, engine: str = None)
         _sqlr.rewrite(sql, None, config.get("tenant_column", "tenant_id"),
                       _protected_predicate(config, connection, engine), engine)
         return
+    _warn_regex_deprecated()
     if _strip_sql(sql).lstrip().upper().startswith(_DML_STARTS + _UNSAFE_STARTS):
         raise PermissionError(_sqlr._NO_TENANT_MSG)
 

@@ -1,5 +1,7 @@
 # Core middleware (middleware/db_firewall/). Database drivers are yours to pick.
-sqlglot>=25        # AST query rewriter (default `rewriter: "ast"`); set rewriter: "regex" to run without it
+# Exact pin: the rewriter's safety depends on how sqlglot parses. Upgrade only
+# when the full suite and the live attack corpus (tests/attack_corpus.py) pass.
+sqlglot==30.24.0   # AST query rewriter (default `rewriter: "ast"`)
 pyyaml>=6.0        # optional: .db-firewall.yaml config (JSON works without it)
 
 # Test-only

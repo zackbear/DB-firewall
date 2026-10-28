@@ -1,0 +1,58 @@
+name: oracle-nightly
+
+# Oracle Database Free is a large image and slow to start, so it runs nightly,
+# on demand, and on pull requests that touch the Oracle files.
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "migrations/004_oracle.sql"
+      - "tests/test_oracle_live.py"
+      - "tests/live_setup/oracle_*.sql"
+      - ".github/workflows/oracle-nightly.yml"
+      - "middleware/db_firewall/**"
+
+jobs:
+  oracle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      oracle:
+        image: gvenzl/oracle-free:23-slim
+        env:
+          ORACLE_PASSWORD: DbfwCi_2026x
+          APP_USER: dbfw
+          APP_USER_PASSWORD: DbfwApp_2026x
+        ports: ["1521:1521"]
+        options: >-
+          --health-cmd healthcheck.sh
+          --health-interval 10s --health-timeout 10s --health-retries 60
+    env:
+      DBFW_ORA_DSN: "dbfw/DbfwApp_2026x@127.0.0.1:1521/FREEPDB1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -r requirements.txt oracledb
+      - name: Test data, migration as SYS, map row
+        run: |
+          ORA=${{ job.services.oracle.id }}
+          # The migration runs as SYS in the PDB, for the app schema, on ORG_ID.
+          { echo "ALTER SESSION SET CONTAINER = FREEPDB1;"; \
+            sed -e "s/^DEFINE SCHEMA_OWNER .*/DEFINE SCHEMA_OWNER   = 'DBFW'/" \
+                -e "s/^DEFINE TENANT_COLUMN .*/DEFINE TENANT_COLUMN   = 'ORG_ID'/" migrations/004_oracle.sql; \
+            echo "EXIT"; } > /tmp/mig.sql
+          docker cp tests/live_setup/oracle_before.sql $ORA:/tmp/before.sql
+          docker cp tests/live_setup/oracle_after.sql $ORA:/tmp/after.sql
+          docker cp /tmp/mig.sql $ORA:/tmp/mig.sql
+          docker exec $ORA sqlplus -s -L dbfw/DbfwApp_2026x@//localhost:1521/FREEPDB1 @/tmp/before.sql
+          docker exec $ORA sqlplus -s -L / as sysdba @/tmp/mig.sql
+          docker exec $ORA sqlplus -s -L dbfw/DbfwApp_2026x@//localhost:1521/FREEPDB1 @/tmp/after.sql
+      - name: Live suite (a skipped test fails the job)
+        run: |
+          set -o pipefail
+          python -m pytest -q -p no:cacheprovider -rs tests/test_oracle_live.py | tee live.txt
+          ! grep -qi "skipped" live.txt

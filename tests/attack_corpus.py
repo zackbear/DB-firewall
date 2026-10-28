@@ -1,0 +1,50 @@
+"""
+Attacks that tried to reach tenant B as tenant A, collected from the PR 10
+reviews. Every entry must be refused, scoped, or fail: a run that returns a
+tenant B row, changes one, or turns on the bypass marker is a bypass.
+
+Tables: orders(id, org_id) with rows (1, 'A') and (2, 'B'); notes has no
+tenant column. Add every new bypass here before fixing it.
+"""
+
+# (label, sql): reads aimed at row (2, 'B')
+READS = [
+    ("baseline", "SELECT id, org_id FROM orders"),
+    ("comma after derived table", "SELECT o.id, o.org_id FROM (SELECT 1) t, orders o"),
+    ("comma join", "SELECT o.id, o.org_id FROM notes n, orders o"),
+    ("comma with AS", "SELECT o.id, o.org_id FROM (SELECT 1) AS t, orders AS o"),
+    ("STRAIGHT_JOIN", "SELECT o.id, o.org_id FROM (SELECT 1) t STRAIGHT_JOIN orders o"),
+    ("parenthesised table", "SELECT id, org_id FROM (orders)"),
+    ("parenthesised, no space", "SELECT id, org_id FROM(orders)o"),
+    ("scalar subquery, no FROM", "SELECT (SELECT org_id FROM orders WHERE id = 2) x"),
+    ("scalar subquery, derived FROM", "SELECT (SELECT org_id FROM orders WHERE id = 2) x FROM (SELECT 1) t"),
+    ("UNION", "SELECT id, org_id FROM orders UNION SELECT id, org_id FROM orders"),
+    ("# comment after appended WHERE", "SELECT id, org_id FROM orders # x"),
+    ("-- without space", "SELECT id, org_id FROM orders --x"),
+    ("CTE", "WITH x AS (SELECT * FROM orders) SELECT id, org_id FROM x"),
+    ("FOR UPDATE", "SELECT id, org_id FROM orders FOR UPDATE"),
+    ("nested join parens", "SELECT o.id, o.org_id FROM (notes n, orders o)"),
+    ("LATERAL", "SELECT o.id, o.org_id FROM (SELECT 1) t, LATERAL (SELECT * FROM orders) o"),
+    ("TABLE command", "TABLE orders"),
+    ("derived then table", "SELECT * FROM (SELECT 1) t, orders"),
+    ("executable comment widens WHERE", "SELECT id, org_id FROM orders WHERE id > 0 /*! OR 1=1 */"),
+]
+
+# (label, sql): writes and bypass attempts
+WRITES = [
+    ("set variable behind #", "SET @x = 1 # @_fw_tenant_id = 'B'"),
+    ("set variable, multi-assignment", "SET @a = 1, @_fw_tenant_id = '__BYPASS__'"),
+    ("set variable, escaped name", "SET @'_fw_tenant_i\\d' = '__BYPASS__'"),
+    ("set variable, accented name", "SET @_fw_tenänt_id = '__BYPASS__'"),
+    ("assign variable in SELECT", "SELECT @'_fw_tenant_i\\d' := '__BYPASS__'"),
+    ("insert B", "INSERT INTO orders VALUES (50, 'B')"),
+    ("insert B from derived table", "INSERT INTO orders (id, org_id) SELECT 51, 'B' FROM (SELECT 1) t"),
+    ("multi-table update", "UPDATE orders o, (SELECT 1) t SET o.id = 99 WHERE o.id = 2"),
+    ("update behind #", "UPDATE orders SET id = 99 WHERE id = 2 # x"),
+    ("multi-table delete", "DELETE o FROM (SELECT 1) t, orders o WHERE o.id = 2"),
+    ("delete behind #", "DELETE FROM orders WHERE id = 2 # x"),
+    ("update all behind #", "UPDATE orders SET id = id + 100 # x"),
+    ("delete all behind #", "DELETE FROM orders # x"),
+    ("executable comment delete", "/*!DELETE FROM orders*/"),
+    ("retag own row as B", "UPDATE orders SET org_id = 'B' WHERE id = 1"),
+]

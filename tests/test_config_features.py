@@ -424,3 +424,12 @@ class TestMySQLGuard:
         from db_firewall.rewrite import validate_tenant_id
         with pytest.raises(ValueError):
             validate_tenant_id(tenant)
+
+
+def test_regex_rewriter_warns_once(cfg, monkeypatch):
+    from db_firewall import rewrite
+    monkeypatch.setattr(rewrite, "_regex_warned", False)
+    cfg["rewriter"] = "regex"
+    with pytest.warns(DeprecationWarning, match="deprecated"):
+        rewrite.rewrite_query("SELECT 1", "A", cfg, None, DBEngine.POSTGRESQL)
+    assert rewrite._regex_warned

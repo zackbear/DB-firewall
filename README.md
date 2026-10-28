@@ -184,7 +184,7 @@ Still **refused** (`PermissionError`, fail closed) because they cannot be proven
 
 **Driver entry points.** `ProtectedConnection` mediates `cursor()`, `execute()`, `executemany()`, `stream()`, `copy()` and `pipeline()`; `ProtectedCursor` mediates `execute()`, `executemany()`, `stream()` and `copy()`, all through one guard that applies the rewrite (tenant set) or the fail-closed check (no tenant). Any other attribute named like a SQL entry point (`execute*`, `copy*`, `executescript`, `callproc`, `exec_driver_sql`, …) raises `PermissionError` instead of being delegated, so a driver method the wrapper does not know cannot bypass it. The SQLAlchemy hook registers `before_cursor_execute` with `retval=True`, so the scoped statement is the one that executes.
 
-`rewriter: "regex"` (or `DB_FIREWALL_REWRITER=regex`) keeps the old dependency-free injector: it handles single-table statements and refuses every multi-scope shape above. With `rewriter: "ast"` and sqlglot missing, `protect()`'d queries raise `ImportError` rather than silently downgrading.
+`rewriter: "regex"` (or `DB_FIREWALL_REWRITER=regex`) keeps the old dependency-free injector: it handles single-table statements and refuses every multi-scope shape above. It is deprecated and will be removed in the next major version: it had cross-tenant read bypasses that the `ast` rewriter did not (see CHANGELOG), and it logs a warning once per process. With `rewriter: "ast"` and sqlglot missing, `protect()`'d queries raise `ImportError` rather than silently downgrading.
 
 In both modes the database-native RLS/VPD policy remains the second layer: the rewriter can only narrow a query, never widen it, and a statement that slips past it unscoped still hits the row policy.
 
@@ -333,7 +333,7 @@ Example `.db-firewall.yaml`:
 version: "1.0"
 tenant_column: "tenant_id"
 fail_mode: "closed"           # "closed" = no tenant → queries on protected tables refused (SAFE)
-rewriter: "ast"               # "ast" (sqlglot, default) or "regex" (legacy, no dependency)
+rewriter: "ast"               # "ast" (sqlglot, default) or "regex" (deprecated, no dependency)
 allow_tenant_placeholder: false   # INSERT ... (tenant_id) VALUES (%s) is refused unless true
 
 protect:

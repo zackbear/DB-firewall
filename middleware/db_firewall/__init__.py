@@ -49,7 +49,7 @@ _MISSING = object()
 # Names a submodule rebinds with `global` at run time (the log-once flags).
 # They are not copied onto the package, so reads stay live (module __getattr__).
 # tests/test_package_layout.py fails if a new `global` name is missing here.
-_LIVE = {"_warned_untrusted_header", "_warned_orphan_config"}
+_LIVE = {"_warned_untrusted_header", "_warned_orphan_config", "_regex_warned"}
 for _name in _LIVE:
     globals().pop(_name, None)
 
