@@ -72,6 +72,18 @@
   - **Migration:** the guard is two `DO` blocks, so no TEMP privilege is
     needed.
   - **`verify`** also fails on `TRIGGER` on any table.
+- From the fourth review round:
+  - **Migration:** it revokes `TRIGGER` and `TRUNCATE` on protected tables
+    from everyone but the owner. A trigger function, even in `pg_temp`, runs
+    in other tenants' sessions.
+  - **Python:** after a `release()` inside an open transaction, the next
+    tenant set on that connection resets it again first.
+  - **TS:**
+    - Drizzle relational queries work again (the full relational config is
+      passed).
+    - A pg client that fn ends no longer crashes the process.
+    - A transaction left aborted makes the call throw on Drizzle and
+      postgres.js too.
 - **Upgrade:** set `DB_FIREWALL_TENANT_KEY` in the app before re-running the
   migration, or set `tenant_context: plain`. PostgreSQL 13+ for signed.
 

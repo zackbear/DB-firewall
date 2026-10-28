@@ -175,6 +175,11 @@ async function onClient<T>(client: PgQueryable, pooled: { release(err?: Error | 
   const run: Run = async (text, values) => (await client.query(text, values)).rows;
   const state: ClientState = {};
   let failed: Error | undefined, discard = false, threw = false;
+  // SQL in fn can end its own backend (pg_terminate_backend): node-postgres
+  // then emits 'error' on the client, which would crash the process with no
+  // listener. Mark the client suspect instead; it is destroyed below.
+  const onError = (err: Error) => { state.suspect = err; };
+  (client as any).on?.("error", onError);
   try {
     return await tx(state);
   } catch (err) {
@@ -188,6 +193,7 @@ async function onClient<T>(client: PgQueryable, pooled: { release(err?: Error | 
       const entered = { ...state.entered, drivers: [...new Set([...state.entered.drivers, ...cached])] };
       try { discard = await resetOutside(run, entered); } catch (e) { failed = e as Error; }
     }
+    (client as any).removeListener?.("error", onError);
     pooled?.release(state.suspect ?? failed ?? (discard ? new Error("DB Firewall: session tampered with") : undefined));
     if (failed && !pooled && !threw) {
       // eslint-disable-next-line no-unsafe-finally
@@ -253,7 +259,10 @@ async function reservePostgres(sql: PostgresJs): Promise<any> {
     await r.unsafe(open);
     try {
       const res = await settle(await fn(r));
-      await r.unsafe(close);
+      const done: any = await r.unsafe(close);
+      if (done?.command === "ROLLBACK") {              // fn left the transaction aborted
+        throw new SessionResetError("DB Firewall: the function left the transaction aborted; it was rolled back");
+      }
       return res;
     } catch (err) {
       await r.unsafe(undo).catch(() => {});
@@ -349,7 +358,9 @@ export async function withTenantDrizzle<T>(
     } catch (err) { r.release(); throw err; }
     return onReserved(r, (state) => bound.transaction(async (tx) => {
       state.entered = await enter(runOn(tx), tenant);
-      return withHandle(tx, fn);
+      const result = await withHandle(tx, fn);
+      await alive(runOn(tx));
+      return result;
     }));
   }
   if (isPgPool(base) || isPgClient(base)) {
@@ -361,10 +372,22 @@ export async function withTenantDrizzle<T>(
     } catch (err) { pooled?.release(); throw err; }
     return onClient(client, pooled, (state) => bound.transaction(async (tx) => {
       state.entered = await enter(runOn(tx), tenant);
-      return withHandle(tx, fn);
+      const result = await withHandle(tx, fn);
+      await alive(runOn(tx));
+      return result;
     }));
   }
   throw new TypeError("DB Firewall: withTenantDrizzle supports Drizzle on node-postgres or postgres.js");
+}
+
+/** Drizzle hides COMMIT's result, and COMMIT of an aborted transaction rolls it
+ *  back without an error: probe first, so the call fails instead. */
+async function alive(run: Run): Promise<void> {
+  try {
+    await run("SELECT 1");
+  } catch (err) {
+    throw new SessionResetError(`DB Firewall: the function left the transaction aborted (${(err as Error).message})`);
+  }
 }
 
 /** The same Drizzle database (dialect, relational schema, session options such
@@ -374,8 +397,11 @@ function rebind(db: DrizzleDb, client: unknown): DrizzleDb {
   if (typeof d.constructor !== "function" || typeof d.session?.constructor !== "function" || !d.dialect || !d._) {
     throw new TypeError("DB Firewall: unsupported Drizzle version (cannot hold one connection for the call)");
   }
-  const session = new d.session.constructor(client, d.dialect, d._.schema, d.session.options);
-  return new d.constructor(d.dialect, session, d._.schema);
+  // The relational config Drizzle built (for tx.query.*), not only the tables.
+  const schema = d._.schema
+    ? { schema: d._.schema, fullSchema: d._.fullSchema, tableNamesMap: d._.tableNamesMap } : undefined;
+  const session = new d.session.constructor(client, d.dialect, schema, d.session.options);
+  return new d.constructor(d.dialect, session, schema);
 }
 
 /**

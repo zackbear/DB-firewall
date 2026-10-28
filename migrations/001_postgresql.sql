@@ -315,6 +315,7 @@ $$ LANGUAGE plpgsql STABLE;
 DO $$
 DECLARE
     r RECORD;
+    g RECORD;
     policy_name TEXT;
     legacy_name TEXT;
     col TEXT := COALESCE(NULLIF(current_setting('dbfw.tenant_column', true), ''), 'tenant_id');
@@ -369,6 +370,19 @@ BEGIN
 
         -- Force RLS even for table owners
         EXECUTE format('ALTER TABLE %I.%I FORCE ROW LEVEL SECURITY', r.table_schema, r.table_name);
+
+        -- RLS does not cover TRUNCATE (it empties every tenant's rows) or what
+        -- a trigger does: with TRIGGER, a role attaches its own function (even
+        -- one in pg_temp) that runs in other tenants' sessions as them. Only
+        -- the owner keeps either.
+        FOR g IN
+            SELECT a.grantee, a.privilege_type FROM pg_class c, aclexplode(c.relacl) a
+            WHERE c.oid = format('%I.%I', r.table_schema, r.table_name)::regclass
+              AND a.grantee <> c.relowner AND a.privilege_type IN ('TRIGGER', 'TRUNCATE')
+        LOOP
+            EXECUTE format('REVOKE %s ON %I.%I FROM %s', g.privilege_type, r.table_schema, r.table_name,
+                           CASE g.grantee WHEN 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(g.grantee)) END);
+        END LOOP;
 
         -- Drop existing policies if re-running (idempotent). Permissive
         -- policies OR together, so every earlier generation must go: the

@@ -27,6 +27,14 @@ _baselines: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 _DEFAULT_BASELINE = json.dumps({"role": "none"})
 
 
+# Connections released inside an open transaction: the app commits after the
+# reset, and a deferred trigger firing at that COMMIT could undo it. The next
+# _set_context_postgres on such a connection resets again first.
+_reset_pending: "weakref.WeakSet" = weakref.WeakSet()
+
+_RESET = "public._firewall_reset_session(%s::pg_catalog.text::pg_catalog.jsonb)"
+
+
 def _remember_baseline(connection, settings) -> None:
     if settings is None:
         return
@@ -84,6 +92,13 @@ def _set_context_postgres(connection, tenant_id: str):
     global _warned_unsigned
     key = tenant_key()
     cursor = connection.cursor()
+    try:
+        pending = connection in _reset_pending
+    except TypeError:
+        pending = False
+    if pending:
+        cursor.execute(f"SELECT {_RESET}", (_baseline(connection),))
+        _reset_pending.discard(connection)
     if key is None:
         if not _warned_unsigned:
             _warned_unsigned = True
@@ -121,10 +136,13 @@ def _clear_context_postgres(connection):
     # LISTEN, advisory locks. It restores the settings and role the connection
     # had before the middleware first set a tenant on it.
     cursor.execute("SELECT set_config('app.current_tenant', '', false), "
-                   "set_config('app.tenant_sig', '', false), "
-                   "public._firewall_reset_session(%s::pg_catalog.text::pg_catalog.jsonb)",
-                   (_baseline(connection),))
+                   f"set_config('app.tenant_sig', '', false), {_RESET}", (_baseline(connection),))
     cursor.close()
+    if not was_idle:
+        try:
+            _reset_pending.add(connection)
+        except TypeError:           # no weak reference: pool_checkin is then the only safe path
+            pass
     if was_idle and not _is_autocommit(connection) and hasattr(connection, "commit"):
         connection.commit()
 

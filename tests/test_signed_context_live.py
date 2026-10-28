@@ -335,3 +335,45 @@ def test_a_reset_the_agent_broke_closes_the_connection():
             assert c.closed
         finally:
             db_context._baseline = orig
+
+
+def test_release_inside_a_transaction_is_reset_again_at_the_next_tenant():
+    """release() inside an open transaction resets before the app's COMMIT; a
+    deferred trigger firing at that COMMIT (it needs CREATE in a schema, which
+    verify fails) must not reach the next tenant."""
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute("DROP SCHEMA IF EXISTS sg_plant CASCADE")
+        c.execute("CREATE SCHEMA sg_plant")
+        c.execute(f"GRANT CREATE, USAGE ON SCHEMA sg_plant TO {ROLE}")
+    try:
+        with psycopg.connect(DSN) as c:
+            c.execute(f"SET ROLE {ROLE}")
+            c.commit()
+            _set_context_postgres(c, "A")
+            c.execute("CREATE TABLE sg_plant.t (x int)")
+            c.execute("CREATE FUNCTION sg_plant.f() RETURNS trigger LANGUAGE plpgsql AS "
+                      "$$ BEGIN PERFORM set_config('search_path', 'sg_plant, public', false); RETURN NULL; END $$")
+            c.execute("CREATE CONSTRAINT TRIGGER late AFTER INSERT ON sg_plant.t DEFERRABLE INITIALLY DEFERRED "
+                      "FOR EACH ROW EXECUTE FUNCTION sg_plant.f()")
+            c.execute("INSERT INTO sg_plant.t VALUES (1)")
+            db_context.clear_db_context(c, DBEngine.POSTGRESQL)          # release(), transaction still open
+            c.commit()                                                     # the trigger fires here
+            assert c.execute("SHOW search_path").fetchone()[0] == "sg_plant, public"
+            c.commit()
+            _set_context_postgres(c, "B")                                  # the next tenant
+            assert c.execute("SHOW search_path").fetchone()[0] == '"$user", public'
+    finally:
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute("DROP SCHEMA sg_plant CASCADE")
+
+
+def test_migration_revokes_trigger_and_truncate_on_protected_tables():
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute(f"GRANT TRIGGER, TRUNCATE ON {SCHEMA}.docs TO {ROLE}")
+        c.execute(f"GRANT TRIGGER ON {SCHEMA}.docs TO PUBLIC")
+    _migrate()
+    with psycopg.connect(DSN) as c:
+        privs = c.execute(f"SELECT has_table_privilege(%s, '{SCHEMA}.docs', 'TRIGGER'), "
+                          f"has_table_privilege(%s, '{SCHEMA}.docs', 'TRUNCATE'), "
+                          f"has_table_privilege(%s, '{SCHEMA}.docs', 'SELECT')", (ROLE, ROLE, ROLE)).fetchone()
+    assert privs == (False, False, True)

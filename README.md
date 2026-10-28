@@ -139,7 +139,17 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
   does not survive a reserved connection being ended). A node-postgres
   connection is also destroyed when the function replaced or removed one of
   the driver's prepared statements. In Python a reset that fails closes the
-  connection, and `pool_checkin` raises so the pool drops it.
+  connection, and `pool_checkin` raises so the pool drops it. A `release()`
+  inside an open transaction is followed by the app's COMMIT, where a deferred
+  trigger could still run, so the next tenant set on that connection resets
+  it again first.
+* **Triggers and TRUNCATE.** RLS does not cover what a trigger does or
+  `TRUNCATE`. With `TRIGGER` on a table, a role can attach its own function
+  (even one in `pg_temp`) that then runs in other tenants' sessions as those
+  tenants. The migration revokes `TRIGGER` and `TRUNCATE` on every protected
+  table from everyone but the owner, and `verify` fails on `TRIGGER` on any
+  table. Re-run the migration after granting privileges (`GRANT ALL` includes
+  both).
   The reset costs about 1 ms per call. [Inference] It was measured on localhost.
 * **The migration protects itself.** It binds every name and operator in
   `pg_catalog`, so a planted operator such as `public.=` for `varchar, text`

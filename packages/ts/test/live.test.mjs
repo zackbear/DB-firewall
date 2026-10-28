@@ -205,6 +205,10 @@ describe("node-postgres", live, () => {
   it("a deferred trigger cannot undo the reset (reset after COMMIT)", async () => {
     await assertDeferredTriggerReset(pool, async (c, q) => (await c.query(q)).rows);
   });
+  it("fn ending its own backend fails the call, not the process", async () => {
+    await assert.rejects(withTenant(pool, "A", (c) => c.query("SELECT pg_terminate_backend(pg_backend_pid())")));
+    assert.deepEqual(ids(await withTenant(pool, "A", async (c) => (await c.query(SELECT)).rows)), [1]);
+  });
   it("a connection whose driver statement fn removed is discarded", async () => {
     const Q = { name: "docs_q", text: SELECT };
     const pid = await withTenant(pool, "A", async (c) => {
@@ -254,6 +258,10 @@ describe("postgres.js", live, () => {
   });
   it("a deferred trigger cannot undo the reset (reset after COMMIT)", async () => {
     await assertDeferredTriggerReset(sql, (tx, q) => tx.unsafe(q));
+  });
+  it("a transaction fn left aborted fails the call", async () => {
+    await assert.rejects(withTenant(sql, "A", async (tx) => { await tx.unsafe("SELECT 1/0").catch(() => {}); }),
+                         /aborted/);
   });
   it("tx.savepoint works and a nested begin is refused", async () => {
     const rows = await withTenant(sql, "A", (tx) => tx.savepoint((sp) => sp`SELECT id FROM ts_app.docs`));
@@ -305,6 +313,14 @@ describe("Drizzle", live, () => {
   });
   it("a deferred trigger cannot undo the reset (reset after COMMIT)", async () => {
     await assertDeferredTriggerReset(db, async (tx, q) => (await tx.execute(dsql.raw(q))).rows);
+  });
+  it("relational queries (tx.query) work", async () => {
+    const rdb = drizzle(pool, { schema: { docs } });
+    assert.deepEqual(ids(await withTenant(rdb, "A", (tx) => tx.query.docs.findMany())), [1]);
+  });
+  it("a transaction fn left aborted fails the call", async () => {
+    await assert.rejects(withTenant(db, "A", async (tx) => { await tx.execute(dsql.raw("SELECT 1/0")).catch(() => {}); }),
+                         /aborted/);
   });
   it("late queries, nested calls and a raw Drizzle transaction are refused", async () => {
     let kept;
