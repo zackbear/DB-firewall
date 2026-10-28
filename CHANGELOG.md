@@ -1,5 +1,20 @@
 # Changelog
 
+## 2026-10-28: PostgreSQL 14 to 17 and the attack corpus in CI (PR #16)
+
+- **CI runs on PostgreSQL 14, 15, 16 and 17:** the Python suite (with the
+  coverage gate), `@db-firewall/pg` and the CLI.
+- **Attack corpus for PostgreSQL** (`tests/attacks/postgresql.sql`): 55
+  attacks from the PR 13 to 15 reviews and 5 safe patterns. On every version,
+  `verify` must fail each attack with the named check, and each attack's leak
+  query, run as the app for tenant A, must show tenant B's row (so the case
+  is real on that version). Safe patterns must pass. The fixture must pass
+  before and after, so an incomplete undo fails too. The CLI's own list of
+  failing cases moved there.
+- The CLI tests revoke `CREATE` on schema `public` from `PUBLIC` (PostgreSQL
+  14 grants it, and `verify` fails on it), and skip what needs a newer
+  server.
+
 ## 2026-10-28: Strict mode and hardening (PR #15)
 
 - **`db-firewall verify --strict`:** an allowlist instead of a list of known

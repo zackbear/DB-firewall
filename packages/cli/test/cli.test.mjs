@@ -53,12 +53,15 @@ describe("migrate, scan, verify", live, () => {
   const APP = () => ["--url", appUrl(), ...scope];
   const scope = ["--schema", S];
   const failed = (checks) => checks.filter((c) => c.ok === false).map((c) => `${c.table}: ${c.check}`);
+  let major = 0;
   before(async () => {
+    major = Math.floor(Number((await sql("SHOW server_version_num"))[0].server_version_num) / 10000);
     await sql(`DROP SCHEMA IF EXISTS ${S} CASCADE; DROP SCHEMA IF EXISTS ${S}_other CASCADE; CREATE SCHEMA ${S};
       DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${ROLE}')
         THEN CREATE ROLE ${ROLE} LOGIN PASSWORD '${PW}'; END IF; END $$;
       CREATE TABLE ${S}.docs (id serial, tenant_id text);
       INSERT INTO ${S}.docs (tenant_id) VALUES ('A'), ('B');
+      REVOKE CREATE ON SCHEMA public FROM PUBLIC;          -- PostgreSQL 14 grants it
       CREATE TABLE ${S}.open_t (id int, tenant_id text);
       INSERT INTO ${S}.open_t VALUES (1, 'A'), (2, 'B');
       CREATE TABLE ${S}.feature_flags (id int, tenant_id text);     -- the migration protects it
@@ -151,156 +154,8 @@ describe("migrate, scan, verify", live, () => {
     assert.ok(failed(r.data.checks).includes("-: tenant has rows"));
   });
 
-  const blockers = [
-    ["a role it can SET ROLE to has BYPASSRLS", "-: role",
-     `CREATE ROLE dbfw_cli_bypass NOLOGIN BYPASSRLS; GRANT dbfw_cli_bypass TO ${ROLE};`,
-     `REVOKE dbfw_cli_bypass FROM ${ROLE}; DROP ROLE dbfw_cli_bypass;`],
-    ["it owns the table", `${S}.docs: role does not own the table`,
-     `ALTER TABLE ${S}.docs OWNER TO ${ROLE};`,
-     // An owner change merges the role's own grant into the owner entry: grant it back.
-     `ALTER TABLE ${S}.docs OWNER TO CURRENT_USER; GRANT SELECT, INSERT ON ${S}.docs TO ${ROLE};`],
-    ["it can write the bypass list", "-: cannot write firewall tables",
-     `GRANT INSERT ON public._firewall_bypass_roles TO ${ROLE};`,
-     `REVOKE INSERT ON public._firewall_bypass_roles FROM ${ROLE};`],
-    ["it has TRUNCATE", `${S}.docs: no TRUNCATE`,
-     `GRANT TRUNCATE ON ${S}.docs TO ${ROLE};`, `REVOKE TRUNCATE ON ${S}.docs FROM ${ROLE};`],
-    ["a view runs as a superuser", "-: no RLS-bypassing views or functions",
-     `CREATE VIEW ${S}.v_docs AS SELECT * FROM ${S}.docs; GRANT SELECT ON ${S}.v_docs TO ${ROLE};`,
-     `DROP VIEW ${S}.v_docs;`],
-    ["a materialized view", "-: no RLS-bypassing views or functions",
-     `CREATE MATERIALIZED VIEW ${S}.m_docs AS SELECT * FROM ${S}.docs; GRANT SELECT ON ${S}.m_docs TO ${ROLE};`,
-     `DROP MATERIALIZED VIEW ${S}.m_docs;`],
-    ["a SECURITY DEFINER function", "-: no RLS-bypassing views or functions",
-     `CREATE FUNCTION ${S}.all_docs() RETURNS SETOF ${S}.docs LANGUAGE sql SECURITY DEFINER AS 'SELECT * FROM ${S}.docs';
-      GRANT EXECUTE ON FUNCTION ${S}.all_docs() TO ${ROLE};`, `DROP FUNCTION ${S}.all_docs();`],
-    ["a tenant table in another schema", "-: no tenant tables in other schemas",
-     `CREATE SCHEMA ${S}_other; CREATE TABLE ${S}_other.docs (id int, tenant_id text);
-      GRANT USAGE ON SCHEMA ${S}_other TO ${ROLE}; GRANT SELECT ON ${S}_other.docs TO ${ROLE};`,
-     `DROP SCHEMA ${S}_other CASCADE;`],
-    // Round 2: ownership of public / the firewall objects, column grants, view chains, other schemas.
-    ["it owns the database (so schema public)", "-: does not own firewall objects",
-     `ALTER DATABASE ${DB} OWNER TO ${ROLE};`, `ALTER DATABASE ${DB} OWNER TO CURRENT_USER;`],
-    ["it owns a firewall function", "-: does not own firewall objects",
-     `ALTER FUNCTION public._firewall_is_bypass_role(text) OWNER TO ${ROLE};`,
-     `ALTER FUNCTION public._firewall_is_bypass_role(text) OWNER TO CURRENT_USER;`],
-    ["it has a column grant on the bypass list", "-: cannot write firewall tables",
-     `GRANT INSERT (role_name) ON public._firewall_bypass_roles TO ${ROLE};`,
-     `REVOKE INSERT (role_name) ON public._firewall_bypass_roles FROM ${ROLE};`],
-    ["a definer view is readable through a column grant", "-: no RLS-bypassing views or functions",
-     `CREATE VIEW ${S}.col_v AS SELECT * FROM ${S}.docs; GRANT SELECT (id) ON ${S}.col_v TO ${ROLE};`,
-     `DROP VIEW ${S}.col_v;`],
-    ["a view on a view", "-: no RLS-bypassing views or functions",
-     `CREATE VIEW ${S}.inner_v AS SELECT * FROM ${S}.docs; CREATE VIEW ${S}.outer_v AS SELECT * FROM ${S}.inner_v;
-      GRANT SELECT ON ${S}.outer_v TO ${ROLE};`, `DROP VIEW ${S}.outer_v; DROP VIEW ${S}.inner_v;`],
-    ["a materialized view over an invoker view", "-: no RLS-bypassing views or functions",
-     `CREATE VIEW ${S}.base_v WITH (security_invoker = true) AS SELECT * FROM ${S}.docs;
-      CREATE MATERIALIZED VIEW ${S}.mv AS SELECT * FROM ${S}.base_v; GRANT SELECT ON ${S}.mv TO ${ROLE};`,
-     `DROP MATERIALIZED VIEW ${S}.mv; DROP VIEW ${S}.base_v;`],
-    ["a view in another schema", "-: no RLS-bypassing views or functions",
-     `CREATE SCHEMA ${S}_other; CREATE VIEW ${S}_other.all_docs AS SELECT * FROM ${S}.docs;
-      GRANT USAGE ON SCHEMA ${S}_other TO ${ROLE}; GRANT SELECT ON ${S}_other.all_docs TO ${ROLE};`,
-     `DROP SCHEMA ${S}_other CASCADE;`],
-    ["a SECURITY DEFINER function in another schema", "-: no RLS-bypassing views or functions",
-     `CREATE SCHEMA ${S}_other; GRANT USAGE ON SCHEMA ${S}_other TO ${ROLE};
-      CREATE FUNCTION ${S}_other.dump() RETURNS SETOF ${S}.docs LANGUAGE sql SECURITY DEFINER AS 'SELECT * FROM ${S}.docs';`,
-     `DROP SCHEMA ${S}_other CASCADE;`],
-    ["a column grant on a tenant table in another schema", "-: no tenant tables in other schemas",
-     `CREATE SCHEMA ${S}_other; CREATE TABLE ${S}_other.copy (id int, tenant_id text);
-      GRANT USAGE ON SCHEMA ${S}_other TO ${ROLE}; GRANT SELECT (id) ON ${S}_other.copy TO ${ROLE};`,
-     `DROP SCHEMA ${S}_other CASCADE;`],
-    // Round 3: SET-only roles, unreachable unprotected tables, matviews over functions,
-    // extension members, foreign tables, LEAKPROOF functions.
-    ["a SET-only role can write the bypass list", "-: cannot write firewall tables",
-     `CREATE ROLE dbfw_cli_w NOLOGIN; GRANT INSERT ON public._firewall_bypass_roles TO dbfw_cli_w;
-      GRANT dbfw_cli_w TO ${ROLE} WITH INHERIT FALSE;`,
-     `REVOKE dbfw_cli_w FROM ${ROLE}; REVOKE ALL ON public._firewall_bypass_roles FROM dbfw_cli_w; DROP ROLE dbfw_cli_w;`],
-    ["an unprotected table it has no grant on", `${S}.ledger: policies`,
-     `CREATE TABLE ${S}.ledger (id int, tenant_id text);`, `DROP TABLE ${S}.ledger;`],
-    ["a materialized view over a function", "-: no RLS-bypassing views or functions",
-     `CREATE FUNCTION ${S}.all_ids() RETURNS TABLE (id int) LANGUAGE sql STABLE AS 'SELECT id FROM ${S}.docs';
-      CREATE MATERIALIZED VIEW ${S}.ids_mv AS SELECT * FROM ${S}.all_ids(); GRANT SELECT ON ${S}.ids_mv TO ${ROLE};`,
-     `DROP MATERIALIZED VIEW ${S}.ids_mv; DROP FUNCTION ${S}.all_ids();`],
-    ["a SECURITY DEFINER function attached to an extension", "-: no RLS-bypassing views or functions",
-     `CREATE FUNCTION ${S}.export_docs() RETURNS SETOF ${S}.docs LANGUAGE sql SECURITY DEFINER AS 'SELECT * FROM ${S}.docs';
-      ALTER EXTENSION plpgsql ADD FUNCTION ${S}.export_docs();`,
-     `ALTER EXTENSION plpgsql DROP FUNCTION ${S}.export_docs(); DROP FUNCTION ${S}.export_docs();`],
-    ["a foreign table", "-: no RLS-bypassing views or functions",
-     `CREATE FOREIGN DATA WRAPPER dbfw_cli_fdw; CREATE SERVER dbfw_cli_srv FOREIGN DATA WRAPPER dbfw_cli_fdw;
-      CREATE FOREIGN TABLE ${S}.docs_remote (id int, tenant_id text) SERVER dbfw_cli_srv;
-      GRANT SELECT ON ${S}.docs_remote TO ${ROLE};`,
-     `DROP FOREIGN TABLE ${S}.docs_remote; DROP SERVER dbfw_cli_srv; DROP FOREIGN DATA WRAPPER dbfw_cli_fdw;`],
-    ["a LEAKPROOF function", "-: no RLS-bypassing views or functions",
-     `CREATE FUNCTION ${S}.peek(text) RETURNS boolean LANGUAGE sql LEAKPROOF AS 'SELECT true';`,
-     `DROP FUNCTION ${S}.peek(text);`],
-    ["the bypass function was changed", "-: firewall functions unchanged",
-     `CREATE OR REPLACE FUNCTION public._firewall_is_bypass_role(p_role TEXT) RETURNS BOOLEAN AS $f$
-        SELECT EXISTS (SELECT 1 FROM public._firewall_bypass_roles WHERE role_name = p_role)
-            OR current_setting('dbfw.maintenance', true) = 'on';
-      $f$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp;`,
-     `CREATE OR REPLACE FUNCTION public._firewall_is_bypass_role(p_role TEXT) RETURNS BOOLEAN AS $f$
-        SELECT EXISTS (SELECT 1 FROM public._firewall_bypass_roles WHERE role_name = p_role);
-      $f$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp;`],
-    // Signed context: the key and the signing must stay out of the app's reach.
-    ["it can read the signing key", "-: cannot read the key or sign",
-     `GRANT SELECT ON public._firewall_keys TO ${ROLE};`, `REVOKE SELECT ON public._firewall_keys FROM ${ROLE};`],
-    ["it can sign", "-: cannot read the key or sign",
-     `GRANT EXECUTE ON FUNCTION public._firewall_sign(text) TO ${ROLE};`,
-     `REVOKE EXECUTE ON FUNCTION public._firewall_sign(text) FROM ${ROLE};`],
-    ["_firewall_tenant was changed to trust an unsigned tenant", "-: firewall functions unchanged",
-     `CREATE OR REPLACE FUNCTION public._firewall_tenant() RETURNS TEXT AS $f$
-        SELECT NULLIF(current_setting('app.current_tenant', true), '');
-      $f$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp;`,
-     `CREATE OR REPLACE FUNCTION public._firewall_tenant() RETURNS TEXT AS $f$
-    SELECT g.t FROM (SELECT NULLIF(current_setting('app.current_tenant', true), '') AS t,
-                            current_setting('app.tenant_sig', true) AS s) g
-    WHERE sha256(convert_to(g.s, 'UTF8')) = sha256(convert_to(public._firewall_sign(g.t), 'UTF8'));
-      $f$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp;`],
-    ["it has TRIGGER on a table", "-: cannot create triggers",
-     `GRANT TRIGGER ON ${S}.docs TO ${ROLE};`, `REVOKE TRIGGER ON ${S}.docs FROM ${ROLE};`],
-    ["it can CREATE schemas in the database", "-: cannot create in any schema",
-     `GRANT CREATE ON DATABASE ${DB} TO ${ROLE};`, `REVOKE CREATE ON DATABASE ${DB} FROM ${ROLE};`],
-    ["it can run programs as the server", "-: role",
-     `GRANT pg_execute_server_program TO ${ROLE};`, `REVOKE pg_execute_server_program FROM ${ROLE};`],
-    ["it can read server files", "-: role",
-     `GRANT pg_read_server_files TO ${ROLE};`, `REVOKE pg_read_server_files FROM ${ROLE};`],
-    ["it can CREATE in public", "-: cannot create in any schema",
-     `GRANT CREATE ON SCHEMA public TO ${ROLE};`, `REVOKE CREATE ON SCHEMA public FROM ${ROLE};`],
-    ["it can CREATE in its own schema", "-: cannot create in any schema",
-     `GRANT CREATE ON SCHEMA ${S} TO ${ROLE};`, `REVOKE CREATE ON SCHEMA ${S} FROM ${ROLE};`],
-    ["_firewall_auto_resolve was changed to sign any tenant", "-: firewall functions unchanged",
-     `ALTER FUNCTION public._firewall_auto_resolve() RENAME TO _firewall_auto_resolve_saved;
-      CREATE FUNCTION public._firewall_auto_resolve() RETURNS TEXT AS $f$ SELECT 'x'::text $f$ LANGUAGE sql;`,
-     `DROP FUNCTION public._firewall_auto_resolve();
-      ALTER FUNCTION public._firewall_auto_resolve_saved() RENAME TO _firewall_auto_resolve;`],
-    ["an extra _firewall_ function", "-: firewall functions unchanged",
-     `CREATE FUNCTION public._firewall_extra() RETURNS int LANGUAGE sql AS 'SELECT 1';`,
-     `DROP FUNCTION public._firewall_extra();`],
-  ];
-  for (const [why, check, apply, undo] of blockers) {
-    it(`verify fails when ${why}`, async () => {
-      await withChange(apply, undo, async () => {
-        const r = await json(["verify", ...APP(), "--tenant", "A", ...clean]);
-        assert.equal(r.code, 1, `exit ${r.code}`);
-        assert.ok(failed(r.data.checks).includes(check), failed(r.data.checks).join("; "));
-      });
-    });
-  }
-
-  it("a security_invoker view is fine (RLS applies through it)", async () => {
-    await withChange(`CREATE VIEW ${S}.vi_docs WITH (security_invoker = true) AS SELECT * FROM ${S}.docs;
-                      GRANT SELECT ON ${S}.vi_docs TO ${ROLE};`, `DROP VIEW ${S}.vi_docs;`, async () => {
-      const r = await json(["verify", ...APP(), "--tenant", "A", ...clean]);
-      assert.equal(r.code, 0, failed(r.data.checks).join("; "));
-    });
-  });
-
-  it("security_invoker spelled 1 is an invoker view", async () => {
-    await withChange(`CREATE VIEW ${S}.vi1 WITH (security_invoker = 1) AS SELECT * FROM ${S}.docs;
-                      GRANT SELECT ON ${S}.vi1 TO ${ROLE};`, `DROP VIEW ${S}.vi1;`, async () => {
-      const r = await json(["verify", ...APP(), "--tenant", "A", ...clean]);
-      assert.equal(r.code, 0, failed(r.data.checks).join("; "));
-    });
-  });
+  // The ways to reach another tenant's rows, and safe patterns that must pass,
+  // are in the attack corpus (tests/attacks/postgresql.sql, test/attacks.test.mjs).
 
   it("partitions read through their parent pass", async () => {
     await withChange(`CREATE TABLE ${S}.parts (id int, tenant_id text) PARTITION BY LIST (tenant_id);
@@ -456,7 +311,8 @@ describe("migrate, scan, verify", live, () => {
         assert.match(plain.data.checks.find((c) => c.check === "reads other sessions' SQL (info)").detail, /^yes/);
       });
     });
-    it("a readable table without the tenant column fails until allowlisted; invoker views over it too", async () => {
+    it("a readable table without the tenant column fails until allowlisted; invoker views over it too", async (t) => {
+      if (major < 15) return t.skip("security_invoker needs PostgreSQL 15");
       await withChange(`CREATE TABLE ${S}.settings (k text); GRANT SELECT ON ${S}.settings TO ${ROLE};
           CREATE VIEW ${S}.my_docs WITH (security_invoker = true) AS SELECT * FROM ${S}.docs;
           CREATE VIEW ${S}.all_settings WITH (security_invoker = true) AS SELECT * FROM ${S}.settings;
@@ -471,14 +327,6 @@ describe("migrate, scan, verify", live, () => {
           assert.equal(ok.code, 0, failed(ok.data.checks).join("; "));
         });
     });
-    it("an invoker view of constants, or one that calls a function, fails", async () => {
-      await withChange(`CREATE VIEW ${S}.consts WITH (security_invoker = true) AS VALUES ('B', 'b-ceo@example.com');
-          CREATE FUNCTION ${S}.k() RETURNS text LANGUAGE sql AS 'SELECT 1::text';
-          CREATE VIEW ${S}.fv WITH (security_invoker = true) AS SELECT ${S}.k() AS k, d.* FROM ${S}.docs d;
-          GRANT SELECT ON ${S}.consts, ${S}.fv TO ${ROLE};`,
-        `DROP VIEW ${S}.consts, ${S}.fv; DROP FUNCTION ${S}.k();`,
-        () => failedWith("strict: only tenant data readable", new RegExp(`${S}\\.consts, ${S}\\.fv`)));
-    });
     it("a SECURITY DEFINER function fails until allowlisted by its signature (in both checks)", async () => {
       await withChange(`CREATE FUNCTION ${S}.now_utc() RETURNS timestamptz LANGUAGE sql SECURITY DEFINER AS 'SELECT now()';
           CREATE TABLE ${S}.now_utc (k text); GRANT SELECT ON ${S}.now_utc TO ${ROLE};`,
@@ -490,49 +338,12 @@ describe("migrate, scan, verify", live, () => {
           assert.equal(ok.code, 0, failed(ok.data.checks).join("; "));
         });
     });
-    it("a SECURITY DEFINER trigger function fails even with EXECUTE revoked", async () => {
-      await withChange(`CREATE FUNCTION ${S}.tg() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS 'BEGIN RETURN NEW; END';
-          REVOKE EXECUTE ON FUNCTION ${S}.tg() FROM PUBLIC;
-          CREATE TRIGGER tg AFTER INSERT ON ${S}.docs FOR EACH ROW EXECUTE FUNCTION ${S}.tg();`,
-        `DROP TRIGGER tg ON ${S}.docs; DROP FUNCTION ${S}.tg();`, async () => {
-          await failedWith("strict: no SECURITY DEFINER functions", /tg\(\)/);
-          await failedWith("no RLS-bypassing views or functions", /tg\(\)/);
-        });
-    });
-    it("a rule on a table the app writes fails, and --allow-global cannot clear a definer view", async () => {
-      await withChange(`CREATE TABLE ${S}.audit (who text);
-          CREATE RULE leak AS ON INSERT TO ${S}.docs DO ALSO SELECT who FROM ${S}.audit;
-          CREATE VIEW ${S}.ref_docs AS SELECT * FROM ${S}.docs; GRANT SELECT ON ${S}.ref_docs TO ${ROLE};`,
-        `DROP RULE leak ON ${S}.docs; DROP TABLE ${S}.audit; DROP VIEW ${S}.ref_docs;`,
-        () => failedWith("no RLS-bypassing views or functions", new RegExp(`view ${S}\\.ref_docs.*rule leak on ${S}\\.docs`),
-                         "--allow-global", `${S}.ref_*`));
-    });
-    it("an aggregate over a SECURITY DEFINER function fails, even with EXECUTE revoked (in both checks)", async () => {
-      await withChange(`CREATE FUNCTION ${S}.sfunc(text, text) RETURNS text LANGUAGE sql SECURITY DEFINER AS 'SELECT $1';
-          REVOKE EXECUTE ON FUNCTION ${S}.sfunc(text, text) FROM PUBLIC;
-          CREATE AGGREGATE ${S}.agg(text) (SFUNC = ${S}.sfunc, STYPE = text);`,
-        `DROP AGGREGATE ${S}.agg(text); DROP FUNCTION ${S}.sfunc(text, text);`, async () => {
-          await failedWith("strict: no SECURITY DEFINER functions", /sfunc\(text,text\)/);
-          await failedWith("no RLS-bypassing views or functions", /sfunc\(text,text\)/);
-        });
-    });
-    it("a rule fails even when the app writes only through a column grant or a view", async () => {
-      await withChange(`CREATE TABLE ${S}.audit2 (who text); CREATE TABLE ${S}.notes2 (body text);
-          GRANT INSERT (body) ON ${S}.notes2 TO ${ROLE};
-          CREATE RULE leak2 AS ON INSERT TO ${S}.notes2 DO ALSO SELECT who FROM ${S}.audit2;`,
-        `DROP TABLE ${S}.notes2, ${S}.audit2;`,
-        () => failedWith("no RLS-bypassing views or functions", /rule leak2 on/));
-    });
     it("--allow-query-text accepts other sessions' SQL (an info line)", async () => {
       await withChange("GRANT SELECT ON pg_catalog.pg_stat_activity TO PUBLIC", NO_ACTIVITY, async () => {
         const r = await verifyStrict("--allow-query-text");
         assert.equal(r.code, 0, failed(r.data.checks).join("; "));
         assert.ok(r.data.checks.some((c) => c.check === "reads other sessions' SQL (info)"));
       });
-    });
-    it("a readable large object fails", async () => {
-      await withChange(`SELECT lo_from_bytea(424242, 'tenant B contract'); ALTER LARGE OBJECT 424242 OWNER TO ${ROLE}`,
-        "SELECT lo_unlink(424242)", () => failedWith("strict: no readable large objects", /^1 large object/));
     });
     it("--allow-global without --strict exits 2", async () => {
       assert.equal((await run(["verify", ...APP(), "--tenant", "A", "--allow-global", `${S}.x`])).code, 2);

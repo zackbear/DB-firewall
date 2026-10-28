@@ -53,7 +53,7 @@ Each script protects every table that has the tenant column (PostgreSQL: in the
 chosen schema; MySQL: the current database; SQL Server: all schemas; Oracle:
 `SCHEMA_OWNER`). Re-run it after adding tables (MySQL: steps 2 and 3).
 `run_migration()` handles PostgreSQL, MySQL and SQL Server; Oracle needs sqlplus.
-Tested live: PostgreSQL 16, MySQL 8.4, SQL Server 2022 and Oracle Database Free
+Tested live: PostgreSQL 14, 15, 16 and 17, MySQL 8.4, SQL Server 2022 and Oracle Database Free
 23ai (see "Tests" for the live suites).
 
 MySQL has no RLS. Its layer is views plus triggers, keyed on the user variable
@@ -119,7 +119,7 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
   the key, or generates one on the first run: read it with
   `SELECT encode(key, 'hex') FROM public._firewall_keys` or `npx db-firewall key`.
   The policies check the signature once per query, not once per row (an
-  InitPlan). Needs PostgreSQL 13+.
+  InitPlan). Tested on PostgreSQL 14 to 17.
 * **Session reset.** SQL run in one tenant's transaction could leave session
   state for the connection's next user: a temp view that shadows a table, a
   SQL-level prepared statement under a driver's statement name, or a custom
@@ -568,7 +568,7 @@ A failure to set the DB-side context raises when `fail_mode: closed` (the defaul
 
 ```bash
 db-firewall/
-├── .github/workflows/tests.yml   # CI: pytest (3.11, 3.13) on PostgreSQL 16; live MySQL + SQL Server; TypeScript
+├── .github/workflows/tests.yml   # CI: pytest and TypeScript on PostgreSQL 14-17; live MySQL + SQL Server
 ├── .github/workflows/oracle-nightly.yml  # CI: Oracle Free, nightly and on Oracle/middleware PRs
 ├── adapters/                     # NoSQL: mongodb.py, redis.py, firestore.py, convex/ (see "NoSQL stores")
 ├── config/
@@ -610,8 +610,16 @@ DBFW_PG_DSN="host=localhost port=5432 dbname=dbfw_test user=postgres" \
 
 The live tests create the `dbfw_app` role and their own tables, and apply
 `migrations/001_postgresql.sql`, so point `DBFW_PG_DSN` at a throwaway database
-as a superuser. CI does the same with a `postgres:16` service and fails below
-85% coverage.
+as a superuser. CI does the same on PostgreSQL 14, 15, 16 and 17 and fails
+below 85% coverage.
+
+`tests/attacks/postgresql.sql` is the attack corpus: every known way to reach
+another tenant's rows on PostgreSQL, from the reviews (definer views and
+functions, rules, ownership, functions PostgreSQL runs without an `EXECUTE`
+check, shared stores), and safe patterns that must pass. CI runs it on every
+version: `db-firewall verify` must fail each attack with the named check, and
+each attack's leak query must really show the other tenant's row on that
+version. Add every new bypass there before fixing it.
 
 | Test file | Covers |
 | --- | --- |
