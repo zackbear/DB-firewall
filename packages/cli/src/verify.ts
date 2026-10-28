@@ -29,8 +29,10 @@ const anyRole = (expr: string) =>
   `EXISTS (SELECT 1 FROM pg_roles m WHERE pg_has_role(current_user, m.oid, 'MEMBER') AND ${expr})`;
 
 /** Functions PostgreSQL runs without checking the caller's EXECUTE: trigger and
- *  event trigger functions, aggregate and range support, index support
- *  (amproc), selectivity estimators, type I/O and encoding conversions. */
+ *  event trigger functions, aggregate and range support, index support (amproc,
+ *  and the operators of operator families), selectivity estimators, planner
+ *  support, type I/O, encoding conversions, transforms, text search parsers and
+ *  templates, and FDW and language handlers and validators. */
 const IMPLICIT = `(SELECT tgfoid FROM pg_trigger UNION SELECT evtfoid FROM pg_event_trigger
   UNION SELECT unnest(ARRAY[aggtransfn, aggfinalfn, aggcombinefn, aggserialfn, aggdeserialfn,
                             aggmtransfn, aggminvtransfn, aggmfinalfn])::oid FROM pg_aggregate
@@ -39,7 +41,14 @@ const IMPLICIT = `(SELECT tgfoid FROM pg_trigger UNION SELECT evtfoid FROM pg_ev
   UNION SELECT unnest(ARRAY[oprrest, oprjoin])::oid FROM pg_operator
   UNION SELECT unnest(ARRAY[typinput, typoutput, typreceive, typsend, typmodin, typmodout,
                             typanalyze, typsubscript])::oid FROM pg_type
-  UNION SELECT conproc FROM pg_conversion)`;
+  UNION SELECT conproc FROM pg_conversion
+  UNION SELECT o.oprcode::oid FROM pg_amop a JOIN pg_operator o ON o.oid = a.amopopr
+  UNION SELECT prosupport::oid FROM pg_proc WHERE prosupport <> 0
+  UNION SELECT unnest(ARRAY[trffromsql, trftosql])::oid FROM pg_transform
+  UNION SELECT unnest(ARRAY[prsstart, prstoken, prsend, prsheadline, prslextype])::oid FROM pg_ts_parser
+  UNION SELECT unnest(ARRAY[tmplinit, tmpllexize])::oid FROM pg_ts_template
+  UNION SELECT unnest(ARRAY[fdwhandler, fdwvalidator]) FROM pg_foreign_data_wrapper
+  UNION SELECT unnest(ARRAY[lanplcallfoid, laninline, lanvalidator]) FROM pg_language)`;
 
 /**
  * The role and every role it can SET ROLE to (or inherits): none may skip RLS.
@@ -101,7 +110,8 @@ export async function roleChecks(client: pg.ClientBase): Promise<Check[]> {
     // An owner can change what runs in other tenants' sessions: a domain
     // constraint or a function body that sends values out (pg_notify), a
     // table's RLS, its own grants back. Any object in the database counts
-    // (pg_shdepend), except temporary ones, large objects and default ACLs.
+    // (pg_shdepend), except temporary ones, large objects, default ACLs and
+    // user mappings (the mapped role counts as their owner).
     () => guard("owns no database objects", async () => {
       const { rows } = await client.query(
         `SELECT 'database ' || datname AS name FROM pg_database
@@ -109,7 +119,7 @@ export async function roleChecks(client: pg.ClientBase): Promise<Check[]> {
          UNION ALL (SELECT o.type || ' ' || o.identity FROM pg_shdepend s
            CROSS JOIN LATERAL pg_identify_object(s.classid, s.objid, 0) o
            WHERE s.dbid = (SELECT oid FROM pg_database WHERE datname = current_database()) AND s.deptype = 'o'
-             AND s.classid NOT IN ('pg_largeobject'::regclass, 'pg_default_acl'::regclass)
+             AND s.classid NOT IN ('pg_largeobject'::regclass, 'pg_default_acl'::regclass, 'pg_user_mapping'::regclass)
              AND pg_has_role(current_user, s.refobjid, 'MEMBER')
              AND COALESCE(o.schema, '') NOT LIKE 'pg#_temp#_%' ESCAPE '#'
              AND COALESCE(o.schema, '') NOT LIKE 'pg#_toast#_temp#_%' ESCAPE '#'
@@ -154,7 +164,7 @@ export async function roleChecks(client: pg.ClientBase): Promise<Check[]> {
       const { rows } = await client.query(
         `SELECT c.oid::regclass::text AS name FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
          WHERE c.relkind IN ('r', 'p', 'v', 'f') AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-           AND n.nspname NOT LIKE 'pg#_toast%' ESCAPE '#'
+           AND n.nspname NOT LIKE 'pg#_toast%' ESCAPE '#' AND n.nspname NOT LIKE 'pg#_temp#_%' ESCAPE '#'
            AND (${anyRole("has_table_privilege(m.oid, c.oid, 'TRIGGER')")}
                 OR pg_has_role(current_user, c.relowner, 'MEMBER'))
          ORDER BY 1 LIMIT 20`);
@@ -517,7 +527,9 @@ async function strictChecks(client: pg.ClientBase, protectedTables: TableReport[
       const to = deps.get(oid) ?? [];
       return !r.calls_fn && to.length > 0 && to.every((t) => safeView(t, seen));
     };
-    const bad = rels.filter((r) => r.readable && !allowedRel(allow, r.name) && !(
+    // --allow-query-text also accepts pg_stat_statements' own views.
+    const stats = (r: any) => allowQueryText && ["pg_stat_statements", "pg_stat_statements_info"].includes(r.rel);
+    const bad = rels.filter((r) => r.readable && !allowedRel(allow, r.name) && !stats(r) && !(
       safe.has(r.oid) || (r.kind === "S" && r.owned_by && safe.has(r.owned_by)) || (r.kind === "v" && safeView(r.oid))))
       .map((r) => r.name).sort();
     return { ok: bad.length === 0, detail: bad.length

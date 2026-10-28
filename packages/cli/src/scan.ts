@@ -103,7 +103,7 @@ export function globMatch(pattern: string, name: string): boolean {
       i = end;
     } else re += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
   }
-  return new RegExp(`^${re}$`).test(name);
+  try { return new RegExp(`^${re}$`).test(name); } catch { return false; }   // a reversed range ([z-a]): no match, as fnmatch
 }
 
 /**

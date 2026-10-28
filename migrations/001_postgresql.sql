@@ -560,7 +560,8 @@ BEGIN
              WHERE d.dbid = (SELECT oid FROM pg_catalog.pg_database WHERE datname = current_database())
                AND d.deptype = 'o'
                AND d.classid NOT IN ('pg_catalog.pg_largeobject'::pg_catalog.regclass,
-                                     'pg_catalog.pg_default_acl'::pg_catalog.regclass)
+                                     'pg_catalog.pg_default_acl'::pg_catalog.regclass,
+                                     'pg_catalog.pg_user_mapping'::pg_catalog.regclass)
                AND pg_catalog.pg_has_role(app_oid, d.refobjid, 'MEMBER')
                AND COALESCE(o.schema, '') NOT LIKE 'pg#_temp#_%' ESCAPE '#'
                AND COALESCE(o.schema, '') NOT LIKE 'pg#_toast#_temp#_%' ESCAPE '#'
@@ -624,7 +625,8 @@ BEGIN
              FROM pg_catalog.pg_proc p WHERE p.proname = 'pg_stat_statements'
              UNION ALL
              SELECT format('REVOKE SELECT ON %s FROM PUBLIC', c.oid::pg_catalog.regclass)
-             FROM pg_catalog.pg_class c WHERE c.relname = 'pg_stat_statements' AND c.relkind = 'v'
+             FROM pg_catalog.pg_class c WHERE c.relname IN ('pg_stat_statements', 'pg_stat_statements_info')
+               AND c.relkind = 'v'
     LOOP
         EXECUTE r.cmd;
     END LOOP;

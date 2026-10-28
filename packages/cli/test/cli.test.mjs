@@ -568,6 +568,15 @@ describe("migrate, scan, verify", live, () => {
     }
   });
 
+  it("an app session's temporary table does not fail verify", async () => {
+    const held = new pg.Client({ connectionString: appUrl() }); await held.connect();
+    try {
+      await held.query("CREATE TEMP TABLE scratch (x int)");
+      const r = await json(["verify", ...APP(), "--tenant", "A", ...clean]);
+      assert.equal(r.code, 0, failed(r.data.checks).join("; "));
+    } finally { await held.end(); }
+  });
+
   it("migrate --harden refuses when the app role owns a domain, and verify fails on it", async () => {
     await withChange(`CREATE DOMAIN ${S}.sec AS text; ALTER DOMAIN ${S}.sec OWNER TO ${ROLE}`, `DROP DOMAIN ${S}.sec`, async () => {
       const v = await json(["verify", ...APP(), "--tenant", "A", ...clean]);

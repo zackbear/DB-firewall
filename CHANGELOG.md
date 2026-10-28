@@ -18,7 +18,9 @@
 - **verify, all modes:** fails on any rule other than a view's own (its
   actions run as the owner), on a `SECURITY DEFINER` function PostgreSQL runs
   without checking `EXECUTE` (triggers, aggregate, range and index support,
-  estimators, type I/O, conversions), and when a role the app can use owns
+  operator family operators, estimators, planner support, type I/O,
+  conversions, transforms, text search parsers and templates, FDW and
+  language handlers and validators), and when a role the app can use owns
   the database or any object in it (an owner can change a domain constraint
   or a function body, or grant itself `CREATE` and `TRIGGER` back). A new information line reports whether the role can read other
   sessions' SQL. `--exclude` globs read `[^a]` as fnmatch does (a literal
