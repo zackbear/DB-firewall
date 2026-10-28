@@ -6,6 +6,7 @@ for every non-excluded table that has the tenant column.
 import hashlib
 import json
 import os
+import re
 import sys
 from typing import Dict
 
@@ -114,15 +115,24 @@ def _pg_ident(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
 
 
-def _pg_reference(cursor, schema: str, table: str, tenant_col: str):
+def _pg_predicate(tenant_col: str, context: str) -> str:
+    """The migration's predicate for dbfw.context signed (default) or plain."""
+    col = _pg_ident(tenant_col)
+    if context == "plain":
+        return (f"{col} = NULLIF(current_setting('app.current_tenant', true), '') "
+                "OR public._firewall_is_bypass_role(current_user::text)")
+    return (f"{col} = (SELECT public._firewall_tenant()) "
+            "OR (SELECT public._firewall_is_bypass_role(current_user::text))")
+
+
+def _pg_reference(cursor, schema: str, table: str, tenant_col: str, context: str = "signed"):
     """The firewall predicate exactly as PostgreSQL deparses it for this table:
     a policy with the migration's predicate on a temporary copy of the table's
     columns, read back from pg_policies, then rolled back. Comparing deparsed
     text exactly catches a changed cast, an overloaded function or a changed
     constant that a normalised comparison would miss. Returns (text, None),
     or (None, reason) when it cannot be built."""
-    pred = (f"{_pg_ident(tenant_col)} = NULLIF(current_setting('app.current_tenant', true), '') "
-            "OR public._firewall_is_bypass_role(current_user::text)")
+    pred = _pg_predicate(tenant_col, context)
     autocommit = bool(getattr(getattr(cursor, "connection", None), "autocommit", False))
     cursor.execute("BEGIN" if autocommit else "SAVEPOINT _fw_ref")
     try:
@@ -153,8 +163,80 @@ def _pg_altered(policies, reference) -> list:
     return sorted(altered)
 
 
+_PG_FUNCTION_RE = re.compile(r"CREATE OR REPLACE FUNCTION public\.(_firewall_\w+)\(([^)]*)\)\s*RETURNS (\w+) "
+                             r"AS \$\$(.*?)\$\$ LANGUAGE (\w+)([^;]*);", re.S)
+
+
+def _pg_firewall_objects(cursor):
+    """None when every function the migration creates matches it (body,
+    SECURITY DEFINER, settings, volatility, language, return type), no extra
+    public._firewall_* function exists, and the public._firewall_* objects have
+    one owner (or only superusers); else the reason. The policies call some of
+    these functions and others sign, so a changed body opens every table while
+    the policies still look exact. Same rules as packages/cli/src/scan.ts."""
+    from middleware.db_firewall.migrate import MIGRATIONS_DIR
+    sql = (MIGRATIONS_DIR / "001_postgresql.sql").read_text()
+    norm = lambda x: " ".join(x.split())   # noqa: E731
+    diff, sigs = [], []
+    for name, args, ret, body, lang, tail in _PG_FUNCTION_RE.findall(sql):
+        sig = ", ".join(a.split()[1].lower() for a in args.split(",") if len(a.split()) > 1)
+        sigs.append(f"{name}({sig})")
+        cursor.execute("SELECT prosrc, prosecdef, proconfig, provolatile, l.lanname, "
+                       "format_type(prorettype, NULL) FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang "
+                       "WHERE p.oid = to_regprocedure(%s)", (f"public.{name}({sig})",))
+        row = cursor.fetchone()
+        if not row:
+            diff.append(f"{name} (missing)")
+            continue
+        src, secdef, config, volatile, lanname, rettype = row
+        path = re.search(r"SET search_path = ([^\n;]+?)\s*$", tail, re.M)
+        what = [w for w, bad in (
+            ("body", norm(src) != norm(body)),
+            ("SECURITY DEFINER", bool(secdef) != ("SECURITY DEFINER" in tail)),
+            ("settings", (config or None) != ([f"search_path={path.group(1)}"] if path else None)),
+            ("volatility", volatile != ("s" if "STABLE" in tail else "i" if "IMMUTABLE" in tail else "v")),
+            ("language or return type", lanname != lang.lower() or rettype != ret.lower())) if bad]
+        if what:
+            diff.append(f"{name} ({', '.join(what)})")
+    cursor.execute("SELECT p.oid::regprocedure::text FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace "
+                   "AND p.proname LIKE '#_firewall#_%%' ESCAPE '#' "
+                   "AND NOT (p.proname || '(' || oidvectortypes(p.proargtypes) || ')') = ANY(%s) ORDER BY 1",
+                   (sigs,))
+    extra = [r[0] for r in cursor.fetchall()]
+    if extra:
+        diff.append("extra " + ", ".join(extra))
+    cursor.execute("SELECT pg_get_userbyid(o.owner), r.rolsuper, string_agg(o.name, ', ' ORDER BY o.name) FROM ("
+                   "SELECT relname::text AS name, relowner AS owner FROM pg_class "
+                   "WHERE relnamespace = 'public'::regnamespace AND relname LIKE '#_firewall#_%%' ESCAPE '#' "
+                   "UNION ALL SELECT proname::text, proowner FROM pg_proc "
+                   "WHERE pronamespace = 'public'::regnamespace AND proname LIKE '#_firewall#_%%' ESCAPE '#') o "
+                   "JOIN pg_roles r ON r.oid = o.owner GROUP BY o.owner, r.rolsuper ORDER BY count(*) DESC")
+    owners = cursor.fetchall()
+    if len(owners) > 1 and not all(sup for _, sup, _ in owners):
+        diff.append("more than one owner (" + "; ".join(f"{o}: {objs}" for o, _, objs in owners)
+                    + "): objects another role planted? drop those and re-run the migration")
+    return ("differ from the migration: " + "; ".join(diff)) if diff else None
+
+
 def _scan_postgres(cursor, tenant_col, excluded, opts) -> Dict[str, dict]:
+    # Read the policies with search_path = pg_catalog, pg_temp: under the
+    # default path a planted operator (say public.= for varchar, text) deparses
+    # as a plain "=" and the policy would look exact.
+    cursor.execute("SELECT current_setting('search_path'), "
+                   "set_config('search_path', 'pg_catalog, pg_temp', false)")
+    old_path = cursor.fetchone()[0]
+    try:
+        return _scan_postgres_tables(cursor, tenant_col, excluded, opts)
+    finally:
+        cursor.execute("SELECT set_config('search_path', %s, false)", (old_path,))
+
+
+def _scan_postgres_tables(cursor, tenant_col, excluded, opts) -> Dict[str, dict]:
     results = {}
+    try:
+        objects = _pg_firewall_objects(cursor)
+    except Exception as e:          # no migration yet, an aborted transaction ...
+        objects = "could not be checked: " + str(e).strip().splitlines()[0]
     cursor.execute(_PG_SQL, (opts.get("schema") or "public", tenant_col))
     schema = opts.get("schema") or "public"
     for table, enabled, forced, missing, extra, restrictive, policies, base in cursor.fetchall():
@@ -162,26 +244,37 @@ def _scan_postgres(cursor, tenant_col, excluded, opts) -> Dict[str, dict]:
             continue
         if isinstance(policies, str):
             policies = json.loads(policies)
-        reference, why = _pg_reference(cursor, schema, table, tenant_col) if policies else (None, None)
+        # The expected context (engines.postgresql.tenant_context, default
+        # signed). Policies in the other context count as altered, but the
+        # report names the context they use.
+        context = (opts.get("tenant_context") or "signed").lower()
+        reference, why = _pg_reference(cursor, schema, table, tenant_col, context) if policies else (None, None)
         unverified = bool(policies) and reference is None
         # Without a reference the predicates cannot be checked: report that,
         # and fail closed, instead of calling every policy altered.
         altered = _pg_altered(policies, reference) if reference is not None else []
+        found = context if policies and not altered and not unverified else None
+        if policies and altered and not unverified:
+            other = "plain" if context == "signed" else "signed"
+            ref2, _ = _pg_reference(cursor, schema, table, tenant_col, other)
+            found = other if ref2 is not None and not _pg_altered(policies, ref2) else "altered"
         missing, extra = sorted(missing), sorted(extra)
         results[table] = {
             "has_tenant_col": True, "has_rls_policy": not missing,
             "missing_policies": missing, "extra_permissive_policies": extra,
             "rls_enabled": bool(enabled), "rls_forced": bool(forced),
             "policy_mode": "restrictive" if restrictive else "permissive",
+            "tenant_context": found,
             "altered_policies": altered,
             "predicate_check": ("unavailable: " + str(why)
                                 + " (run the scanner outside a read-only transaction, with the "
-                                  "TEMP privilege and SELECT on the table)") if unverified else "ok",
+                                  "TEMP privilege and SELECT on the table)") if unverified
+                               else f"firewall functions {objects}" if objects else "ok",
             # restrictive mode: "<stem>_base" (USING true) next to the app's own
             # permissive policies ORs with them inside the tenant: re-run the migration.
             "stale_base_policy": bool(base) and any(not e.endswith("_base") for e in extra),
             "protected": bool(enabled) and bool(forced) and not missing and not altered
-                         and not unverified and (bool(restrictive) or not extra),
+                         and not unverified and not objects and (bool(restrictive) or not extra),
         }
     return results
 

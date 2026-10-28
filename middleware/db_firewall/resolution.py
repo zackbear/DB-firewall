@@ -6,7 +6,7 @@ import re
 import weakref
 from typing import Optional
 
-from .config import check_table_name
+from .config import check_table_name, engine_options
 from .engines import DBEngine, _is_autocommit, placeholder
 from .introspection import _META_SAVEPOINT, _conn_dsn, _in_transaction
 from .rewrite import validate_tenant_id
@@ -90,10 +90,20 @@ def _resolve_tenant_from_map(connection, engine: str,
     return probe(connection, sql)
 
 
-def _from_session_var(connection, engine: str, entry: dict) -> Optional[str]:
+def _from_session_var(connection, engine: str, entry: dict, config: dict) -> Optional[str]:
     sql = _SESSION_VAR_SQL.get(engine)
     if sql is None:
         return None
+    if engine == DBEngine.POSTGRESQL and \
+            (engine_options(config, engine).get("tenant_context") or "signed").lower() != "plain":
+        # Signed context: only a tenant signed for this transaction counts.
+        # A plain setting may come from SQL the app ran (or an earlier user of
+        # the connection); taking it here would sign it. Other variables
+        # cannot be signed, so they are refused.
+        if entry.get("variable", "app.current_tenant") != "app.current_tenant":
+            raise ValueError("DB Firewall: session_var with tenant_context: signed reads "
+                             "app.current_tenant only")
+        return probe(connection, "SELECT public._firewall_tenant()")
     if engine == DBEngine.POSTGRESQL:
         ph = placeholder(connection)
         return probe(connection, sql.format(ph=ph), (entry.get("variable", "app.current_tenant"),))
@@ -109,7 +119,7 @@ def _from_connection_param(connection, entry: dict) -> Optional[str]:
     return value
 
 
-def _source_value(connection, engine: str, entry: dict) -> Optional[str]:
+def _source_value(connection, engine: str, entry: dict, config: dict) -> Optional[str]:
     source = entry["source"]
     if source == "env_var":
         return os.environ.get(entry.get("variable", "TENANT_ID"))
@@ -117,7 +127,7 @@ def _source_value(connection, engine: str, entry: dict) -> Optional[str]:
         return _resolve_tenant_from_map(connection, engine,
                                         entry.get("table", "_firewall_tenant_map"))
     if source == "session_var":
-        return _from_session_var(connection, engine, entry)
+        return _from_session_var(connection, engine, entry, config)
     return _from_connection_param(connection, entry)
 
 
@@ -129,7 +139,7 @@ def resolve_tenant(connection, engine: str, config: dict) -> Optional[str]:
     for entry in config.get("resolution") or []:
         if not entry.get("enabled", True):
             continue
-        value = _source_value(connection, engine, entry)
+        value = _source_value(connection, engine, entry, config)
         # An empty DB value means "not set"; an empty env var is set (and invalid).
         if value is None or (value == "" and entry["source"] != "env_var"):
             continue

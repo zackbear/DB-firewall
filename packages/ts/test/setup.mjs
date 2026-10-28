@@ -13,6 +13,9 @@ if (!ADMIN_URL && process.env.DBFW_REQUIRE_LIVE) {
 export const live = { skip: ADMIN_URL ? false : "DBFW_PG_URL not set" };
 export const SCHEMA = "ts_app";
 const APP_USER = "dbfw_ts", APP_PW = "DbfwTs_2026x";
+// The signing key withTenant() reads, and the migration installs.
+export const TEST_KEY = "5a".repeat(32);
+process.env.DB_FIREWALL_TENANT_KEY = TEST_KEY;
 
 export function appUrl() {
   const u = new URL(ADMIN_URL);
@@ -39,7 +42,8 @@ export async function setup() {
       .catch(() => {});                       // table exists only after a first migration
     await admin.query("SELECT set_config('dbfw.tenant_column', 'tenant_id', false), " +
                       `set_config('dbfw.schema', '${SCHEMA}', false), ` +
-                      "set_config('dbfw.policy_mode', 'permissive', false)");
+                      "set_config('dbfw.policy_mode', 'permissive', false), " +
+                      `set_config('dbfw.tenant_key', '${TEST_KEY}', false)`);
     const migration = new URL("../../../migrations/001_postgresql.sql", import.meta.url);
     await admin.query(readFileSync(migration, "utf8"));
   } finally {

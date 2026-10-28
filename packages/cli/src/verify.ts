@@ -2,9 +2,8 @@
 // policies' presence. Read-only by default: every check runs in a transaction
 // that is rolled back, and nothing is written unless --write-probe is given.
 import type pg from "pg";
-import { readFileSync } from "node:fs";
-import { MIGRATION } from "./migrate.js";
-import { ident, scan, type TableReport } from "./scan.js";
+import { sign } from "./key.js";
+import { firewallObjects, ident, scan, withCatalogPath, type TableReport } from "./scan.js";
 
 /** ok: true pass, false fail, null inconclusive (counted separately, never as a pass). */
 export interface Check { table: string; check: string; ok: boolean | null; detail: string }
@@ -14,6 +13,12 @@ const MARK = "__dbfw_verify_other__";
 
 // A role that skips RLS: superuser, BYPASSRLS, or listed in _firewall_bypass_roles.
 const BYPASSES = "(r.rolsuper OR r.rolbypassrls OR public._firewall_is_bypass_role(r.rolname::text))";
+
+// Predefined roles that skip RLS in effect: they read every row (all_data),
+// or run programs / read and write files as the server (and so connect as
+// anyone it trusts).
+const PREDEFINED = ["pg_read_all_data", "pg_write_all_data", "pg_execute_server_program",
+                    "pg_read_server_files", "pg_write_server_files"];
 
 /**
  * True when any role the app can use holds the privilege: itself, a role it
@@ -37,9 +42,15 @@ export async function roleChecks(client: pg.ClientBase): Promise<Check[]> {
         `SELECT r.rolname, r.rolname = current_user AS self, r.rolsuper, r.rolbypassrls,
                 public._firewall_is_bypass_role(r.rolname::text) AS fw
          FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'MEMBER') AND ${BYPASSES}`);
-      return rows.length
-        ? { ok: false, detail: rows.map((r) => r.self ? `role ${r.rolname} ${why(r)}`
-              : `is a member of ${r.rolname}, which ${why(r)}`).join("; ") + ": RLS does not apply" }
+      const { rows: pre } = await client.query(
+        `SELECT rolname FROM pg_roles WHERE rolname = ANY($1) AND pg_has_role(current_user, oid, 'MEMBER') ORDER BY 1`,
+        [PREDEFINED]);
+      const bad = [
+        ...rows.map((r) => r.self ? `role ${r.rolname} ${why(r)}` : `is a member of ${r.rolname}, which ${why(r)}`),
+        ...pre.map((r) => `is a member of ${r.rolname}, which reads or runs things as the server`),
+      ];
+      return bad.length
+        ? { ok: false, detail: bad.join("; ") + ": RLS does not apply" }
         : { ok: true, detail: "no role it can use skips RLS" };
     }),
     () => guard("cannot write firewall tables", async () => {
@@ -50,6 +61,17 @@ export async function roleChecks(client: pg.ClientBase): Promise<Check[]> {
                            OR has_table_privilege(m.oid, t, 'DELETE, TRUNCATE'))`)}`);
       return { ok: rows.length === 0, detail: rows.length
         ? `can write ${rows.map((x) => x.name).join(", ")} (could add itself as a bypass role)` : "no write access" };
+    }),
+    // With the key, or a way to sign, the app could sign any tenant.
+    () => guard("cannot read the key or sign", async () => {
+      const { rows } = await client.query(
+        `SELECT 'table _firewall_keys' AS name WHERE to_regclass('public._firewall_keys') IS NOT NULL
+           AND ${anyRole("has_any_column_privilege(m.oid, 'public._firewall_keys'::regclass, 'SELECT')")}
+         UNION ALL SELECT 'function ' || p.proname FROM pg_proc p
+         WHERE p.pronamespace = 'public'::regnamespace AND p.proname IN ('_firewall_sign', '_firewall_set_tenant')
+           AND ${anyRole("has_function_privilege(m.oid, p.oid, 'EXECUTE')")}`);
+      return { ok: rows.length === 0, detail: rows.length
+        ? `can use ${rows.map((x) => x.name).join(", ")} (could sign another tenant): re-run migrate` : "neither" };
     }),
     // The owner of schema public (on PG15+ the database owner, via pg_database_owner)
     // can drop the bypass list and create its own; an owner of a firewall object can replace it.
@@ -63,29 +85,84 @@ export async function roleChecks(client: pg.ClientBase): Promise<Check[]> {
       return { ok: rows.length === 0, detail: rows.length
         ? `can act as the owner of ${rows.map((x) => x.name).join(", ")} (could drop or replace the bypass list)` : "owns none" };
     }),
-    // Every policy calls this function, so a changed body (say, a session-setting
-    // "maintenance switch") opens every table while the policies still look exact.
-    () => guard("bypass function unchanged", async () => {
-      const want = /FUNCTION _firewall_is_bypass_role\(p_role TEXT\)\s*RETURNS BOOLEAN AS \$\$([\s\S]*?)\$\$/
-        .exec(readFileSync(MIGRATION, "utf8"))?.[1];
-      const { rows: [f] } = await client.query(
-        `SELECT prosrc, prosecdef, proconfig, l.lanname, prorettype = 'boolean'::regtype AS bool
-         FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
-         WHERE p.oid = 'public._firewall_is_bypass_role(text)'::regprocedure`);
-      const norm = (x: string) => x.replace(/\s+/g, " ").trim();
-      const diff = [];
-      if (!want || norm(f.prosrc) !== norm(want)) diff.push("body");
-      if (!f.prosecdef) diff.push("not SECURITY DEFINER");
-      if (JSON.stringify(f.proconfig) !== JSON.stringify(["search_path=pg_catalog, pg_temp"])) diff.push("settings");
-      if (f.lanname !== "sql" || !f.bool) diff.push("language or return type");
-      return { ok: diff.length === 0, detail: diff.length
-        ? `public._firewall_is_bypass_role differs from the migration (${diff.join(", ")}): re-run migrate`
-        : "matches the migration" };
+    // The policies call these (and they sign): see firewallObjects().
+    () => guard("firewall functions unchanged", () => firewallObjects(client)),
+    // CREATE in a schema lets the app plant objects or operators that a later
+    // migration or query binds to: a view named like a table, reached through
+    // a search_path the app role sets for itself (ALTER ROLE ... SET persists
+    // across sessions, and no reset can undo it). The migration refuses planted
+    // _firewall_* objects and pins search_path; nothing else should rely on that.
+    // Information, never a failure: what one shared role allows that no
+    // tenant check can see.
+    () => info("signals other sessions (info)", async () => {
+      const { rows: [r] } = await client.query(
+        `SELECT ${anyRole(`EXISTS (SELECT 1 FROM pg_proc p WHERE p.pronamespace = 'pg_catalog'::regnamespace
+           AND p.proname IN ('pg_terminate_backend', 'pg_cancel_backend')
+           AND has_function_privilege(m.oid, p.oid, 'EXECUTE'))`)} AS can`);
+      return { ok: true, detail: r.can
+        ? "yes: SQL one tenant runs can end or cancel another tenant's requests (availability only); " +
+          "migrate --harden-signals revokes it" : "no (pg_terminate_backend / pg_cancel_backend revoked)" };
+    }),
+    () => info("role defaults (info)", async () => {
+      const { rows: [r] } = await client.query(
+        `SELECT string_agg(ro.rolname || COALESCE(' in ' || d.datname, '') || ': ' || array_to_string(s.setconfig, ', '),
+                           '; ' ORDER BY ro.rolname) AS set
+         FROM pg_db_role_setting s JOIN pg_roles ro ON ro.oid = s.setrole
+         LEFT JOIN pg_database d ON d.oid = s.setdatabase
+         WHERE pg_has_role(current_user, s.setrole, 'MEMBER') AND (s.setdatabase = 0 OR d.datname = current_database())`);
+      return { ok: true, detail: (r.set ? `set: ${r.set}` : "none") +
+        " (the role can change its own with ALTER ROLE CURRENT_USER SET; no grant prevents it, " +
+        "and a bad value can break its later connections)" };
+    }),
+    // TRIGGER on a table lets the app attach a deferred trigger: it fires at
+    // COMMIT, after an in-transaction session reset (postgres.js), and can
+    // leave state for the connection's next user.
+    () => guard("cannot create triggers", async () => {
+      const { rows } = await client.query(
+        `SELECT c.oid::regclass::text AS name FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE c.relkind IN ('r', 'p', 'v', 'f') AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+           AND n.nspname NOT LIKE 'pg#_toast%' ESCAPE '#'
+           AND ${anyRole("has_table_privilege(m.oid, c.oid, 'TRIGGER')")}
+         ORDER BY 1 LIMIT 20`);
+      return { ok: rows.length === 0, detail: rows.length
+        ? `TRIGGER is granted on ${rows.map((r) => r.name).join(", ")}: REVOKE TRIGGER ... FROM the app role`
+        : "no TRIGGER on any table" };
+    }),
+    () => guard("cannot create in any schema", async () => {
+      // CREATE on the database makes new schemas, such as one named like the
+      // role: the default search_path ("$user", public) looks there first, so a
+      // view in it shadows a table for every session of the role.
+      const { rows: [db] } = await client.query(
+        `SELECT ${anyRole("has_database_privilege(m.oid, current_database(), 'CREATE')")} AS create_db`);
+      if (db.create_db) {
+        return { ok: false, detail: "a role it can use can CREATE schemas in this database " +
+                 "(REVOKE CREATE ON DATABASE ... FROM PUBLIC and the app role)" };
+      }
+      const { rows } = await client.query(
+        `SELECT n.nspname FROM pg_namespace n
+         WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg#_toast%' ESCAPE '#'
+           AND n.nspname NOT LIKE 'pg#_temp#_%' ESCAPE '#'
+           AND ${anyRole("has_schema_privilege(m.oid, n.oid, 'CREATE')")}
+         ORDER BY 1`);
+      return { ok: rows.length === 0, detail: rows.length
+        ? `a role it can use can CREATE in ${rows.map((r) => r.nspname).join(", ")}: REVOKE CREATE ON SCHEMA ... ` +
+          "FROM PUBLIC and the app role (run migrations as another role)"
+        : "no CREATE in any schema" };
     }),
   ];
   const out: Check[] = [];
   for (const check of checks) out.push(await check());
   return out;
+}
+
+/** An information line: always ok, also when its query fails (say, an
+ *  unreadable catalog), so it can never change verify's result. */
+async function info(check: string, fn: () => Promise<{ ok: boolean; detail: string }>): Promise<Check> {
+  try {
+    return { table: "-", check, ...await fn(), ok: true };
+  } catch (err) {
+    return { table: "-", check, ok: true, detail: `could not read: ${msg(err)}` };
+  }
 }
 
 /** A global check; a query error fails it (a precondition that cannot be checked is not met). */
@@ -97,24 +174,43 @@ async function guard(check: string, fn: () => Promise<{ ok: boolean; detail: str
   }
 }
 
-/** Run fn in a transaction (optionally as tenant) and always roll back. */
-async function inTx<T>(client: pg.ClientBase, tenant: string | null, fn: () => Promise<T>): Promise<T> {
+/** How a transaction sets the tenant: not at all, unsigned (as SQL the app ran could), or signed. */
+type Ctx = { tenant: string; key?: Buffer } | null;
+
+/** Run fn in a transaction with that context, and always roll back. */
+async function inTx<T>(client: pg.ClientBase, ctx: Ctx, fn: () => Promise<T>): Promise<T> {
   await client.query("BEGIN");
   try {
-    if (tenant !== null) await client.query("SELECT set_config('app.current_tenant', $1, true)", [tenant]);
+    if (ctx?.key) {
+      const { rows: [r] } = await client.query("SELECT public._firewall_nonce() AS n");
+      await client.query("SELECT set_config('app.current_tenant', $1, true), set_config('app.tenant_sig', $2, true)",
+                         [ctx.tenant, sign(ctx.key, r.n, ctx.tenant)]);
+    } else if (ctx) {
+      await client.query("SELECT set_config('app.current_tenant', $1, true)", [ctx.tenant]);
+    }
     return await fn();
   } finally {
     await client.query("ROLLBACK");
   }
 }
 
-export async function verify(client: pg.ClientBase, opts: {
-  tenant: string; schemas?: string[]; column?: string; exclude?: string[]; writeProbe?: boolean;
-}): Promise<{ checks: Check[]; tables: TableReport[]; excluded: string[] }> {
+type VerifyOpts = {
+  tenant: string; key: Buffer; schemas?: string[]; column?: string; exclude?: string[]; writeProbe?: boolean;
+};
+type VerifyResult = { checks: Check[]; tables: TableReport[]; excluded: string[] };
+
+/** Every check runs with search_path = pg_catalog, pg_temp: a planted "="
+ *  must not make "tenant sees only its rows" count another tenant's rows as own. */
+export function verify(client: pg.ClientBase, opts: VerifyOpts): Promise<VerifyResult> {
+  return withCatalogPath(client, () => verifyTables(client, opts));
+}
+
+async function verifyTables(client: pg.ClientBase, opts: VerifyOpts): Promise<VerifyResult> {
+  const signed = { tenant: opts.tenant, key: opts.key };
   const schemas = opts.schemas?.length ? opts.schemas : ["public"];
   const column = opts.column ?? "tenant_id";
   const checks: Check[] = await roleChecks(client);
-  const { tables, excluded } = await scan(client, { schemas, column, exclude: opts.exclude });
+  const { tables, excluded } = await scan(client, { schemas, column, exclude: opts.exclude, context: "signed" });
   if (!tables.length) {
     checks.push({ table: "-", check: "tables found", ok: false,
                   detail: `no table with column ${column} in ${schemas.join(", ")} (wrong --column or --schema?)` });
@@ -147,11 +243,15 @@ export async function verify(client: pg.ClientBase, opts: {
     }
     try {
       // No tenant: no rows at all (fail closed).
-      const none = await inTx(client, null, async () =>
-        Number((await client.query(`SELECT count(*) AS n FROM ${name}`)).rows[0].n));
+      const count = async () => Number((await client.query(`SELECT count(*) AS n FROM ${name}`)).rows[0].n);
+      const none = await inTx(client, null, count);
       checks.push({ table: label, check: "no tenant sees nothing", ok: none === 0, detail: `${none} rows visible` });
+      // The tenant set without a signature, as SQL the app (or an agent) runs could set it.
+      const unsigned = await inTx(client, { tenant: opts.tenant }, count);
+      checks.push({ table: label, check: "unsigned tenant sees nothing", ok: unsigned === 0,
+                    detail: unsigned ? `${unsigned} rows visible: SQL the app runs can switch tenants` : "0 rows" });
       // As the tenant: every visible row is the tenant's.
-      const [foreign, own] = await inTx(client, opts.tenant, async () => {
+      const [foreign, own] = await inTx(client, signed, async () => {
         const { rows: [r] } = await client.query(
           `SELECT count(*) FILTER (WHERE ${ident(column)} IS DISTINCT FROM $1) AS foreign,
                   count(*) FILTER (WHERE ${ident(column)} = $1) AS own FROM ${name}`, [opts.tenant]);
@@ -164,11 +264,12 @@ export async function verify(client: pg.ClientBase, opts: {
       checks.push({ table: label, check: "row checks", ok: null, detail: `query failed: ${msg(err)}` });
       continue;
     }
-    if (opts.writeProbe) checks.push(await writeProbe(client, label, name, column, opts.tenant));
+    if (opts.writeProbe) checks.push(await writeProbe(client, label, name, column, signed));
   }
   if (tables.length && ownRows === 0) {
     checks.push({ table: "-", check: "tenant has rows", ok: false,
-                  detail: `tenant ${opts.tenant} sees no rows in any table, so the row checks prove nothing: use a tenant that has data` });
+                  detail: `tenant ${opts.tenant} sees no rows in any table, so the row checks prove nothing: use a tenant that has data, and check that ` +
+                          `DB_FIREWALL_TENANT_KEY is the database's key (db-firewall key)` });
   }
   checks.push(await bypassObjects(client, column));
   checks.push(await otherSchemas(client, schemas, column));
@@ -181,9 +282,9 @@ export async function verify(client: pg.ClientBase, opts: {
  * up a sequence value even when refused.
  */
 async function writeProbe(client: pg.ClientBase, label: string, name: string, column: string,
-                          tenant: string): Promise<Check> {
+                          ctx: { tenant: string; key: Buffer }): Promise<Check> {
   try {
-    await inTx(client, tenant, () => client.query(`INSERT INTO ${name} (${ident(column)}) VALUES ($1)`, [MARK]));
+    await inTx(client, ctx, () => client.query(`INSERT INTO ${name} (${ident(column)}) VALUES ($1)`, [MARK]));
     return { table: label, check: "cross-tenant insert refused", ok: false,
              detail: "a row for another tenant was accepted (rolled back)" };
   } catch (err) {
@@ -285,6 +386,7 @@ function otherSchemas(client: pg.ClientBase, schemas: string[], column: string):
 }
 
 function summary(t: TableReport): string {
+  if (t.tenant_context === "plain") return "plain tenant context: SQL the app runs can switch tenants (re-run migrate)";
   const parts = [];
   if (!t.rls_enabled) parts.push("RLS off");
   else if (!t.rls_forced) parts.push("RLS not forced");

@@ -1,5 +1,111 @@
 # Changelog
 
+## 2026-10-28: Signed tenant context (PR #14), breaking
+
+- **PostgreSQL tenant context is signed by default** (`dbfw.context` /
+  `engines.postgresql.tenant_context`: `signed`). The app sets
+  `app.tenant_sig = hex(HMAC-SHA256(key, nonce:tenant))` next to
+  `app.current_tenant`. The nonce is the backend and the transaction's start,
+  and the key is `DB_FIREWALL_TENANT_KEY` in the app and `_firewall_keys` in the
+  database. SQL the app or an AI agent runs can set `app.current_tenant`, but
+  cannot sign it, so it can no longer switch tenants. This closes the gap in
+  `@db-firewall/pg`, where SQL run inside `withTenant` could switch, and makes
+  the Python SQL rewriter a second layer, not the only one.
+- The policies check the signature once per query (`(SELECT f())`, an
+  InitPlan), so they run faster than the plain policies (200k-row count:
+  15 ms, against 341 ms).
+- Python middleware and `@db-firewall/pg` sign with `DB_FIREWALL_TENANT_KEY`
+  and clear `app.tenant_sig` too. The `session_var` resolution source takes
+  only a signed tenant. The SQL rewriter refuses `app.tenant_sig`.
+- The migration revokes every non-owner grant on the key, the bypass list,
+  the tenant map, `_firewall_sign` and `_firewall_set_tenant`, which covers
+  platforms that grant new objects directly. `_firewall_set_tenant` is now for
+  admins only. `_firewall_auto_resolve` maps `session_user`, not the
+  function owner.
+- Scanners report `tenant_context` and expect `signed`. The CLI adds
+  `migrate --context`, `scan --context` and `db-firewall key`. `verify` needs
+  the key and also checks that an unsigned tenant sees nothing, that the app
+  cannot read the key or sign, and that the signing functions match the
+  migration.
+- From the independent review:
+  - **Session reset:** SQL run in one tenant's transaction could leave a temp
+    view, a SQL-level prepared statement or a custom setting for the
+    connection's next user (another tenant). `public._firewall_reset_session`
+    now clears these after every `withTenant` call, and on Python `release()`
+    and `pool_checkin`.
+  - **Planted objects:** the migration refuses `public._firewall_*` objects
+    planted by another role, which could have read the key. All its DDL is
+    schema-qualified.
+  - **Operators:** the migration binds the predicates in `pg_catalog`, so a
+    planted operator such as `public.=` for `varchar, text` cannot bind. The
+    scanners and `verify` read policies the same way.
+  - **Scanners** fail when a firewall function differs from the migration or
+    the firewall objects have more than one owner.
+  - **`verify`** fails when the app can `CREATE` in `public`.
+  - **Tenant map:** reading it stays allowed (`db_user_map`). Column grants
+    on the key are revoked.
+  - **Key handling:** `migrate` turns statement and parameter logging off for
+    its session when it runs as a superuser, and clears `dbfw.tenant_key`
+    after a failed run.
+- From the second review round:
+  - **TS:** when `fn` breaks its transaction, the reset now runs after a
+    `ROLLBACK`. node-postgres connections are destroyed. Advisory locks are
+    released. The reset's casts are qualified.
+  - **Python:** the reset restores the settings from when the middleware
+    first set a tenant, not the ones agent SQL changed. A failed reset closes
+    the connection, and `pool_checkin` raises. `transaction_*` settings are
+    not restored.
+  - **Migration:** the owner guard also runs as the last statement.
+  - **Scanners:** they check every function the migration creates and flag
+    extra `_firewall_*` functions. Several superuser owners are accepted.
+    `verify` fails on `CREATE` in any schema.
+- From the third review round:
+  - **TS:** every adapter now holds one connection for the call (Drizzle via
+    `db.$client`; postgres.js via `sql.reserve()` with `begin`/`savepoint`
+    added) and resets the session after COMMIT, so a deferred trigger cannot
+    undo the reset. `RESET ALL` and the advisory-lock release run first, so a
+    short `statement_timeout` cannot stop the reset.
+  - **Failed resets:** node-postgres connections are destroyed. postgres.js
+    connections are retired, because ending them crashed postgres.js. A
+    node-postgres connection whose driver statements were removed is also
+    destroyed.
+  - **Migration:** the guard is two `DO` blocks, so no TEMP privilege is
+    needed.
+  - **`verify`** also fails on `TRIGGER` on any table.
+- From the fourth review round:
+  - **Migration:** it revokes `TRIGGER` and `TRUNCATE` on protected tables
+    from everyone but the owner. A trigger function, even in `pg_temp`, runs
+    in other tenants' sessions.
+  - **Python:** after a `release()` inside an open transaction, the next
+    tenant set on that connection resets it again first.
+  - **TS:**
+    - Drizzle relational queries work again (the full relational config is
+      passed).
+    - A pg client that fn ends no longer crashes the process.
+    - A transaction left aborted makes the call throw on Drizzle and
+      postgres.js too.
+- From the independent final review:
+  - **`verify`:**
+    - It fails on `CREATE` on the database. A schema named like the role
+      comes first in the default `search_path`, and a view in it shadows a
+      table.
+    - It fails on membership in `pg_read_all_data`, `pg_write_all_data`,
+      `pg_execute_server_program`, `pg_read_server_files` and
+      `pg_write_server_files`.
+  - **The reset** also drops `currval`/`lastval` (`DISCARD SEQUENCES`).
+  - **Docs:**
+    - `search_path` guidance: schema-qualify table names, or leave out
+      `"$user"`.
+    - The limits of one shared role: query text in `pg_stat_activity`,
+      `pg_terminate_backend`, and `ALTER ROLE` on itself.
+- Opt-in `harden_signals` (`dbfw.harden_signals`, `migrate --harden-signals`):
+  it revokes `pg_terminate_backend` / `pg_cancel_backend` from `PUBLIC` in the
+  database, so tenants sharing one role cannot end each other's requests. It
+  needs a superuser. `verify` adds two information lines: whether the role
+  can signal other sessions, and its role-level defaults.
+- **Upgrade:** set `DB_FIREWALL_TENANT_KEY` in the app before re-running the
+  migration, or set `tenant_context: plain`. PostgreSQL 13+ for signed.
+
 ## 2026-10-28: Node CLI (PR #13)
 
 - **`db-firewall` CLI** (`packages/cli`, `npx db-firewall`), for PostgreSQL:

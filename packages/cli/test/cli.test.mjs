@@ -12,6 +12,9 @@ if (!ADMIN_URL && process.env.DBFW_REQUIRE_LIVE) throw new Error("DBFW_REQUIRE_L
 const live = { skip: ADMIN_URL ? false : "DBFW_PG_URL not set" };
 const S = "cli_app", ROLE = "dbfw_cli", PW = "DbfwCli_2026x";
 const CLI = new URL("../dist/cli.js", import.meta.url).pathname;
+// The app's signing key: migrate installs it, verify signs with it.
+const KEY = "5a".repeat(32);
+process.env.DB_FIREWALL_TENANT_KEY = KEY;
 
 function appUrl() { const u = new URL(ADMIN_URL); u.username = ROLE; u.password = PW; return u.toString(); }
 function run(args, env = {}) {
@@ -80,7 +83,7 @@ describe("migrate, scan, verify", live, () => {
     assert.equal(t.late.rls_enabled, false);
     assert.deepEqual(t.open_t.extra_permissive_policies, ["open_all"]);
     const text = await run(["scan", "--url", ADMIN_URL, ...scope]);
-    assert.match(text.stdout, new RegExp(`FAIL\\s+${S}\\.late\\s+\\(permissive; RLS off`));
+    assert.match(text.stdout, new RegExp(`FAIL\\s+${S}\\.late\\s+\\(permissive, no policies; RLS off`));
   });
 
   it("excluded tables are listed, not skipped silently", async () => {
@@ -220,7 +223,7 @@ describe("migrate, scan, verify", live, () => {
     ["a LEAKPROOF function", "-: no RLS-bypassing views or functions",
      `CREATE FUNCTION ${S}.peek(text) RETURNS boolean LANGUAGE sql LEAKPROOF AS 'SELECT true';`,
      `DROP FUNCTION ${S}.peek(text);`],
-    ["the bypass function was changed", "-: bypass function unchanged",
+    ["the bypass function was changed", "-: firewall functions unchanged",
      `CREATE OR REPLACE FUNCTION public._firewall_is_bypass_role(p_role TEXT) RETURNS BOOLEAN AS $f$
         SELECT EXISTS (SELECT 1 FROM public._firewall_bypass_roles WHERE role_name = p_role)
             OR current_setting('dbfw.maintenance', true) = 'on';
@@ -228,6 +231,41 @@ describe("migrate, scan, verify", live, () => {
      `CREATE OR REPLACE FUNCTION public._firewall_is_bypass_role(p_role TEXT) RETURNS BOOLEAN AS $f$
         SELECT EXISTS (SELECT 1 FROM public._firewall_bypass_roles WHERE role_name = p_role);
       $f$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp;`],
+    // Signed context: the key and the signing must stay out of the app's reach.
+    ["it can read the signing key", "-: cannot read the key or sign",
+     `GRANT SELECT ON public._firewall_keys TO ${ROLE};`, `REVOKE SELECT ON public._firewall_keys FROM ${ROLE};`],
+    ["it can sign", "-: cannot read the key or sign",
+     `GRANT EXECUTE ON FUNCTION public._firewall_sign(text) TO ${ROLE};`,
+     `REVOKE EXECUTE ON FUNCTION public._firewall_sign(text) FROM ${ROLE};`],
+    ["_firewall_tenant was changed to trust an unsigned tenant", "-: firewall functions unchanged",
+     `CREATE OR REPLACE FUNCTION public._firewall_tenant() RETURNS TEXT AS $f$
+        SELECT NULLIF(current_setting('app.current_tenant', true), '');
+      $f$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp;`,
+     `CREATE OR REPLACE FUNCTION public._firewall_tenant() RETURNS TEXT AS $f$
+    SELECT g.t FROM (SELECT NULLIF(current_setting('app.current_tenant', true), '') AS t,
+                            current_setting('app.tenant_sig', true) AS s) g
+    WHERE sha256(convert_to(g.s, 'UTF8')) = sha256(convert_to(public._firewall_sign(g.t), 'UTF8'));
+      $f$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp;`],
+    ["it has TRIGGER on a table", "-: cannot create triggers",
+     `GRANT TRIGGER ON ${S}.docs TO ${ROLE};`, `REVOKE TRIGGER ON ${S}.docs FROM ${ROLE};`],
+    ["it can CREATE schemas in the database", "-: cannot create in any schema",
+     `GRANT CREATE ON DATABASE ${DB} TO ${ROLE};`, `REVOKE CREATE ON DATABASE ${DB} FROM ${ROLE};`],
+    ["it can run programs as the server", "-: role",
+     `GRANT pg_execute_server_program TO ${ROLE};`, `REVOKE pg_execute_server_program FROM ${ROLE};`],
+    ["it can read server files", "-: role",
+     `GRANT pg_read_server_files TO ${ROLE};`, `REVOKE pg_read_server_files FROM ${ROLE};`],
+    ["it can CREATE in public", "-: cannot create in any schema",
+     `GRANT CREATE ON SCHEMA public TO ${ROLE};`, `REVOKE CREATE ON SCHEMA public FROM ${ROLE};`],
+    ["it can CREATE in its own schema", "-: cannot create in any schema",
+     `GRANT CREATE ON SCHEMA ${S} TO ${ROLE};`, `REVOKE CREATE ON SCHEMA ${S} FROM ${ROLE};`],
+    ["_firewall_auto_resolve was changed to sign any tenant", "-: firewall functions unchanged",
+     `ALTER FUNCTION public._firewall_auto_resolve() RENAME TO _firewall_auto_resolve_saved;
+      CREATE FUNCTION public._firewall_auto_resolve() RETURNS TEXT AS $f$ SELECT 'x'::text $f$ LANGUAGE sql;`,
+     `DROP FUNCTION public._firewall_auto_resolve();
+      ALTER FUNCTION public._firewall_auto_resolve_saved() RENAME TO _firewall_auto_resolve;`],
+    ["an extra _firewall_ function", "-: firewall functions unchanged",
+     `CREATE FUNCTION public._firewall_extra() RETURNS int LANGUAGE sql AS 'SELECT 1';`,
+     `DROP FUNCTION public._firewall_extra();`],
   ];
   for (const [why, check, apply, undo] of blockers) {
     it(`verify fails when ${why}`, async () => {
@@ -295,6 +333,91 @@ describe("migrate, scan, verify", live, () => {
     assert.equal(t.open_t.policy_mode, "restrictive");
     const v = await json(["verify", ...APP(), "--tenant", "A", "--exclude", "_firewall_*"]);
     assert.equal(v.code, 0, failed(v.data.checks).join("; "));
+  });
+
+  it("plain context: scan and verify fail, scan --context plain accepts it", async () => {
+    assert.equal((await run(["migrate", "--url", ADMIN_URL, ...scope, "--context", "plain"])).code, 0);
+    try {
+      const r = await json(["scan", "--url", ADMIN_URL, ...scope]);
+      assert.equal(byTable(r.data.tables).docs.protected, false);
+      assert.equal(byTable(r.data.tables).docs.tenant_context, "plain");
+      assert.match((await run(["scan", "--url", ADMIN_URL, ...scope])).stdout, /plain tenant context/);
+      const p = await json(["scan", "--url", ADMIN_URL, ...scope, "--context", "plain"]);
+      assert.equal(byTable(p.data.tables).docs.protected, true);
+      const v = await json(["verify", ...APP(), "--tenant", "A", "--exclude", "_firewall_*"]);
+      assert.equal(v.code, 1);
+      assert.ok(failed(v.data.checks).includes(`${S}.docs: unsigned tenant sees nothing`));
+    } finally {
+      assert.equal((await run(["migrate", "--url", ADMIN_URL, ...scope, "--mode", "restrictive"])).code, 0);
+    }
+  });
+
+  it("verify needs the key, and a wrong key proves nothing", async () => {
+    assert.equal((await run(["verify", ...APP(), "--tenant", "A"], { DB_FIREWALL_TENANT_KEY: "" })).code, 2);
+    assert.equal((await run(["verify", ...APP(), "--tenant", "A"], { DB_FIREWALL_TENANT_KEY: "abcd" })).code, 2);
+    const r = await run(["verify", ...APP(), "--tenant", "A", "--exclude", "_firewall_*", "--json"],
+                        { DB_FIREWALL_TENANT_KEY: "6b".repeat(32) });
+    const checks = JSON.parse(r.stdout).checks;
+    assert.equal(r.code, 1);
+    assert.match(checks.find((c) => c.check === "tenant has rows").detail, /db-firewall key/);
+  });
+
+  it("migrate refuses _firewall_* objects another role planted", async () => {
+    await withChange(`GRANT CREATE ON SCHEMA public TO ${ROLE}; SET ROLE ${ROLE};
+        CREATE TABLE public._firewall_planted (k bytea); RESET ROLE;`,
+      `DROP TABLE public._firewall_planted; REVOKE CREATE ON SCHEMA public FROM ${ROLE};`, async () => {
+        const r = await run(["migrate", "--url", ADMIN_URL, ...scope]);
+        assert.equal(r.code, 2);
+        assert.match(r.stderr, /planted/);
+      });
+  });
+
+  it("scan reports a policy bound to a planted operator", async () => {
+    const [{ stem }] = await sql(`SELECT 'fw_' || left(md5('${S}.vdocs'), 12) AS stem`);
+    await withChange(`CREATE TABLE ${S}.vdocs (id int, tenant_id varchar(36));
+        CREATE FUNCTION public.rv_any(varchar, text) RETURNS boolean LANGUAGE sql AS 'SELECT true';
+        CREATE OPERATOR public.= (LEFTARG = varchar, RIGHTARG = text, FUNCTION = public.rv_any);`,
+      `DROP TABLE ${S}.vdocs; DROP OPERATOR public.= (varchar, text); DROP FUNCTION public.rv_any(varchar, text);`,
+      async () => {
+        assert.equal((await run(["migrate", "--url", ADMIN_URL, ...scope, "--mode", "restrictive"])).code, 0);
+        assert.equal(byTable((await json(["scan", "--url", ADMIN_URL, ...scope])).data.tables).vdocs.protected, true);
+        await sql(`SET search_path = public; ALTER POLICY ${stem}_sel ON ${S}.vdocs USING
+          (tenant_id = (SELECT public._firewall_tenant()) OR (SELECT public._firewall_is_bypass_role(current_user::text)))`);
+        const t = byTable((await json(["scan", "--url", ADMIN_URL, ...scope])).data.tables).vdocs;
+        assert.equal(t.protected, false);
+        assert.ok(t.altered_policies.includes(`${stem}_sel`));
+      });
+  });
+
+  it("the info lines report signals and role defaults, without failing", async () => {
+    await withChange(`ALTER ROLE ${ROLE} SET statement_timeout = '9s';`, `ALTER ROLE ${ROLE} RESET statement_timeout;`,
+      async () => {
+        const r = await json(["verify", ...APP(), "--tenant", "A", ...clean]);
+        assert.equal(r.code, 0, failed(r.data.checks).join("; "));
+        const info = Object.fromEntries(r.data.checks.filter((c) => c.check.endsWith("(info)")).map((c) => [c.check, c]));
+        assert.match(info["signals other sessions (info)"].detail, /^yes/);
+        assert.match(info["role defaults (info)"].detail, /statement_timeout=9s/);
+      });
+  });
+
+  it("migrate --harden-signals revokes backend signals (superuser), and verify sees it", async () => {
+    const restore = "GRANT EXECUTE ON FUNCTION pg_catalog.pg_terminate_backend(integer, bigint), " +
+                    "pg_catalog.pg_cancel_backend(integer) TO PUBLIC";
+    try {
+      assert.equal((await run(["migrate", "--url", ADMIN_URL, ...scope, "--mode", "restrictive", "--harden-signals"])).code, 0);
+      const [{ can }] = await sql(`SELECT has_function_privilege('${ROLE}', 'pg_catalog.pg_terminate_backend(integer, bigint)', 'EXECUTE') AS can`);
+      assert.equal(can, false);
+      const r = await json(["verify", ...APP(), "--tenant", "A", ...clean]);
+      assert.match(r.data.checks.find((c) => c.check === "signals other sessions (info)").detail, /^no/);
+    } finally {
+      await sql(restore);
+    }
+  });
+
+  it("key prints the database's key", async () => {
+    const r = await run(["key", "--url", ADMIN_URL]);
+    assert.equal(r.code, 0);
+    assert.equal(r.stdout.trim(), KEY);
   });
 
   it("an invalid mode exits 2", async () => {

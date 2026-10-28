@@ -16,6 +16,65 @@ const ids = (rows) => rows.map((r) => Number(r.id)).sort();
 const SELECT = `SELECT id FROM ${SCHEMA}.docs`;
 const docs = pgSchema(SCHEMA).table("docs", { id: integer("id"), tenantId: text("tenant_id") });
 
+// Session state SQL run inside fn could leave for the connection's next user
+// (another tenant): a temp view shadowing a table, a SQL-level prepared
+// statement, a custom setting as a drop box, a search_path. withTenant must
+// undo all of it, after fn returns and after fn throws.
+const PLANT = ["CREATE TEMP VIEW docs AS SELECT 99 AS id", "PREPARE agent_plant AS SELECT 1",
+               "SELECT set_config('rv.loot', 'B-secret', false)", "SET search_path = pg_temp, public",
+               "SELECT pg_advisory_lock(66, 2)"];
+const PROBE = "SELECT (SELECT count(*) FROM pg_class WHERE relnamespace = pg_my_temp_schema())::int AS temp, " +
+  "(SELECT count(*) FROM pg_prepared_statements WHERE from_sql)::int AS prep, " +
+  "coalesce(current_setting('rv.loot', true), '') AS loot, current_setting('search_path') AS path, " +
+  "(SELECT count(*) FROM pg_locks WHERE locktype = 'advisory')::int AS locks";
+const CLEAN = { temp: 0, prep: 0, loot: "", path: '"$user", public', locks: 0 };
+// fn breaks the transaction around the reset: leaves it aborted, releases its
+// savepoint and throws, or shadows the jsonb type the reset call casts to.
+const BREAKS = {
+  aborted: async (raw, h) => { await raw(h, "SELECT 1/0").catch(() => {}); },
+  "failed statement": async (raw, h) => { await raw(h, "RELEASE SAVEPOINT nope").catch(() => {}); throw new Error("boom"); },
+  "temp type": async (raw, h) => { await raw(h, "CREATE TYPE pg_temp.jsonb AS (x int)"); },
+};
+// A deferred trigger fires at COMMIT. Planted in a schema the app can CREATE
+// in (verify fails on that), it would run after a reset done before COMMIT.
+const DEFERRED = [
+  "CREATE TABLE ts_plant.t (x int)",
+  "CREATE FUNCTION ts_plant.f() RETURNS trigger LANGUAGE plpgsql AS " +
+    "$$ BEGIN PERFORM set_config('search_path', 'ts_plant, public', false); RETURN NULL; END $$",
+  "CREATE CONSTRAINT TRIGGER late AFTER INSERT ON ts_plant.t DEFERRABLE INITIALLY DEFERRED " +
+    "FOR EACH ROW EXECUTE FUNCTION ts_plant.f()",
+  "INSERT INTO ts_plant.t VALUES (1)",
+];
+async function assertDeferredTriggerReset(db, raw) {
+  await adminQuery("DROP SCHEMA IF EXISTS ts_plant CASCADE; CREATE SCHEMA ts_plant; " +
+                   "GRANT CREATE, USAGE ON SCHEMA ts_plant TO dbfw_ts");
+  try {
+    await withTenant(db, "A", async (h) => { for (const q of DEFERRED) await raw(h, q); });
+    const [state] = await withTenant(db, "B", (h) => raw(h, PROBE));
+    assert.equal(state.path, '"$user", public');
+  } finally {
+    await adminQuery("DROP SCHEMA IF EXISTS ts_plant CASCADE");
+  }
+}
+async function assertResets(db, raw) {
+  for (const fails of [false, true]) {
+    const planted = withTenant(db, "A", async (h) => {
+      for (const q of PLANT) await raw(h, q);
+      if (fails) throw new Error("boom");
+    });
+    if (fails) await assert.rejects(planted, /boom/); else await planted;
+    const [state] = await withTenant(db, "B", (h) => raw(h, PROBE));
+    assert.deepEqual({ ...state }, CLEAN, fails ? "after fn threw" : "after fn returned");
+  }
+  for (const [how, breakIt] of Object.entries(BREAKS)) {
+    // Whether the call throws differs by driver; what matters is the next borrower.
+    await withTenant(db, "A", async (h) => { for (const q of PLANT) await raw(h, q); await breakIt(raw, h); })
+      .catch(() => {});
+    const [state] = await withTenant(db, "B", (h) => raw(h, PROBE));
+    assert.deepEqual({ ...state }, CLEAN, `after fn ${how}`);
+  }
+}
+
 describe("tenant ids", () => {
   for (const bad of ["", "a\u0000b", "a\nb", "a\\b", "__BYPASS__", "__bypass__", 7, undefined]) {
     it(`refuses ${JSON.stringify(bad)}`, () => assert.throws(() => validateTenantId(bad)));
@@ -104,6 +163,65 @@ describe("node-postgres", live, () => {
     await withTenant(pool, "A", async (c) => { conn = c.connection; });
     assert.throws(() => conn.query, TypeError);
   });
+  for (const [how, sql] of [["SET LOCAL", "SET LOCAL app.current_tenant = 'B'"],
+                           ["set_config", "SELECT set_config('app.current_tenant', 'B', true)"]]) {
+    it(`SQL run inside fn cannot switch tenants (${how})`, async () => {
+      const rows = await withTenant(pool, "A", async (c) => {
+        await c.query(sql);
+        return (await c.query(SELECT)).rows;
+      });
+      assert.deepEqual(ids(rows), []);                  // B's row stays hidden: B is not signed
+    });
+  }
+  it("a forged or replayed signature sees nothing", async () => {
+    const sig = await withTenant(pool, "A", async (c) =>
+      (await c.query("SELECT current_setting('app.tenant_sig') AS s")).rows[0].s);
+    const seen = async (tenant, s) => {
+      const c = await pool.connect();
+      try {
+        await c.query("BEGIN");
+        await c.query("SELECT set_config('app.current_tenant', $1, true), set_config('app.tenant_sig', $2, true)",
+                      [tenant, s]);
+        return ids((await c.query(SELECT)).rows);
+      } finally { await c.query("ROLLBACK"); c.release(); }
+    };
+    assert.deepEqual(await seen("A", sig), []);           // new transaction, new nonce
+    assert.deepEqual(await seen("B", "0".repeat(64)), []);
+  });
+  it("without the key the context is unsigned and shows nothing", async () => {
+    const saved = process.env.DB_FIREWALL_TENANT_KEY;
+    delete process.env.DB_FIREWALL_TENANT_KEY;
+    try {
+      assert.deepEqual(ids(await withTenant(pool, "A", async (c) => (await c.query(SELECT)).rows)), []);
+    } finally { process.env.DB_FIREWALL_TENANT_KEY = saved; }
+    process.env.DB_FIREWALL_TENANT_KEY = "abcd";
+    try {
+      await assert.rejects(withTenant(pool, "A", async () => {}), /32 to 64 bytes/);
+    } finally { process.env.DB_FIREWALL_TENANT_KEY = saved; }
+  });
+  it("session state left by fn is reset for the next borrower", async () => {
+    await assertResets(pool, async (c, q) => (await c.query(q)).rows);
+  });
+  it("a deferred trigger cannot undo the reset (reset after COMMIT)", async () => {
+    await assertDeferredTriggerReset(pool, async (c, q) => (await c.query(q)).rows);
+  });
+  it("fn ending its own backend fails the call, not the process", async () => {
+    await assert.rejects(withTenant(pool, "A", (c) => c.query("SELECT pg_terminate_backend(pg_backend_pid())")));
+    assert.deepEqual(ids(await withTenant(pool, "A", async (c) => (await c.query(SELECT)).rows)), [1]);
+  });
+  it("a connection whose driver statement fn removed is discarded", async () => {
+    const Q = { name: "docs_q", text: SELECT };
+    const pid = await withTenant(pool, "A", async (c) => {
+      await c.query(Q);
+      await c.query("DEALLOCATE docs_q");
+      return (await c.query("SELECT pg_backend_pid() AS p")).rows[0].p;
+    });
+    const next = await withTenant(pool, "A", async (c) => {
+      assert.deepEqual(ids((await c.query(Q)).rows), [1]);              // works: a new connection
+      return (await c.query("SELECT pg_backend_pid() AS p")).rows[0].p;
+    });
+    assert.notEqual(next, pid);
+  });
   it("a session-level tenant set inside fn does not survive the release", async () => {
     await withTenant(pool, "A", (c) => c.query("SET app.current_tenant = 'B'"));
     assert.deepEqual(ids((await pool.query(SELECT)).rows), []);
@@ -134,6 +252,22 @@ describe("postgres.js", live, () => {
     assert.deepEqual(ids(await withTenant(sql, "B", (tx) => tx`SELECT id FROM ts_app.docs`)), [2]);
     assert.deepEqual(ids(await sql.unsafe(SELECT)), []);
     await assertSafeRole(sql);
+  });
+  it("session state left by fn is reset for the next borrower", async () => {
+    await assertResets(sql, (tx, q) => tx.unsafe(q));
+  });
+  it("a deferred trigger cannot undo the reset (reset after COMMIT)", async () => {
+    await assertDeferredTriggerReset(sql, (tx, q) => tx.unsafe(q));
+  });
+  it("a transaction fn left aborted fails the call", async () => {
+    await assert.rejects(withTenant(sql, "A", async (tx) => { await tx.unsafe("SELECT 1/0").catch(() => {}); }),
+                         /aborted/);
+  });
+  it("tx.savepoint works and a nested begin is refused", async () => {
+    const rows = await withTenant(sql, "A", (tx) => tx.savepoint((sp) => sp`SELECT id FROM ts_app.docs`));
+    assert.deepEqual(ids(rows), [1]);
+    await assert.rejects(withTenant(sql, "A", async (tx) => tx.begin(async () => 1)), /not allowed/);
+    await assert.rejects(withTenant(sql, "A", (tx) => tx.savepoint(async () => { throw new Error("inner"); })), /inner/);
   });
   it("late queries and nested calls are refused", async () => {
     let kept;
@@ -173,6 +307,20 @@ describe("Drizzle", live, () => {
     assert.deepEqual(ids(await withTenant(db, "B", read)), [2]);
     assert.deepEqual(ids((await db.execute(dsql.raw(SELECT))).rows), []);
     await assertSafeRole(db);
+  });
+  it("session state left by fn is reset for the next borrower", async () => {
+    await assertResets(db, async (tx, q) => (await tx.execute(dsql.raw(q))).rows);
+  });
+  it("a deferred trigger cannot undo the reset (reset after COMMIT)", async () => {
+    await assertDeferredTriggerReset(db, async (tx, q) => (await tx.execute(dsql.raw(q))).rows);
+  });
+  it("relational queries (tx.query) work", async () => {
+    const rdb = drizzle(pool, { schema: { docs } });
+    assert.deepEqual(ids(await withTenant(rdb, "A", (tx) => tx.query.docs.findMany())), [1]);
+  });
+  it("a transaction fn left aborted fails the call", async () => {
+    await assert.rejects(withTenant(db, "A", async (tx) => { await tx.execute(dsql.raw("SELECT 1/0")).catch(() => {}); }),
+                         /aborted/);
   });
   it("late queries, nested calls and a raw Drizzle transaction are refused", async () => {
     let kept;

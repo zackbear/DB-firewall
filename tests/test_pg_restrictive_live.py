@@ -21,6 +21,7 @@ ROOT = os.path.join(os.path.dirname(__file__), '..')
 sys.path.insert(0, ROOT)
 from hooks.scan_engines import scan_tables  # noqa: E402
 from middleware.db_firewall import DBEngine, load_config, run_migration  # noqa: E402
+from middleware.db_firewall.db_context import _set_context_postgres  # noqa: E402
 
 SCHEMA, ROLE = "rs_app", "rs_app_user"
 
@@ -64,7 +65,7 @@ def _ids(table, tenant=None, user=None):
     with psycopg.connect(DSN) as c:
         c.execute(f"SET LOCAL ROLE {ROLE}")
         if tenant:
-            c.execute("SELECT set_config('app.current_tenant', %s, true)", (tenant,))
+            _set_context_postgres(c, tenant)          # signed, as the middleware does
         if user:
             c.execute("SELECT set_config('app.user', %s, true)", (user,))
         return [r[0] for r in c.execute(f"SELECT id FROM {SCHEMA}.{table} ORDER BY id").fetchall()]
@@ -97,7 +98,7 @@ def test_fails_closed_without_tenant():
 def test_cross_tenant_write_blocked():
     with psycopg.connect(DSN) as c:
         c.execute(f"SET LOCAL ROLE {ROLE}")
-        c.execute("SELECT set_config('app.current_tenant', 'A', true)")
+        _set_context_postgres(c, "A")
         with pytest.raises(psycopg.errors.InsufficientPrivilege):
             c.execute(f"INSERT INTO {SCHEMA}.plain VALUES (9, 'B')")
 

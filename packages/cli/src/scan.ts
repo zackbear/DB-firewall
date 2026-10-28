@@ -1,6 +1,8 @@
 // PostgreSQL scan: the same checks as hooks/scan_engines.py (_scan_postgres),
 // so TypeScript teams need no Python. Keep the two in step.
+import { readFileSync } from "node:fs";
 import type pg from "pg";
+import { MIGRATION } from "./migrate.js";
 
 /** Exactly the tables migrations/001_postgresql.sql skips, so a table the
  *  migration protects is never skipped here. Skipped tables are reported. */
@@ -24,6 +26,19 @@ export interface TableReport {
   altered_policies: string[];
   stale_base_policy: boolean;
   predicate_check: string;
+  /** The context the policies use: signed, plain, or altered (neither); null without policies. */
+  tenant_context: "signed" | "plain" | "altered" | null;
+}
+
+export type Context = "signed" | "plain";
+
+/** The migration's predicate for dbfw.context signed (default) or plain. */
+export function predicate(column: string, context: Context): string {
+  return context === "plain"
+    ? `${ident(column)} = NULLIF(current_setting('app.current_tenant', true), '') ` +
+      "OR public._firewall_is_bypass_role(current_user::text)"
+    : `${ident(column)} = (SELECT public._firewall_tenant()) ` +
+      "OR (SELECT public._firewall_is_bypass_role(current_user::text))";
 }
 
 // Exact schema.table match. Protected = RLS enabled AND forced AND all four
@@ -91,10 +106,9 @@ export function globMatch(pattern: string, name: string): boolean {
  * columns, read back, then rolled back. Exact comparison catches a changed
  * cast, constant or function overload.
  */
-async function reference(client: pg.ClientBase, rel: string, column: string):
+async function reference(client: pg.ClientBase, rel: string, column: string, context: Context):
     Promise<[string | null, string | null]> {
-  const pred = `${ident(column)} = NULLIF(current_setting('app.current_tenant', true), '') ` +
-    "OR public._firewall_is_bypass_role(current_user::text)";
+  const pred = predicate(column, context);
   await client.query("BEGIN");
   try {
     await client.query(`CREATE TEMP TABLE _fw_ref (LIKE ${rel})`);
@@ -112,10 +126,90 @@ async function reference(client: pg.ClientBase, rel: string, column: string):
 
 export interface ScanResult { tables: TableReport[]; excluded: string[] }
 
+const norm = (x: string) => x.replace(/\s+/g, " ").trim();
+
+/**
+ * Every function the migration creates must match it (body, SECURITY DEFINER,
+ * settings, volatility, language, return type), with no extra public._firewall_*
+ * function: the policies call some of them, others sign, and a changed body
+ * (say, a session-setting "maintenance switch") opens every table while the
+ * policies still look exact. Every public._firewall_* object must have one
+ * owner, or only superusers: an object another role planted keeps its owner.
+ */
+export async function firewallObjects(client: pg.ClientBase): Promise<{ ok: boolean; detail: string }> {
+  const sql = readFileSync(MIGRATION, "utf8");
+  const want = [...sql.matchAll(/CREATE OR REPLACE FUNCTION public\.(_firewall_\w+)\(([^)]*)\)\s*RETURNS (\w+) AS \$\$([\s\S]*?)\$\$ LANGUAGE (\w+)([^;]*);/g)]
+    .map(([, name, args, ret, body, lang, tail]) => ({
+      name: name!, sig: args!.split(",").map((a) => a.trim().split(/\s+/)[1]?.toLowerCase()).filter(Boolean).join(", "),
+      ret: ret!.toLowerCase(), body: body!, lang: lang!.toLowerCase(), tail: tail!,
+    }));
+  const diff: string[] = [];
+  for (const w of want) {
+    const { rows: [f] } = await client.query(
+      `SELECT prosrc, prosecdef, proconfig, provolatile, l.lanname, format_type(prorettype, NULL) AS ret
+       FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang WHERE p.oid = to_regprocedure($1)`,
+      [`public.${w.name}(${w.sig})`]);
+    if (!f) { diff.push(`${w.name} (missing)`); continue; }
+    const path = /SET search_path = ([^\n;]+?)\s*$/m.exec(w.tail)?.[1];
+    const what = [
+      norm(f.prosrc) !== norm(w.body) && "body",
+      f.prosecdef !== /SECURITY DEFINER/.test(w.tail) && "SECURITY DEFINER",
+      JSON.stringify(f.proconfig) !== JSON.stringify(path ? [`search_path=${path}`] : null) && "settings",
+      f.provolatile !== (/STABLE/.test(w.tail) ? "s" : /IMMUTABLE/.test(w.tail) ? "i" : "v") && "volatility",
+      (f.lanname !== w.lang || f.ret !== w.ret) && "language or return type",
+    ].filter(Boolean);
+    if (what.length) diff.push(`${w.name} (${what.join(", ")})`);
+  }
+  const { rows: extra } = await client.query(
+    `SELECT p.oid::regprocedure::text AS fn FROM pg_proc p
+     WHERE p.pronamespace = 'public'::regnamespace AND p.proname LIKE '#_firewall#_%' ESCAPE '#'
+       AND NOT (p.proname || '(' || oidvectortypes(p.proargtypes) || ')') = ANY($1)
+     ORDER BY 1`,
+    [want.map((w) => `${w.name}(${w.sig})`)]);
+  if (extra.length) diff.push(`extra ${extra.map((e) => e.fn).join(", ")}`);
+  const { rows: owners } = await client.query(
+    `SELECT pg_get_userbyid(o.owner) AS owner, r.rolsuper AS super, string_agg(o.name, ', ' ORDER BY o.name) AS objects
+     FROM (SELECT relname::text AS name, relowner AS owner FROM pg_class
+           WHERE relnamespace = 'public'::regnamespace AND relname LIKE '#_firewall#_%' ESCAPE '#'
+           UNION ALL SELECT proname::text, proowner FROM pg_proc
+           WHERE pronamespace = 'public'::regnamespace AND proname LIKE '#_firewall#_%' ESCAPE '#') o
+     JOIN pg_roles r ON r.oid = o.owner
+     GROUP BY o.owner, r.rolsuper ORDER BY count(*) DESC`);
+  const mixed = owners.length > 1 && owners.some((o) => !o.super);
+  if (mixed) {
+    diff.push(`more than one owner (${owners.map((o) => `${o.owner}: ${o.objects}`).join("; ")}): ` +
+              "objects another role planted? drop those and re-run migrate");
+  }
+  return { ok: diff.length === 0, detail: diff.length
+    ? `differ from the migration: ${diff.join("; ")}${mixed ? "" : ": re-run migrate"}`
+    : "match the migration, one owner" };
+}
+
+/** Run fn with search_path = pg_catalog, pg_temp, so a planted operator in
+ *  another schema cannot hide in how a policy reads, then put it back. */
+export async function withCatalogPath<T>(client: pg.ClientBase, fn: () => Promise<T>): Promise<T> {
+  const { rows: [r] } = await client.query(
+    "SELECT current_setting('search_path') AS old, set_config('search_path', 'pg_catalog, pg_temp', false)");
+  try {
+    return await fn();
+  } finally {
+    await client.query("SELECT set_config('search_path', $1, false)", [r.old]);
+  }
+}
+
 /** Scan every table in the schemas that has the tenant column. */
-export async function scan(client: pg.ClientBase, opts: {
-  schemas?: string[]; column?: string; exclude?: string[];
+export function scan(client: pg.ClientBase, opts: {
+  schemas?: string[]; column?: string; exclude?: string[]; context?: Context;
 } = {}): Promise<ScanResult> {
+  return withCatalogPath(client, () => scanTables(client, opts));
+}
+
+async function scanTables(client: pg.ClientBase, opts: {
+  schemas?: string[]; column?: string; exclude?: string[]; context?: Context;
+}): Promise<ScanResult> {
+  const context: Context = opts.context ?? "signed";
+  // The predicate calls these: when they differ, no table is protected.
+  const objects = await firewallObjects(client).catch((e) => ({ ok: false, detail: (e as Error).message }));
   const schemas = opts.schemas?.length ? opts.schemas : ["public"];
   const column = opts.column ?? "tenant_id";
   const exclude = opts.exclude ?? DEFAULT_EXCLUDED;
@@ -125,15 +219,23 @@ export async function scan(client: pg.ClientBase, opts: {
   for (const r of rows) {
     if (exclude.some((p) => globMatch(p, r.table))) { excluded.push(`${schema}.${r.table}`); continue; }
     const policies: [string, string, string[], string | null, string | null][] = r.policies;
-    const [ref, why] = policies.length ? await reference(client, r.ref_rel, column) : [null, null];
+    const [ref, why] = policies.length ? await reference(client, r.ref_rel, column, context) : [null, null];
     const unverified = policies.length > 0 && ref === null;
-    const altered = ref === null ? [] : policies.filter(([name, cmd, roles, qual, check]) => {
+    const alteredFrom = (want: string) => policies.filter(([name, cmd, roles, qual, check]) => {
       const op = name.slice(name.lastIndexOf("_") + 1);
-      const wantQual = ["sel", "upd", "del"].includes(op) ? ref : null;
-      const wantCheck = ["ins", "upd"].includes(op) ? ref : null;
+      const wantQual = ["sel", "upd", "del"].includes(op) ? want : null;
+      const wantCheck = ["ins", "upd"].includes(op) ? want : null;
       return !(roles.length === 1 && roles[0] === "public") || cmd !== CMD[op]
         || qual !== wantQual || check !== wantCheck;
     }).map(([name]) => name).sort();
+    const altered = ref === null ? [] : alteredFrom(ref);
+    // Policies in the other context count as altered; the report names it.
+    let found: TableReport["tenant_context"] = policies.length && !unverified && !altered.length ? context : null;
+    if (policies.length && !unverified && altered.length) {
+      const other: Context = context === "signed" ? "plain" : "signed";
+      const [ref2] = await reference(client, r.ref_rel, column, other);
+      found = ref2 !== null && !alteredFrom(ref2).length ? other : "altered";
+    }
     const extra: string[] = [...r.extra].sort();
     out.push({
       schema, table: r.table, has_tenant_col: true, has_rls_policy: r.missing.length === 0, owner: r.owner,
@@ -142,12 +244,13 @@ export async function scan(client: pg.ClientBase, opts: {
       missing_policies: [...r.missing].sort(),
       extra_permissive_policies: extra,
       altered_policies: altered,
+      tenant_context: found,
       stale_base_policy: r.base && extra.some((e) => !e.endsWith("_base")),
       predicate_check: unverified
         ? `unavailable: ${why} (run outside a read-only transaction, with the TEMP privilege and SELECT on the table)`
-        : "ok",
+        : !objects.ok ? `firewall functions ${objects.detail}` : "ok",
       protected: r.enabled && r.forced && r.missing.length === 0 && altered.length === 0 && !unverified
-        && (r.restrictive || extra.length === 0),
+        && objects.ok && (r.restrictive || extra.length === 0),
     });
   }
   }
