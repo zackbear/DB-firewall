@@ -7,7 +7,7 @@ from typing import Optional
 
 from .config import engine_options, load_config
 from .db_context import tenant_key
-from .engines import DBEngine, detect_engine, placeholder
+from .engines import DBEngine, _is_autocommit, detect_engine, placeholder
 
 logger = logging.getLogger("db_firewall")
 
@@ -39,6 +39,14 @@ def _set_migration_settings(connection, cursor, engine: str, config: dict) -> No
     if engine == DBEngine.POSTGRESQL:
         opts = engine_options(config, engine)
         key = tenant_key()
+        if key:
+            # Keep the key out of the server log where this role may (a
+            # superuser): statement and parameter logging off for this session.
+            cursor.execute("SELECT set_config('log_statement', 'none', false), "
+                           "set_config('log_min_duration_statement', '-1', false), "
+                           "set_config('log_parameter_max_length', '0', false), "
+                           "set_config('log_parameter_max_length_on_error', '0', false) "
+                           "FROM pg_roles WHERE rolname = current_user AND rolsuper")
         cursor.execute("SELECT set_config('dbfw.tenant_column', %s, false), "
                        "set_config('dbfw.schema', %s, false), "
                        "set_config('dbfw.policy_mode', %s, false), "
@@ -117,8 +125,21 @@ def run_migration(connection, engine: Optional[str] = None, config: Optional[dic
     sql = migration_path.read_text()
     cursor = connection.cursor()
     _set_migration_settings(connection, cursor, engine, config)
-
-    _execute_script(cursor, engine, sql)
+    try:
+        _execute_script(cursor, engine, sql)
+    except Exception:
+        if engine == DBEngine.POSTGRESQL:
+            # The script clears dbfw.tenant_key when it succeeds; a failed run
+            # must not leave the key readable in this session.
+            try:
+                if not _is_autocommit(connection):
+                    connection.rollback()
+                cursor.execute("SELECT set_config('dbfw.tenant_key', '', false)")
+                if not _is_autocommit(connection):
+                    connection.commit()
+            except Exception:
+                pass
+        raise
     if engine == DBEngine.MYSQL:
         cursor.execute("CALL _firewall_apply_all()")
         ddl = cursor.fetchone()[0]

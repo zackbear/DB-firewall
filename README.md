@@ -120,6 +120,30 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
   `SELECT encode(key, 'hex') FROM public._firewall_keys` or `npx db-firewall key`.
   The policies check the signature once per query, not once per row (an
   InitPlan). Needs PostgreSQL 13+.
+* **Session reset.** SQL run in one tenant's transaction could leave session
+  state for the connection's next user: a temp view that shadows a table, a
+  SQL-level prepared statement under a driver's statement name, or a custom
+  setting used as a drop box. `withTenant` (TypeScript) runs
+  `public._firewall_reset_session` after every call, also when the function
+  throws. Python's `release()` and `pool_checkin` run it on return. It drops
+  temp objects and SQL-level prepared statements, closes cursors, stops
+  `LISTEN`, and resets every setting, then restores the app's own
+  session-level settings and role. The driver's own prepared statements stay.
+* **The migration protects itself.** It binds every name and operator in
+  `pg_catalog`, so a planted operator such as `public.=` for `varchar, text`
+  cannot bind into a policy. It refuses to run when a `public._firewall_*`
+  object belongs to a role that is neither the one running it nor a superuser,
+  because another role may have planted it to read the key. The scanners read
+  the policies the same way, and fail when a firewall function differs from
+  the migration or the firewall objects have more than one owner. Do not let
+  app roles `CREATE` in `public` (`REVOKE CREATE ON SCHEMA public FROM PUBLIC`,
+  the default since PostgreSQL 15). `npx db-firewall verify` checks this.
+* **The key in logs.** A key you pass in (`dbfw.tenant_key`,
+  `DB_FIREWALL_TENANT_KEY` at migration time) is SQL text. If statement or
+  parameter logging is on, it reaches the server log. `run_migration` and
+  `db-firewall migrate` switch that logging off for their session when they
+  run as a superuser. With `psql`, or as another role, prefer letting the
+  migration generate the key and reading it with `npx db-firewall key`.
 * `plain`: `app.current_tenant` alone. Any SQL in the transaction can set it,
   so it relies on the middleware's SQL rewriter. The scanner reports a plain
   table as unprotected unless `tenant_context: plain` is configured.
@@ -127,10 +151,12 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
 Upgrading from an earlier version: re-running the migration switches to
 signed. Set `DB_FIREWALL_TENANT_KEY` in the app before (or with) the
 migration, or set `tenant_context: plain` to keep the old behaviour. The
-migration also revokes every grant on the key, the bypass list, the tenant
-map, `_firewall_sign` and `_firewall_set_tenant` except the owner's. This
-covers platforms such as Supabase that grant new objects to their roles
-directly. `_firewall_set_tenant` is now for admins only.
+migration also revokes every grant but the owner's, column grants included,
+on the key, `_firewall_sign` and `_firewall_set_tenant`, and every write grant
+on the bypass list and the tenant map. Reading the map stays allowed, because
+the `db_user_map` resolution reads it. This covers platforms such as Supabase
+that grant new objects to their roles directly. `_firewall_set_tenant` is now
+for admins only.
 
 PostgreSQL policy mode (`engines.postgresql.policy_mode`, `dbfw.policy_mode`):
 

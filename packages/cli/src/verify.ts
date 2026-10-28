@@ -2,10 +2,8 @@
 // policies' presence. Read-only by default: every check runs in a transaction
 // that is rolled back, and nothing is written unless --write-probe is given.
 import type pg from "pg";
-import { readFileSync } from "node:fs";
 import { sign } from "./key.js";
-import { MIGRATION } from "./migrate.js";
-import { ident, scan, type TableReport } from "./scan.js";
+import { firewallObjects, ident, scan, withCatalogPath, type TableReport } from "./scan.js";
 
 /** ok: true pass, false fail, null inconclusive (counted separately, never as a pass). */
 export interface Check { table: string; check: string; ok: boolean | null; detail: string }
@@ -75,46 +73,23 @@ export async function roleChecks(client: pg.ClientBase): Promise<Check[]> {
       return { ok: rows.length === 0, detail: rows.length
         ? `can act as the owner of ${rows.map((x) => x.name).join(", ")} (could drop or replace the bypass list)` : "owns none" };
     }),
-    // The policies call these (and they sign): a changed body (say, a
-    // session-setting "maintenance switch") opens every table while the
-    // policies still look exact.
-    () => guard("firewall functions unchanged", async () => {
-      const sql = readFileSync(MIGRATION, "utf8");
-      const diff: string[] = [];
-      for (const [name, args, sig] of FUNCTIONS) {
-        const m = new RegExp(`FUNCTION ${name}\\(${args}\\)\\s*RETURNS (\\w+) AS \\$\\$([\\s\\S]*?)\\$\\$ ` +
-                             "LANGUAGE (\\w+)([^;]*);").exec(sql);
-        const { rows: [f] } = await client.query(
-          `SELECT prosrc, prosecdef, proconfig, provolatile, l.lanname, format_type(prorettype, NULL) AS ret
-           FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang WHERE p.oid = to_regprocedure($1)`,
-          [`public.${name}(${sig})`]);
-        if (!m || !f) { diff.push(`${name} (missing)`); continue; }
-        const [, ret, body, lang, tail] = m;
-        const path = /SET search_path = ([^\n;]+?)\s*$/m.exec(tail!)?.[1];
-        const what = [
-          norm(f.prosrc) !== norm(body!) && "body",
-          f.prosecdef !== /SECURITY DEFINER/.test(tail!) && "SECURITY DEFINER",
-          JSON.stringify(f.proconfig) !== JSON.stringify(path ? [`search_path=${path}`] : null) && "settings",
-          f.provolatile !== (/STABLE/.test(tail!) ? "s" : /IMMUTABLE/.test(tail!) ? "i" : "v") && "volatility",
-          (f.lanname !== lang!.toLowerCase() || f.ret !== ret!.toLowerCase()) && "language or return type",
-        ].filter(Boolean);
-        if (what.length) diff.push(`${name} (${what.join(", ")})`);
-      }
-      return { ok: diff.length === 0, detail: diff.length
-        ? `differ from the migration: ${diff.join("; ")}: re-run migrate` : "match the migration" };
+    // The policies call these (and they sign): see firewallObjects().
+    () => guard("firewall functions unchanged", () => firewallObjects(client)),
+    // CREATE on public lets the app plant objects or operators that a later
+    // migration or query binds to (the migration refuses planted _firewall_*
+    // objects and pins search_path, but nothing else should depend on that).
+    () => guard("cannot create in public", async () => {
+      const { rows } = await client.query(
+        `SELECT 1 WHERE ${anyRole("has_schema_privilege(m.oid, 'public', 'CREATE')")}`);
+      return { ok: rows.length === 0, detail: rows.length
+        ? "a role it can use can CREATE in schema public: REVOKE CREATE ON SCHEMA public FROM PUBLIC (and the app role)"
+        : "no CREATE on public" };
     }),
   ];
   const out: Check[] = [];
   for (const check of checks) out.push(await check());
   return out;
 }
-
-// The functions the policies and the signing depend on: name, migration args, catalog args.
-const FUNCTIONS: [string, string, string][] = [
-  ["_firewall_is_bypass_role", "p_role TEXT", "text"], ["_firewall_tenant", "", ""],
-  ["_firewall_sign", "p_tenant TEXT", "text"], ["_firewall_nonce", "", ""],
-];
-const norm = (x: string) => x.replace(/\s+/g, " ").trim();
 
 /** A global check; a query error fails it (a precondition that cannot be checked is not met). */
 async function guard(check: string, fn: () => Promise<{ ok: boolean; detail: string }>): Promise<Check> {
@@ -145,9 +120,18 @@ async function inTx<T>(client: pg.ClientBase, ctx: Ctx, fn: () => Promise<T>): P
   }
 }
 
-export async function verify(client: pg.ClientBase, opts: {
+type VerifyOpts = {
   tenant: string; key: Buffer; schemas?: string[]; column?: string; exclude?: string[]; writeProbe?: boolean;
-}): Promise<{ checks: Check[]; tables: TableReport[]; excluded: string[] }> {
+};
+type VerifyResult = { checks: Check[]; tables: TableReport[]; excluded: string[] };
+
+/** Every check runs with search_path = pg_catalog, pg_temp: a planted "="
+ *  must not make "tenant sees only its rows" count another tenant's rows as own. */
+export function verify(client: pg.ClientBase, opts: VerifyOpts): Promise<VerifyResult> {
+  return withCatalogPath(client, () => verifyTables(client, opts));
+}
+
+async function verifyTables(client: pg.ClientBase, opts: VerifyOpts): Promise<VerifyResult> {
   const signed = { tenant: opts.tenant, key: opts.key };
   const schemas = opts.schemas?.length ? opts.schemas : ["public"];
   const column = opts.column ?? "tenant_id";

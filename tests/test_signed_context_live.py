@@ -175,3 +175,103 @@ def test_invalid_context_is_refused():
     from middleware.db_firewall.config import validate_config
     with pytest.raises(ValueError, match="tenant_context"):
         validate_config({"engines": {"postgresql": {"tenant_context": "sideways"}}})
+
+
+# ---------------------------------------------------------------- review findings
+
+def test_release_resets_session_state_left_for_the_next_user():
+    """SQL run on a connection must not leave traps for its next user (another
+    tenant): a temp view shadowing a table, a SQL-level prepared statement, a
+    custom setting as a drop box."""
+    with psycopg.connect(DSN) as c:
+        c.execute(f"SET ROLE {ROLE}")
+        c.execute("SET statement_timeout = '7s'")                     # the app's own: kept
+        _set_context_postgres(c, "A")
+        c.execute("CREATE TEMP VIEW docs AS SELECT 99 AS id")
+        c.execute("PREPARE agent_plant AS SELECT 1")
+        c.execute("SELECT set_config('rv.loot', 'B-secret', false)")
+        c.commit()
+        db_context.pool_checkin(c)
+        state = c.execute(
+            "SELECT (SELECT count(*) FROM pg_class WHERE relnamespace = pg_my_temp_schema()), "
+            "(SELECT count(*) FROM pg_prepared_statements WHERE from_sql), "
+            "coalesce(current_setting('rv.loot', true), ''), current_setting('statement_timeout'), "
+            "current_user").fetchone()
+    assert state == (0, 0, "", "7s", ROLE)
+
+
+def test_migration_refuses_objects_another_role_planted():
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute(f"GRANT CREATE ON SCHEMA public TO {ROLE}")
+        c.execute(f"SET ROLE {ROLE}")
+        c.execute("CREATE TABLE public._firewall_planted (k bytea)")
+        c.execute("RESET ROLE")
+    try:
+        with pytest.raises(psycopg.errors.RaiseException, match="planted"):
+            _migrate()
+    finally:
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute("DROP TABLE public._firewall_planted")
+            c.execute(f"REVOKE CREATE ON SCHEMA public FROM {ROLE}")
+
+
+def test_planted_operator_cannot_open_the_policies():
+    """With CREATE on public, a role can add `varchar = text` that returns true.
+    The migration binds the predicate in pg_catalog, so the policy stays exact;
+    a policy bound to the planted operator is reported as altered."""
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute(f"CREATE TABLE {SCHEMA}.vdocs (id int, tenant_id varchar(36))")
+        c.execute(f"INSERT INTO {SCHEMA}.vdocs VALUES (1, 'A'), (2, 'B')")
+        c.execute(f"GRANT SELECT ON {SCHEMA}.vdocs TO {ROLE}")
+        c.execute(f"GRANT CREATE ON SCHEMA public TO {ROLE}")
+        c.execute(f"SET ROLE {ROLE}")
+        c.execute("CREATE FUNCTION public.rv_any(varchar, text) RETURNS boolean LANGUAGE sql AS 'SELECT true'")
+        c.execute("CREATE OPERATOR public.= (LEFTARG = varchar, RIGHTARG = text, FUNCTION = public.rv_any)")
+        c.execute("RESET ROLE")
+    try:
+        _migrate()
+        with psycopg.connect(DSN) as c:
+            c.execute(f"SET LOCAL ROLE {ROLE}")
+            c.execute("SET LOCAL search_path = public")
+            assert c.execute(f"SELECT id FROM {SCHEMA}.vdocs").fetchall() == []          # no tenant: nothing
+        with psycopg.connect(DSN, autocommit=True) as c:
+            stem = c.execute("SELECT 'fw_' || left(md5(%s), 12)", (f"{SCHEMA}.vdocs",)).fetchone()[0]
+            c.execute("SET search_path = public")                         # binds "=" to the planted operator
+            c.execute(f"ALTER POLICY {stem}_sel ON {SCHEMA}.vdocs USING (tenant_id = (SELECT public._firewall_tenant()) "
+                      "OR (SELECT public._firewall_is_bypass_role(current_user::text)))")
+            report = scan_tables(c, DBEngine.POSTGRESQL, _cfg())["vdocs"]
+            assert report["protected"] is False and f"{stem}_sel" in report["altered_policies"]
+            assert c.execute("SHOW search_path").fetchone()[0] == "public"      # the scanner put it back
+    finally:
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"DROP TABLE {SCHEMA}.vdocs")
+            c.execute("DROP OPERATOR public.= (varchar, text)")
+            c.execute("DROP FUNCTION public.rv_any(varchar, text)")
+            c.execute(f"REVOKE CREATE ON SCHEMA public FROM {ROLE}")
+
+
+def test_reading_the_tenant_map_stays_allowed_writing_does_not():
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute(f"GRANT SELECT, INSERT ON public._firewall_tenant_map TO {ROLE}")
+        c.execute(f"GRANT SELECT (key) ON public._firewall_keys TO {ROLE}")          # a column grant
+    _migrate()
+    with psycopg.connect(DSN) as c:
+        privs = c.execute(
+            "SELECT has_table_privilege(%s, 'public._firewall_tenant_map', 'SELECT'), "
+            "has_table_privilege(%s, 'public._firewall_tenant_map', 'INSERT'), "
+            "has_any_column_privilege(%s, 'public._firewall_keys', 'SELECT')", (ROLE, ROLE, ROLE)).fetchone()
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute(f"REVOKE ALL ON public._firewall_tenant_map FROM {ROLE}")
+    assert privs == (True, False, False)
+
+
+def test_scanner_fails_when_a_firewall_function_was_changed():
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute("CREATE OR REPLACE FUNCTION public._firewall_tenant() RETURNS TEXT AS $f$ "
+                  "SELECT NULLIF(current_setting('app.current_tenant', true), ''); "
+                  "$f$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp")
+        try:
+            report = scan_tables(c, DBEngine.POSTGRESQL, _cfg())["docs"]
+        finally:
+            _migrate()
+    assert report["protected"] is False and "_firewall_tenant (body)" in report["predicate_check"]

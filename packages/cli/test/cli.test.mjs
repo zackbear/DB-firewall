@@ -246,6 +246,8 @@ describe("migrate, scan, verify", live, () => {
                             current_setting('app.tenant_sig', true) AS s) g
     WHERE sha256(convert_to(g.s, 'UTF8')) = sha256(convert_to(public._firewall_sign(g.t), 'UTF8'));
       $f$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp;`],
+    ["it can CREATE in public", "-: cannot create in public",
+     `GRANT CREATE ON SCHEMA public TO ${ROLE};`, `REVOKE CREATE ON SCHEMA public FROM ${ROLE};`],
   ];
   for (const [why, check, apply, undo] of blockers) {
     it(`verify fails when ${why}`, async () => {
@@ -340,6 +342,33 @@ describe("migrate, scan, verify", live, () => {
     const checks = JSON.parse(r.stdout).checks;
     assert.equal(r.code, 1);
     assert.match(checks.find((c) => c.check === "tenant has rows").detail, /db-firewall key/);
+  });
+
+  it("migrate refuses _firewall_* objects another role planted", async () => {
+    await withChange(`GRANT CREATE ON SCHEMA public TO ${ROLE}; SET ROLE ${ROLE};
+        CREATE TABLE public._firewall_planted (k bytea); RESET ROLE;`,
+      `DROP TABLE public._firewall_planted; REVOKE CREATE ON SCHEMA public FROM ${ROLE};`, async () => {
+        const r = await run(["migrate", "--url", ADMIN_URL, ...scope]);
+        assert.equal(r.code, 2);
+        assert.match(r.stderr, /planted/);
+      });
+  });
+
+  it("scan reports a policy bound to a planted operator", async () => {
+    const [{ stem }] = await sql(`SELECT 'fw_' || left(md5('${S}.vdocs'), 12) AS stem`);
+    await withChange(`CREATE TABLE ${S}.vdocs (id int, tenant_id varchar(36));
+        CREATE FUNCTION public.rv_any(varchar, text) RETURNS boolean LANGUAGE sql AS 'SELECT true';
+        CREATE OPERATOR public.= (LEFTARG = varchar, RIGHTARG = text, FUNCTION = public.rv_any);`,
+      `DROP TABLE ${S}.vdocs; DROP OPERATOR public.= (varchar, text); DROP FUNCTION public.rv_any(varchar, text);`,
+      async () => {
+        assert.equal((await run(["migrate", "--url", ADMIN_URL, ...scope, "--mode", "restrictive"])).code, 0);
+        assert.equal(byTable((await json(["scan", "--url", ADMIN_URL, ...scope])).data.tables).vdocs.protected, true);
+        await sql(`SET search_path = public; ALTER POLICY ${stem}_sel ON ${S}.vdocs USING
+          (tenant_id = (SELECT public._firewall_tenant()) OR (SELECT public._firewall_is_bypass_role(current_user::text)))`);
+        const t = byTable((await json(["scan", "--url", ADMIN_URL, ...scope])).data.tables).vdocs;
+        assert.equal(t.protected, false);
+        assert.ok(t.altered_policies.includes(`${stem}_sel`));
+      });
   });
 
   it("key prints the database's key", async () => {

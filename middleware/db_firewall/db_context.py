@@ -86,8 +86,13 @@ def _clear_context_postgres(connection):
     # pool reset hook (pool_checkin) rolls back first and then clears.
     was_idle = _pg_transaction_idle(connection)
     cursor = connection.cursor()
+    # _firewall_reset_session also undoes session state SQL run on this
+    # connection may have left for its next user (another tenant): temp
+    # objects, SQL-level prepared statements, custom settings, cursors,
+    # LISTEN. The session settings set so far are kept.
     cursor.execute("SELECT set_config('app.current_tenant', '', false), "
-                   "set_config('app.tenant_sig', '', false)")
+                   "set_config('app.tenant_sig', '', false), "
+                   "public._firewall_reset_session(public._firewall_session_settings())")
     cursor.close()
     if was_idle and not _is_autocommit(connection) and hasattr(connection, "commit"):
         connection.commit()

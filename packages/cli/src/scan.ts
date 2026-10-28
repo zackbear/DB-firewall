@@ -1,6 +1,8 @@
 // PostgreSQL scan: the same checks as hooks/scan_engines.py (_scan_postgres),
 // so TypeScript teams need no Python. Keep the two in step.
+import { readFileSync } from "node:fs";
 import type pg from "pg";
+import { MIGRATION } from "./migrate.js";
 
 /** Exactly the tables migrations/001_postgresql.sql skips, so a table the
  *  migration protects is never skipped here. Skipped tables are reported. */
@@ -124,11 +126,85 @@ async function reference(client: pg.ClientBase, rel: string, column: string, con
 
 export interface ScanResult { tables: TableReport[]; excluded: string[] }
 
+// The functions the policies, the signing and the session reset depend on:
+// name, migration args, catalog args.
+const FUNCTIONS: [string, string, string][] = [
+  ["_firewall_is_bypass_role", "p_role TEXT", "text"], ["_firewall_tenant", "", ""],
+  ["_firewall_sign", "p_tenant TEXT", "text"], ["_firewall_nonce", "", ""],
+  ["_firewall_reset_session", "p_keep JSONB", "jsonb"], ["_firewall_session_settings", "", ""],
+];
+const norm = (x: string) => x.replace(/\s+/g, " ").trim();
+
+/**
+ * The policies call these functions, so a changed body (say, a session-setting
+ * "maintenance switch") opens every table while the policies still look exact.
+ * Each must match the migration (body, SECURITY DEFINER, settings,
+ * volatility), and every public._firewall_* object must have one owner: an
+ * object another role planted before the migration ran keeps that owner.
+ */
+export async function firewallObjects(client: pg.ClientBase): Promise<{ ok: boolean; detail: string }> {
+  const sql = readFileSync(MIGRATION, "utf8");
+  const diff: string[] = [];
+  for (const [name, args, sig] of FUNCTIONS) {
+    const m = new RegExp(`FUNCTION public\\.${name}\\(${args}\\)\\s*RETURNS (\\w+) AS \\$\\$([\\s\\S]*?)\\$\\$ ` +
+                         "LANGUAGE (\\w+)([^;]*);").exec(sql);
+    const { rows: [f] } = await client.query(
+      `SELECT prosrc, prosecdef, proconfig, provolatile, l.lanname, format_type(prorettype, NULL) AS ret
+       FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang WHERE p.oid = to_regprocedure($1)`,
+      [`public.${name}(${sig})`]);
+    if (!m || !f) { diff.push(`${name} (missing)`); continue; }
+    const [, ret, body, lang, tail] = m;
+    const path = /SET search_path = ([^\n;]+?)\s*$/m.exec(tail!)?.[1];
+    const what = [
+      norm(f.prosrc) !== norm(body!) && "body",
+      f.prosecdef !== /SECURITY DEFINER/.test(tail!) && "SECURITY DEFINER",
+      JSON.stringify(f.proconfig) !== JSON.stringify(path ? [`search_path=${path}`] : null) && "settings",
+      f.provolatile !== (/STABLE/.test(tail!) ? "s" : /IMMUTABLE/.test(tail!) ? "i" : "v") && "volatility",
+      (f.lanname !== lang!.toLowerCase() || f.ret !== ret!.toLowerCase()) && "language or return type",
+    ].filter(Boolean);
+    if (what.length) diff.push(`${name} (${what.join(", ")})`);
+  }
+  const { rows: owners } = await client.query(
+    `SELECT pg_get_userbyid(o.owner) AS owner, string_agg(o.name, ', ' ORDER BY o.name) AS objects
+     FROM (SELECT relname::text AS name, relowner AS owner FROM pg_class
+           WHERE relnamespace = 'public'::regnamespace AND relname LIKE '#_firewall#_%' ESCAPE '#'
+           UNION ALL SELECT proname::text, proowner FROM pg_proc
+           WHERE pronamespace = 'public'::regnamespace AND proname LIKE '#_firewall#_%' ESCAPE '#') o
+     GROUP BY o.owner ORDER BY count(*) DESC`);
+  if (owners.length > 1) {
+    diff.push(`more than one owner (${owners.map((o) => `${o.owner}: ${o.objects}`).join("; ")}): ` +
+              "objects another role planted? drop those and re-run migrate");
+  }
+  return { ok: diff.length === 0, detail: diff.length
+    ? `differ from the migration: ${diff.join("; ")}${owners.length > 1 ? "" : ": re-run migrate"}`
+    : "match the migration, one owner" };
+}
+
+/** Run fn with search_path = pg_catalog, pg_temp, so a planted operator in
+ *  another schema cannot hide in how a policy reads, then put it back. */
+export async function withCatalogPath<T>(client: pg.ClientBase, fn: () => Promise<T>): Promise<T> {
+  const { rows: [r] } = await client.query(
+    "SELECT current_setting('search_path') AS old, set_config('search_path', 'pg_catalog, pg_temp', false)");
+  try {
+    return await fn();
+  } finally {
+    await client.query("SELECT set_config('search_path', $1, false)", [r.old]);
+  }
+}
+
 /** Scan every table in the schemas that has the tenant column. */
-export async function scan(client: pg.ClientBase, opts: {
+export function scan(client: pg.ClientBase, opts: {
   schemas?: string[]; column?: string; exclude?: string[]; context?: Context;
 } = {}): Promise<ScanResult> {
+  return withCatalogPath(client, () => scanTables(client, opts));
+}
+
+async function scanTables(client: pg.ClientBase, opts: {
+  schemas?: string[]; column?: string; exclude?: string[]; context?: Context;
+}): Promise<ScanResult> {
   const context: Context = opts.context ?? "signed";
+  // The predicate calls these: when they differ, no table is protected.
+  const objects = await firewallObjects(client).catch((e) => ({ ok: false, detail: (e as Error).message }));
   const schemas = opts.schemas?.length ? opts.schemas : ["public"];
   const column = opts.column ?? "tenant_id";
   const exclude = opts.exclude ?? DEFAULT_EXCLUDED;
@@ -167,9 +243,9 @@ export async function scan(client: pg.ClientBase, opts: {
       stale_base_policy: r.base && extra.some((e) => !e.endsWith("_base")),
       predicate_check: unverified
         ? `unavailable: ${why} (run outside a read-only transaction, with the TEMP privilege and SELECT on the table)`
-        : "ok",
+        : !objects.ok ? `firewall functions ${objects.detail}` : "ok",
       protected: r.enabled && r.forced && r.missing.length === 0 && altered.length === 0 && !unverified
-        && (r.restrictive || extra.length === 0),
+        && objects.ok && (r.restrictive || extra.length === 0),
     });
   }
   }

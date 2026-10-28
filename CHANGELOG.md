@@ -27,6 +27,26 @@
   the key and also checks that an unsigned tenant sees nothing, that the app
   cannot read the key or sign, and that the signing functions match the
   migration.
+- From the independent review:
+  - **Session reset:** SQL run in one tenant's transaction could leave a temp
+    view, a SQL-level prepared statement or a custom setting for the
+    connection's next user (another tenant). `public._firewall_reset_session`
+    now clears these after every `withTenant` call, and on Python `release()`
+    and `pool_checkin`.
+  - **Planted objects:** the migration refuses `public._firewall_*` objects
+    planted by another role, which could have read the key. All its DDL is
+    schema-qualified.
+  - **Operators:** the migration binds the predicates in `pg_catalog`, so a
+    planted operator such as `public.=` for `varchar, text` cannot bind. The
+    scanners and `verify` read policies the same way.
+  - **Scanners** fail when a firewall function differs from the migration or
+    the firewall objects have more than one owner.
+  - **`verify`** fails when the app can `CREATE` in `public`.
+  - **Tenant map:** reading it stays allowed (`db_user_map`). Column grants
+    on the key are revoked.
+  - **Key handling:** `migrate` turns statement and parameter logging off for
+    its session when it runs as a superuser, and clears `dbfw.tenant_key`
+    after a failed run.
 - **Upgrade:** set `DB_FIREWALL_TENANT_KEY` in the app before re-running the
   migration, or set `tenant_context: plain`. PostgreSQL 13+ for signed.
 

@@ -21,6 +21,13 @@ export async function migrate(client: pg.ClientBase, opts: {
   const key = tenantKey();
   // Session settings, as run_migration() does: the script runs its own
   // BEGIN ... COMMIT, and this connection ends after the command.
+  // Keep the key out of the server log where this role may (a superuser):
+  // statement and parameter logging off for this session.
+  if (key) {
+    await client.query("SELECT set_config('log_statement', 'none', false), " +
+      "set_config('log_min_duration_statement', '-1', false), set_config('log_parameter_max_length', '0', false), " +
+      "set_config('log_parameter_max_length_on_error', '0', false) FROM pg_roles WHERE rolname = current_user AND rolsuper");
+  }
   await client.query(
     "SELECT set_config('dbfw.tenant_column', $1, false), set_config('dbfw.schema', $2, false), " +
     "set_config('dbfw.policy_mode', $3, false), set_config('dbfw.context', $4, false), " +
@@ -31,5 +38,8 @@ export async function migrate(client: pg.ClientBase, opts: {
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});   // the script's transaction, if left open
     throw err;
+  } finally {
+    // The script clears the key when it succeeds; a failed run must not leave it.
+    await client.query("SELECT set_config('dbfw.tenant_key', '', false)").catch(() => {});
   }
 }

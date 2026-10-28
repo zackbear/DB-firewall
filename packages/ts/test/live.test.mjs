@@ -16,6 +16,28 @@ const ids = (rows) => rows.map((r) => Number(r.id)).sort();
 const SELECT = `SELECT id FROM ${SCHEMA}.docs`;
 const docs = pgSchema(SCHEMA).table("docs", { id: integer("id"), tenantId: text("tenant_id") });
 
+// Session state SQL run inside fn could leave for the connection's next user
+// (another tenant): a temp view shadowing a table, a SQL-level prepared
+// statement, a custom setting as a drop box, a search_path. withTenant must
+// undo all of it, after fn returns and after fn throws.
+const PLANT = ["CREATE TEMP VIEW docs AS SELECT 99 AS id", "PREPARE agent_plant AS SELECT 1",
+               "SELECT set_config('rv.loot', 'B-secret', false)", "SET search_path = pg_temp, public"];
+const PROBE = "SELECT (SELECT count(*) FROM pg_class WHERE relnamespace = pg_my_temp_schema())::int AS temp, " +
+  "(SELECT count(*) FROM pg_prepared_statements WHERE from_sql)::int AS prep, " +
+  "coalesce(current_setting('rv.loot', true), '') AS loot, current_setting('search_path') AS path";
+const CLEAN = { temp: 0, prep: 0, loot: "", path: '"$user", public' };
+async function assertResets(db, raw) {
+  for (const fails of [false, true]) {
+    const planted = withTenant(db, "A", async (h) => {
+      for (const q of PLANT) await raw(h, q);
+      if (fails) throw new Error("boom");
+    });
+    if (fails) await assert.rejects(planted, /boom/); else await planted;
+    const [state] = await withTenant(db, "B", (h) => raw(h, PROBE));
+    assert.deepEqual({ ...state }, CLEAN, fails ? "after fn threw" : "after fn returned");
+  }
+}
+
 describe("tenant ids", () => {
   for (const bad of ["", "a\u0000b", "a\nb", "a\\b", "__BYPASS__", "__bypass__", 7, undefined]) {
     it(`refuses ${JSON.stringify(bad)}`, () => assert.throws(() => validateTenantId(bad)));
@@ -140,6 +162,9 @@ describe("node-postgres", live, () => {
       await assert.rejects(withTenant(pool, "A", async () => {}), /32 to 64 bytes/);
     } finally { process.env.DB_FIREWALL_TENANT_KEY = saved; }
   });
+  it("session state left by fn is reset for the next borrower", async () => {
+    await assertResets(pool, async (c, q) => (await c.query(q)).rows);
+  });
   it("a session-level tenant set inside fn does not survive the release", async () => {
     await withTenant(pool, "A", (c) => c.query("SET app.current_tenant = 'B'"));
     assert.deepEqual(ids((await pool.query(SELECT)).rows), []);
@@ -170,6 +195,9 @@ describe("postgres.js", live, () => {
     assert.deepEqual(ids(await withTenant(sql, "B", (tx) => tx`SELECT id FROM ts_app.docs`)), [2]);
     assert.deepEqual(ids(await sql.unsafe(SELECT)), []);
     await assertSafeRole(sql);
+  });
+  it("session state left by fn is reset for the next borrower", async () => {
+    await assertResets(sql, (tx, q) => tx.unsafe(q));
   });
   it("late queries and nested calls are refused", async () => {
     let kept;
@@ -209,6 +237,9 @@ describe("Drizzle", live, () => {
     assert.deepEqual(ids(await withTenant(db, "B", read)), [2]);
     assert.deepEqual(ids((await db.execute(dsql.raw(SELECT))).rows), []);
     await assertSafeRole(db);
+  });
+  it("session state left by fn is reset for the next borrower", async () => {
+    await assertResets(db, async (tx, q) => (await tx.execute(dsql.raw(q))).rows);
   });
   it("late queries, nested calls and a raw Drizzle transaction are refused", async () => {
     let kept;

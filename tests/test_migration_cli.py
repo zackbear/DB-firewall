@@ -29,12 +29,18 @@ class FakeConn:
         self.commits += 1
 
 
-def test_postgres_migration_file_is_found_and_run():
+def test_postgres_migration_file_is_found_and_run(monkeypatch):
     conn = FakeConn()
     run_migration(conn, DBEngine.POSTGRESQL, {"tenant_column": "org_id"})
-    assert "dbfw.tenant_column" in conn.executed[0]          # settings first, then the script
-    assert len(conn.executed) == 2 and "_firewall_tenant_map" in conn.executed[1]
+    # With DB_FIREWALL_TENANT_KEY (conftest): logging off, then the settings, then the script.
+    assert "log_statement" in conn.executed[0] and "dbfw.tenant_key" in conn.executed[1]
+    assert len(conn.executed) == 3 and "_firewall_tenant_map" in conn.executed[2]
     assert conn.commits == 1
+    monkeypatch.delenv("DB_FIREWALL_TENANT_KEY")
+    conn = FakeConn()
+    run_migration(conn, DBEngine.POSTGRESQL, {"tenant_column": "org_id"})
+    assert "dbfw.tenant_column" in conn.executed[0]          # no key: settings first, then the script
+    assert len(conn.executed) == 2 and "_firewall_tenant_map" in conn.executed[1]
 
 
 def test_sqlserver_migration_split_on_go():

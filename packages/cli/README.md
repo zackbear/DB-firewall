@@ -27,8 +27,9 @@ Lists every table in the schema that has the tenant column, and reports whether 
 
 - RLS is enabled and forced.
 - All four firewall policies exist.
-- Each policy applies to `PUBLIC`, covers its own command, and uses exactly the migration's predicate. The CLI asks PostgreSQL to deparse that predicate on a temporary copy of the table, which is rolled back.
+- Each policy applies to `PUBLIC`, covers its own command, and uses exactly the migration's predicate, read with `search_path = pg_catalog`, so an operator planted in another schema shows. The CLI asks PostgreSQL to deparse that predicate on a temporary copy of the table, which is rolled back.
 - In permissive mode, no other permissive policy exists on the table.
+- The firewall functions match the migration and every `public._firewall_*` object has one owner (see verify, 2).
 - The policies use the expected tenant context, `--context signed` (the default) or `plain`. `tenant_context` in the report names the one they use.
 
 `--strict` exits 1 when a table is unprotected or no table is found (a wrong `--column` or `--schema`). `--json` prints `{ tables, excluded }`. Each table report has the Python scanner's fields (`hooks/scanner.py`) plus `schema` and `owner`. When the predicate check cannot run (a read-only transaction, no `TEMP` privilege, or no `SELECT` on the table), the report says why in `predicate_check`, and the table counts as unprotected.
@@ -40,7 +41,7 @@ Lists every table in the schema that has the tenant column, and reports whether 
 Connect with your app's own URL and role, not an admin's, with `DB_FIREWALL_TENANT_KEY` set to the key the app uses (exit 2 without it). `verify` tests behaviour, not only the policies. It is read-only by default: each check runs in a transaction that is rolled back.
 
 1. **The role:** RLS applies to it and to every role it is a member of. None is a superuser, has `BYPASSRLS` or is in `_firewall_bypass_roles`.
-2. **Firewall objects:** `_firewall_is_bypass_role`, `_firewall_tenant`, `_firewall_sign` and `_firewall_nonce`, which the policies and the signing use, match the migration (body, `SECURITY DEFINER`, settings, volatility). No role the app can use can read `_firewall_keys` or execute `_firewall_sign` or `_firewall_set_tenant`. The role, and every role it can `SET ROLE` to, cannot write `_firewall_bypass_roles` or `_firewall_tenant_map`, column grants included (else it could add itself as a bypass role). It cannot act as the owner of schema `public` or of any `_firewall_*` object (else it could drop and replace the bypass list). On PostgreSQL 15 and later the database owner owns `public`, so do not make the app role the database owner.
+2. **Firewall objects:** the functions the policies, the signing and the session reset use (`_firewall_is_bypass_role`, `_firewall_tenant`, `_firewall_sign`, `_firewall_nonce`, `_firewall_reset_session`, `_firewall_session_settings`) match the migration (body, `SECURITY DEFINER`, settings, volatility), and every `public._firewall_*` object has one owner. `scan` checks this too. No role the app can use can `CREATE` in `public`: it could plant objects or operators. No role the app can use can read `_firewall_keys` or execute `_firewall_sign` or `_firewall_set_tenant`. The role, and every role it can `SET ROLE` to, cannot write `_firewall_bypass_roles` or `_firewall_tenant_map`, column grants included (else it could add itself as a bypass role). It cannot act as the owner of schema `public` or of any `_firewall_*` object (else it could drop and replace the bypass list). On PostgreSQL 15 and later the database owner owns `public`, so do not make the app role the database owner.
 3. **Tables found:** at least one table has the tenant column.
 4. **Per table:**
    - the scan above passes;

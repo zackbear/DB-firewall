@@ -1,4 +1,4 @@
-import { CLEAR_TENANT, setTenant } from "./sign.js";
+import { CLEAR_TENANT, scoped } from "./sign.js";
 import { resolveTenant } from "./tenant.js";
 
 // Structural types: the package has no runtime dependency on any driver.
@@ -187,8 +187,8 @@ export async function withTenantPg<T>(
       throw err;
     }
     try {
-      await setTenant(async (text, values) => (await client.query(text, values)).rows, tenant);
-      const result = await withHandle(client, fn);
+      const result = await scoped(async (text, values) => (await client.query(text, values)).rows, tenant,
+                                  () => withHandle(client, fn));
       await client.query("COMMIT");
       return result;
     } catch (err) {
@@ -212,13 +212,12 @@ export async function withTenantPostgres<T>(
   if (!isPostgresJs(sql)) throw new TypeError("DB Firewall: withTenantPostgres needs a postgres() instance");
   const [tenant, fn] = split(tenantOrFn, maybeFn);
   return sql.begin(async (tx) => {
-    await setTenant((text, values) => tx.unsafe(text, values), tenant);
     // postgres.js resolves an array of queries returned from begin(): settle it
     // here, while the handle is still open.
-    return withHandle(tx, async (h) => {
+    return scoped((text, values) => tx.unsafe(text, values), tenant, () => withHandle(tx, async (h) => {
       const result: unknown = await fn(h);
       return (Array.isArray(result) ? await Promise.all(result) : result) as T;
-    });
+    }));
   });
 }
 
@@ -233,12 +232,12 @@ export async function withTenantDrizzle<T>(
   const { sql } = await import("drizzle-orm");       // optional peer: only Drizzle users need it
   return db.transaction(async (tx) => {
     // Drizzle's own sql template; $n placeholders map to the values in order.
-    await setTenant(async (text, values = []) => {
+    const run = async (text: string, values: unknown[] = []) => {
       const parts = text.split(/\$\d+/);
       return rowsOf(await tx.execute(sql.join(parts.flatMap((p, i) =>
         i < values.length ? [sql.raw(p), sql`${values[i]}`] : [sql.raw(p)]))));
-    }, tenant);
-    return withHandle(tx, fn);
+    };
+    return scoped(run, tenant, () => withHandle(tx, fn));
   });
 }
 
