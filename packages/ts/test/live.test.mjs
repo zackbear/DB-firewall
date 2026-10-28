@@ -78,6 +78,16 @@ describe("node-postgres", live, () => {
     await assert.rejects(withTenant(pool, "A", async (c) => { c.release(); }), /release\(\) is not allowed/);
     assert.deepEqual(ids(await withTenant(pool, "A", async (c) => (await c.query(SELECT)).rows)), [1]);
   });
+  it("an event listener gets a wrapped emitter", async () => {
+    let emitter;
+    await withTenant(pool, "A", async (c) => {
+      c.on("notice", function () { emitter = this; });
+      await c.query("DO $$ BEGIN RAISE NOTICE 'hi'; END $$");
+      c.removeAllListeners?.("notice");
+    });
+    assert.ok(emitter, "listener ran");
+    assert.throws(() => emitter.query, TypeError);
+  });
   it("raw objects reached through the handle stop working too", async () => {
     let conn;
     await withTenant(pool, "A", async (c) => { conn = c.connection; });
@@ -120,6 +130,16 @@ describe("postgres.js", live, () => {
     assert.throws(() => kept.unsafe(SELECT), TypeError);
     await assert.rejects(withTenant(sql, "A", (tx) => withTenant(tx, "B", async () => 1)), /nested/);
   });
+  it("an array of queries returned from fn works (postgres.js pattern)", async () => {
+    const [a, b] = await withTenant(sql, "A", (tx) => [tx`SELECT id FROM ts_app.docs`, tx`SELECT 1 AS one`]);
+    assert.deepEqual(ids(a), [1]);
+    assert.equal(b[0].one, 1);
+  });
+  it("a savepoint handle kept after fn stops working", async () => {
+    let sp;
+    await withTenant(sql, "A", (tx) => tx.savepoint(async (s) => { sp = s; }));
+    assert.throws(() => sp.unsafe(SELECT), TypeError);
+  });
   it("a query created inside fn and awaited after it is refused", async () => {
     let pending;
     await withTenant(sql, "A", async (tx) => { pending = tx`SELECT id FROM ts_app.docs`; });
@@ -157,6 +177,20 @@ describe("Drizzle", live, () => {
     await withTenant(db, "A", async (tx) => { builder = tx.select().from(docs); session = tx.session; });
     await assert.rejects(Promise.resolve().then(() => builder), TypeError);
     assert.throws(() => session.execute, TypeError);
+  });
+  it("a nested Drizzle transaction works inside fn, its handle stops working after", async () => {
+    let inner;
+    const rows = await withTenant(db, "A", (tx) => tx.transaction(async (t) => {
+      inner = t;
+      return t.select({ id: docs.id }).from(docs);
+    }));
+    assert.deepEqual(ids(rows), [1]);
+    assert.throws(() => inner.select, TypeError);
+  });
+  it("a value read through a property descriptor is wrapped too", async () => {
+    let session;
+    await withTenant(db, "A", async (tx) => { session = Object.getOwnPropertyDescriptor(tx, "session")?.value; });
+    if (session) assert.throws(() => session.execute, TypeError);
   });
 });
 

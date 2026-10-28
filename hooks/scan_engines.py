@@ -5,7 +5,6 @@ for every non-excluded table that has the tenant column.
 
 import hashlib
 import json
-import re
 import os
 import sys
 from typing import Dict
@@ -111,28 +110,45 @@ _ORACLE_SQL = """
 _PG_CMD = {"sel": "SELECT", "ins": "INSERT", "upd": "UPDATE", "del": "DELETE"}
 
 
-def _pg_norm(expr) -> str:
-    """Compare predicates as PostgreSQL deparses them, without the parts that
-    vary: case, casts, the public. prefix, spacing, brackets and quotes."""
-    s = (expr or "").lower()
-    s = re.sub(r"::(character varying|[a-z_]+)", "", s).replace("public.", "")
-    return re.sub(r'[\s()"]', "", s)
+def _pg_ident(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
 
 
-def _pg_altered(policies, tenant_col) -> list:
+def _pg_reference(cursor, schema: str, table: str, tenant_col: str):
+    """The firewall predicate exactly as PostgreSQL deparses it for this table:
+    a policy with the migration's predicate on a temporary copy of the table's
+    columns, read back from pg_policies, then rolled back. Comparing deparsed
+    text exactly catches a changed cast, an overloaded function or a changed
+    constant that a normalised comparison would miss. None when it cannot be
+    built (the migration's functions are missing)."""
+    pred = (f"{_pg_ident(tenant_col)} = NULLIF(current_setting('app.current_tenant', true), '') "
+            "OR public._firewall_is_bypass_role(current_user::text)")
+    autocommit = bool(getattr(getattr(cursor, "connection", None), "autocommit", False))
+    cursor.execute("BEGIN" if autocommit else "SAVEPOINT _fw_ref")
+    try:
+        cursor.execute(f"CREATE TEMP TABLE _fw_ref (LIKE {_pg_ident(schema)}.{_pg_ident(table)})")
+        cursor.execute(f"CREATE POLICY _fw_ref_p ON pg_temp._fw_ref USING ({pred}) WITH CHECK ({pred})")
+        cursor.execute("SELECT qual FROM pg_policies WHERE tablename = '_fw_ref' "
+                       "AND policyname = '_fw_ref_p' AND schemaname = pg_my_temp_schema()::regnamespace::text")
+        row = cursor.fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+    finally:
+        cursor.execute("ROLLBACK" if autocommit else "ROLLBACK TO SAVEPOINT _fw_ref")
+
+
+def _pg_altered(policies, reference) -> list:
     """Firewall policies whose shape differs from what the migration creates:
-    another role than PUBLIC, another command, or another predicate. The
-    predicate must match exactly (after _pg_norm): one that only mentions
-    app.current_tenant (e.g. "... IS NOT NULL") restricts nothing."""
-    pred = _pg_norm(f"{tenant_col} = NULLIF(current_setting('app.current_tenant', true), '') "
-                    "OR _firewall_is_bypass_role(CURRENT_USER)")
+    another role than PUBLIC, another command, or a predicate whose deparsed
+    text is not exactly the reference."""
     altered = []
     for name, cmd, roles, qual, check in policies:
         op = name.rsplit("_", 1)[-1]
-        want_qual = pred if op in ("sel", "upd", "del") else ""
-        want_check = pred if op in ("ins", "upd") else ""
-        if (roles != ["public"] or cmd != _PG_CMD[op]
-                or _pg_norm(qual) != want_qual or _pg_norm(check) != want_check):
+        want_qual = reference if op in ("sel", "upd", "del") else None
+        want_check = reference if op in ("ins", "upd") else None
+        if reference is None or roles != ["public"] or cmd != _PG_CMD[op] \
+                or qual != want_qual or check != want_check:
             altered.append(name)
     return sorted(altered)
 
@@ -140,10 +156,12 @@ def _pg_altered(policies, tenant_col) -> list:
 def _scan_postgres(cursor, tenant_col, excluded, opts) -> Dict[str, dict]:
     results = {}
     cursor.execute(_PG_SQL, (opts.get("schema") or "public", tenant_col))
+    schema = opts.get("schema") or "public"
     for table, enabled, forced, missing, extra, restrictive, policies, base in cursor.fetchall():
         if isinstance(policies, str):
             policies = json.loads(policies)
-        altered = _pg_altered(policies, tenant_col)
+        altered = _pg_altered(policies, _pg_reference(cursor, schema, table, tenant_col)) \
+            if policies else []
         if _is_excluded_table(table, excluded):
             continue
         missing, extra = sorted(missing), sorted(extra)

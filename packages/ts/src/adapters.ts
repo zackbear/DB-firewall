@@ -62,6 +62,12 @@ const handles = new WeakSet<object>();
 // Lifecycle calls fn must not make: releasing or ending the connection while
 // this function still owns it hands it to the next borrower mid-transaction.
 const BLOCKED = new Set<PropertyKey>(["release", "connect", "end"]);
+// Methods that call back with driver objects (a nested Drizzle transaction, a
+// postgres.js savepoint, an event's emitter and payload): their callbacks get
+// wrapped arguments and `this`, so those objects stop working with the rest.
+const CALLBACK_METHODS = new Set<PropertyKey>([
+  "transaction", "savepoint", "on", "once", "addListener", "prependListener", "prependOnceListener",
+]);
 
 /**
  * Run fn with a handle that stops working when fn settles. Everything reached
@@ -93,7 +99,22 @@ async function withHandle<H extends object, T>(target: H, fn: (h: H) => Promise<
         if (typeof v !== "function") return wrap(v);
         // Methods run on the real object (private state, Promise internals),
         // and what they return is wrapped.
-        return (...args: unknown[]) => { check(); return wrap(Reflect.apply(v, t, args)); };
+        const wrapCallbacks = CALLBACK_METHODS.has(key);
+        return (...args: unknown[]) => {
+          check();
+          const passed = wrapCallbacks ? args.map((a) => typeof a === "function"
+            ? function (this: unknown, ...cbArgs: unknown[]) {
+                return (a as (...x: unknown[]) => unknown).apply(wrap(this), cbArgs.map(wrap));
+              }
+            : a) : args;
+          return wrap(Reflect.apply(v, t, passed));
+        };
+      },
+      getOwnPropertyDescriptor(t, key) {
+        check();
+        const d = Reflect.getOwnPropertyDescriptor(t, key);
+        if (d && "value" in d && d.configurable) d.value = wrap(d.value);   // invariants allow it only then
+        return d;
       },
       apply(t, thisArg, args) {
         check();
@@ -179,7 +200,12 @@ export async function withTenantPostgres<T>(
   const [tenant, fn] = split(tenantOrFn, maybeFn);
   return sql.begin(async (tx) => {
     await tx.unsafe(SET_TENANT, [tenant]);
-    return withHandle(tx, fn);
+    // postgres.js resolves an array of queries returned from begin(): settle it
+    // here, while the handle is still open.
+    return withHandle(tx, async (h) => {
+      const result: unknown = await fn(h);
+      return (Array.isArray(result) ? await Promise.all(result) : result) as T;
+    });
   });
 }
 

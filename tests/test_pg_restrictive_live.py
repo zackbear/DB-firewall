@@ -127,6 +127,14 @@ def _stem(table):
     "ALTER POLICY {p}_sel ON {t} USING (current_setting('app.current_tenant', true) IS NOT NULL)",
     "ALTER POLICY {p}_upd ON {t} USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), '') "
     "OR true) WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant', true), '') OR true)",
+    # same text after normalising, different meaning (PR 12 final review)
+    "ALTER POLICY {p}_sel ON {t} USING (tenant_id::name = NULLIF(current_setting('app.current_tenant', "
+    "true), '')::name OR public._firewall_is_bypass_role(current_user::text))",
+    "ALTER POLICY {p}_sel ON {t} USING (tenant_id = NULLIF(current_setting('app.current_tenant', true), ' ') "
+    "OR public._firewall_is_bypass_role(current_user::text))",
+    "CREATE OR REPLACE FUNCTION public._firewall_is_bypass_role(r name) RETURNS boolean "
+    "LANGUAGE sql AS 'SELECT true'; ALTER POLICY {p}_sel ON {t} USING (tenant_id = "
+    "NULLIF(current_setting('app.current_tenant', true), '') OR public._firewall_is_bypass_role(current_user))",
 ])
 def test_scanner_flags_an_altered_firewall_policy(alter):
     t, p = f"{SCHEMA}.plain", _stem("plain")
@@ -135,7 +143,8 @@ def test_scanner_flags_an_altered_firewall_policy(alter):
         try:
             report = scan_tables(c, DBEngine.POSTGRESQL, _cfg("restrictive"))["plain"]
         finally:
-            _migrate("restrictive")                       # restore the policies
+            _migrate("restrictive")                       # restore the policies first
+            c.execute("DROP FUNCTION IF EXISTS public._firewall_is_bypass_role(name)")
     assert report["protected"] is False and report["altered_policies"]
 
 
