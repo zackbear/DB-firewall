@@ -220,6 +220,14 @@ describe("migrate, scan, verify", live, () => {
     ["a LEAKPROOF function", "-: no RLS-bypassing views or functions",
      `CREATE FUNCTION ${S}.peek(text) RETURNS boolean LANGUAGE sql LEAKPROOF AS 'SELECT true';`,
      `DROP FUNCTION ${S}.peek(text);`],
+    ["the bypass function was changed", "-: bypass function unchanged",
+     `CREATE OR REPLACE FUNCTION public._firewall_is_bypass_role(p_role TEXT) RETURNS BOOLEAN AS $f$
+        SELECT EXISTS (SELECT 1 FROM public._firewall_bypass_roles WHERE role_name = p_role)
+            OR current_setting('dbfw.maintenance', true) = 'on';
+      $f$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp;`,
+     `CREATE OR REPLACE FUNCTION public._firewall_is_bypass_role(p_role TEXT) RETURNS BOOLEAN AS $f$
+        SELECT EXISTS (SELECT 1 FROM public._firewall_bypass_roles WHERE role_name = p_role);
+      $f$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp;`],
   ];
   for (const [why, check, apply, undo] of blockers) {
     it(`verify fails when ${why}`, async () => {

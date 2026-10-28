@@ -18,7 +18,9 @@
     tenant with no rows, definer views (followed through view chains),
     materialized views, foreign tables, `SECURITY DEFINER` and `LEAKPROOF`
     functions in any schema, and readable tenant tables in other schemas.
-    Privileges count for every role the app can `SET ROLE` to. Read-only by default. `--write-probe` adds a
+    Privileges count for every role the app can `SET ROLE` to. It also fails
+    when `_firewall_is_bypass_role` differs from the migration. The README
+    says what a pass does not prove (copies, side channels, untagged tables). Read-only by default. `--write-probe` adds a
     rolled-back cross-tenant insert. Exit 3 when a check is inconclusive.
   - Live tests in the `typescript` CI job. Not yet published to npm.
 

@@ -2,6 +2,8 @@
 // policies' presence. Read-only by default: every check runs in a transaction
 // that is rolled back, and nothing is written unless --write-probe is given.
 import type pg from "pg";
+import { readFileSync } from "node:fs";
+import { MIGRATION } from "./migrate.js";
 import { ident, scan, type TableReport } from "./scan.js";
 
 /** ok: true pass, false fail, null inconclusive (counted separately, never as a pass). */
@@ -60,6 +62,25 @@ export async function roleChecks(client: pg.ClientBase): Promise<Check[]> {
            AND proname LIKE '#_firewall#_%' ESCAPE '#' AND pg_has_role(current_user, proowner, 'MEMBER')`);
       return { ok: rows.length === 0, detail: rows.length
         ? `can act as the owner of ${rows.map((x) => x.name).join(", ")} (could drop or replace the bypass list)` : "owns none" };
+    }),
+    // Every policy calls this function, so a changed body (say, a session-setting
+    // "maintenance switch") opens every table while the policies still look exact.
+    () => guard("bypass function unchanged", async () => {
+      const want = /FUNCTION _firewall_is_bypass_role\(p_role TEXT\)\s*RETURNS BOOLEAN AS \$\$([\s\S]*?)\$\$/
+        .exec(readFileSync(MIGRATION, "utf8"))?.[1];
+      const { rows: [f] } = await client.query(
+        `SELECT prosrc, prosecdef, proconfig, l.lanname, prorettype = 'boolean'::regtype AS bool
+         FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang
+         WHERE p.oid = 'public._firewall_is_bypass_role(text)'::regprocedure`);
+      const norm = (x: string) => x.replace(/\s+/g, " ").trim();
+      const diff = [];
+      if (!want || norm(f.prosrc) !== norm(want)) diff.push("body");
+      if (!f.prosecdef) diff.push("not SECURITY DEFINER");
+      if (JSON.stringify(f.proconfig) !== JSON.stringify(["search_path=pg_catalog, pg_temp"])) diff.push("settings");
+      if (f.lanname !== "sql" || !f.bool) diff.push("language or return type");
+      return { ok: diff.length === 0, detail: diff.length
+        ? `public._firewall_is_bypass_role differs from the migration (${diff.join(", ")}): re-run migrate`
+        : "matches the migration" };
     }),
   ];
   const out: Check[] = [];

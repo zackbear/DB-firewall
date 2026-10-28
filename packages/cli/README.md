@@ -36,7 +36,7 @@ Lists every table in the schema that has the tenant column, and reports whether 
 Connect with your app's own URL and role, not an admin's. `verify` tests behaviour, not only the policies. It is read-only by default: each check runs in a transaction that is rolled back.
 
 1. **The role:** RLS applies to it and to every role it is a member of. None is a superuser, has `BYPASSRLS` or is in `_firewall_bypass_roles`.
-2. **Firewall objects:** the role, and every role it can `SET ROLE` to, cannot write `_firewall_bypass_roles` or `_firewall_tenant_map`, column grants included (else it could add itself as a bypass role). It cannot act as the owner of schema `public` or of any `_firewall_*` object (else it could drop and replace the bypass list). On PostgreSQL 15 and later the database owner owns `public`, so do not make the app role the database owner.
+2. **Firewall objects:** `_firewall_is_bypass_role`, which every policy calls, matches the migration (body, `SECURITY DEFINER`, settings). The role, and every role it can `SET ROLE` to, cannot write `_firewall_bypass_roles` or `_firewall_tenant_map`, column grants included (else it could add itself as a bypass role). It cannot act as the owner of schema `public` or of any `_firewall_*` object (else it could drop and replace the bypass list). On PostgreSQL 15 and later the database owner owns `public`, so do not make the app role the database owner.
 3. **Tables found:** at least one table has the tenant column.
 4. **Per table:**
    - the scan above passes;
@@ -51,6 +51,17 @@ Connect with your app's own URL and role, not an admin's. `verify` tests behavio
 A table no usable role can `SELECT` (such as a partition read through its parent) gets no row checks: there are no direct reads, and the other checks cover the rest. A table readable only after `SET ROLE` is inconclusive: run `verify` as that role. So is a row check whose query fails. A global check whose query fails counts as failed.
 
 `--write-probe` also tries, per table, to insert a row for another tenant, which RLS must refuse. It is rolled back, but it fires `BEFORE INSERT` triggers and uses up a sequence value, so it is off by default. A refusal by anything other than RLS is inconclusive.
+
+### What a pass means
+
+A pass means `verify` found no known leak path. It does not prove isolation. It does not see:
+
+- **Tenant data in tables without the tenant column,** such as child tables, audit logs or history tables. Give every table that holds tenant data the tenant column, so the migration protects it.
+- **Copies made by triggers, rules or jobs** into a table the app can read, even a plain (not `SECURITY DEFINER`) trigger.
+- **Side channels** that RLS leaves open: a `UNIQUE` or foreign-key error, or timing, can show that another tenant has a value.
+- **Your app setting `app.current_tenant` itself.** `verify` assumes only the middleware (`withTenant`) sets it, from the authenticated session.
+
+Run it in CI and after schema changes, and review triggers, rules and jobs that copy tenant rows.
 
 Exit codes: 0 all checks passed; 1 a check failed; 2 usage or connection error; 3 no failure, but a check was inconclusive (not a pass).
 
