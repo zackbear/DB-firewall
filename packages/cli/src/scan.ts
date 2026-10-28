@@ -2,15 +2,20 @@
 // so TypeScript teams need no Python. Keep the two in step.
 import type pg from "pg";
 
-/** Tables the Python config skips by default (config/firewall.yaml excluded_tables). */
+/** Exactly the tables migrations/001_postgresql.sql skips, so a table the
+ *  migration protects is never skipped here. Skipped tables are reported. */
 export const DEFAULT_EXCLUDED = [
   "_firewall_*", "schema_migrations", "alembic_version", "knex_migrations", "prisma_migrations",
-  "__diesel_schema_migrations", "flyway_schema_history", "app_config", "feature_flags",
+  "__diesel_schema_migrations", "flyway_schema_history",
 ];
 
 export interface TableReport {
+  schema: string;
   table: string;
   protected: boolean;
+  has_tenant_col: true;
+  has_rls_policy: boolean;
+  owner: string;
   rls_enabled: boolean;
   rls_forced: boolean;
   policy_mode: "permissive" | "restrictive";
@@ -34,6 +39,7 @@ const SQL = `
       AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attname = $2
                     AND a.attnum > 0 AND NOT a.attisdropped))
   SELECT t.relname AS table, t.relrowsecurity AS enabled, t.relforcerowsecurity AS forced,
+    pg_get_userbyid((SELECT relowner FROM pg_class WHERE oid = t.oid)) AS owner,
     ARRAY(SELECT op FROM unnest(ARRAY['sel', 'ins', 'upd', 'del']) AS op
           WHERE NOT EXISTS (SELECT 1 FROM pg_policies p
                             WHERE p.schemaname = t.nspname AND p.tablename = t.relname
@@ -59,10 +65,22 @@ const CMD: Record<string, string> = { sel: "SELECT", ins: "INSERT", upd: "UPDATE
 
 export const ident = (name: string) => `"${name.replace(/"/g, '""')}"`;
 
-function globMatch(pattern: string, name: string): boolean {
-  const re = new RegExp("^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*/g, ".*").replace(/\?/g, ".") + "$");
-  return re.test(name);
+/** fnmatch-style glob (*, ?, [abc], [!abc]), as the Python scanner matches. */
+export function globMatch(pattern: string, name: string): boolean {
+  let re = "";
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i]!;
+    if (ch === "*") re += ".*";
+    else if (ch === "?") re += ".";
+    else if (ch === "[" && pattern.indexOf("]", i + 2) > i) {
+      const end = pattern.indexOf("]", i + 2);
+      let body = pattern.slice(i + 1, end).replace(/\\/g, "\\\\");
+      if (body.startsWith("!")) body = "^" + body.slice(1);
+      re += `[${body}]`;
+      i = end;
+    } else re += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  }
+  return new RegExp(`^${re}$`).test(name);
 }
 
 /**
@@ -90,16 +108,20 @@ async function reference(client: pg.ClientBase, schema: string, table: string, c
   }
 }
 
-/** Scan every table in schema that has the tenant column. */
+export interface ScanResult { tables: TableReport[]; excluded: string[] }
+
+/** Scan every table in the schemas that has the tenant column. */
 export async function scan(client: pg.ClientBase, opts: {
-  schema?: string; column?: string; exclude?: string[];
-} = {}): Promise<TableReport[]> {
-  const schema = opts.schema ?? "public", column = opts.column ?? "tenant_id";
+  schemas?: string[]; column?: string; exclude?: string[];
+} = {}): Promise<ScanResult> {
+  const schemas = opts.schemas?.length ? opts.schemas : ["public"];
+  const column = opts.column ?? "tenant_id";
   const exclude = opts.exclude ?? DEFAULT_EXCLUDED;
+  const out: TableReport[] = [], excluded: string[] = [];
+  for (const schema of schemas) {
   const { rows } = await client.query(SQL, [schema, column]);
-  const out: TableReport[] = [];
   for (const r of rows) {
-    if (exclude.some((p) => globMatch(p, r.table))) continue;
+    if (exclude.some((p) => globMatch(p, r.table))) { excluded.push(`${schema}.${r.table}`); continue; }
     const policies: [string, string, string[], string | null, string | null][] = r.policies;
     const [ref, why] = policies.length ? await reference(client, schema, r.table, column) : [null, null];
     const unverified = policies.length > 0 && ref === null;
@@ -112,7 +134,7 @@ export async function scan(client: pg.ClientBase, opts: {
     }).map(([name]) => name).sort();
     const extra: string[] = [...r.extra].sort();
     out.push({
-      table: r.table,
+      schema, table: r.table, has_tenant_col: true, has_rls_policy: r.missing.length === 0, owner: r.owner,
       rls_enabled: r.enabled, rls_forced: r.forced,
       policy_mode: r.restrictive ? "restrictive" : "permissive",
       missing_policies: [...r.missing].sort(),
@@ -126,5 +148,6 @@ export async function scan(client: pg.ClientBase, opts: {
         && (r.restrictive || extra.length === 0),
     });
   }
-  return out;
+  }
+  return { tables: out, excluded };
 }

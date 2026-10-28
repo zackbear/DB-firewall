@@ -7,11 +7,17 @@
     `--column`, `--schema` and `--mode permissive|restrictive`, then prints the
     scan.
   - `scan` ports the Python PostgreSQL scanner, including the exact-predicate
-    check, with the same report fields. `--strict` exits 1 when a table is
-    unprotected.
-  - `verify` connects as the app's role and tests the behaviour: the role,
-    the policies, no rows without a tenant, only the tenant's rows with one,
-    and a refused cross-tenant insert. Every check is rolled back.
+    check. `--schema` is repeatable. The default exclusions are exactly the
+    tables the migration skips, and excluded tables are listed. `--strict`
+    exits 1 when a table is unprotected or none is found.
+  - `verify` connects as the app's role and tests the behaviour. It fails on:
+    a role it can use that skips RLS (also through `SET ROLE` or
+    inheritance), write access to the bypass list, table ownership,
+    `TRUNCATE`, rows visible without a tenant or from another tenant, a
+    tenant with no rows, definer views, materialized views and
+    `SECURITY DEFINER` functions over tenant tables, and readable tenant
+    tables in other schemas. Read-only by default. `--write-probe` adds a
+    rolled-back cross-tenant insert. Exit 3 when a check is inconclusive.
   - Live tests in the `typescript` CI job. Not yet published to npm.
 
 ## 2026-10-28: TypeScript package and restrictive policies (PR #12)

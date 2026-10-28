@@ -3,7 +3,7 @@
 import { parseArgs } from "node:util";
 import pg from "pg";
 import { migrate } from "./migrate.js";
-import { scan, type TableReport } from "./scan.js";
+import { scan, type ScanResult, type TableReport } from "./scan.js";
 import { verify, type Check } from "./verify.js";
 
 const USAGE = `Usage: db-firewall <command> [options]
@@ -16,22 +16,28 @@ Commands:
 Options:
   --url <url>        PostgreSQL URL (default: $DATABASE_URL)
   --column <name>    Tenant column (default: tenant_id)
-  --schema <name>    Schema (default: public)
+  --schema <name>    Schema (default: public; repeatable)
   --mode <mode>      migrate: permissive (default) or restrictive
-  --tenant <id>      verify: a tenant id that exists in your data
-  --exclude <glob>   scan/verify: skip tables matching (repeatable; replaces the defaults)
-  --strict           scan: exit 1 if any table is unprotected
+  --tenant <id>      verify: a tenant id that has rows in your data
+  --write-probe      verify: also try a cross-tenant insert (rolled back, but it
+                     fires BEFORE INSERT triggers and uses up a sequence value)
+  --exclude <glob>   scan/verify: skip tables matching (repeatable; replaces the
+                     defaults, which are the tables the migration skips)
+  --strict           scan: exit 1 if any table is unprotected or none is found
   --json             machine-readable output
   -h, --help
 
-Exit codes: 0 ok; 1 a check failed or (scan --strict) a table is unprotected; 2 usage or connection error.
+Exit codes: 0 ok; 1 a check failed (scan --strict: a table is unprotected or
+none found); 2 usage or connection error; 3 verify: no failure, but a check was
+inconclusive.
 `;
 
 async function main(argv: string[]): Promise<number> {
   const { values, positionals } = parseArgs({
     args: argv, allowPositionals: true,
     options: {
-      url: { type: "string" }, column: { type: "string" }, schema: { type: "string" },
+      url: { type: "string" }, column: { type: "string" }, schema: { type: "string", multiple: true },
+      "write-probe": { type: "boolean" },
       mode: { type: "string" }, tenant: { type: "string" }, exclude: { type: "string", multiple: true },
       strict: { type: "boolean" }, json: { type: "boolean" }, help: { type: "boolean", short: "h" },
     },
@@ -40,31 +46,37 @@ async function main(argv: string[]): Promise<number> {
   if (values.help || !command) { process.stdout.write(USAGE); return command || values.help ? 0 : 2; }
   const url = values.url ?? process.env.DATABASE_URL;
   if (!url) { process.stderr.write("db-firewall: --url or DATABASE_URL is required\n"); return 2; }
-  const common = { schema: values.schema, column: values.column, exclude: values.exclude };
+  const common = { schemas: values.schema, column: values.column, exclude: values.exclude };
 
   const client = new pg.Client({ connectionString: url });
   await client.connect();
   try {
     if (command === "migrate") {
-      await migrate(client, { ...common, mode: values.mode });
-      const tables = await scan(client, common);
-      print(values.json, { migrated: true, tables }, () =>
-        `Migration applied. ${tables.filter((t) => t.protected).length} of ${tables.length} tables protected.\n`
-        + tablesText(tables));
+      for (const schema of values.schema?.length ? values.schema : ["public"]) {
+        await migrate(client, { schema, column: values.column, mode: values.mode });
+      }
+      const result = await scan(client, common);
+      print(values.json, { migrated: true, ...result }, () => `Migration applied. ` +
+        `${result.tables.filter((t) => t.protected).length} of ${result.tables.length} tables protected.\n` +
+        tablesText(result));
       return 0;
     }
     if (command === "scan") {
-      const tables = await scan(client, common);
-      print(values.json, tables, () => tablesText(tables));
-      return values.strict && tables.some((t) => !t.protected) ? 1 : 0;
+      const result = await scan(client, common);
+      print(values.json, result, () => tablesText(result));
+      return values.strict && (!result.tables.length || result.tables.some((t) => !t.protected)) ? 1 : 0;
     }
     if (command === "verify") {
       if (!values.tenant) { process.stderr.write("db-firewall verify: --tenant is required\n"); return 2; }
-      const result = await verify(client, { ...common, tenant: values.tenant });
-      const failed = result.checks.filter((c) => c.ok === false);
-      print(values.json, result, () => checksText(result.checks) +
-        (failed.length ? `\n${failed.length} check(s) FAILED.\n` : "\nAll checks passed.\n"));
-      return failed.length ? 1 : 0;
+      const result = await verify(client, { ...common, tenant: values.tenant,
+                                            writeProbe: values["write-probe"] });
+      const failed = result.checks.filter((c) => c.ok === false).length;
+      const unsure = result.checks.filter((c) => c.ok === null).length;
+      print(values.json, result, () => checksText(result.checks) + skippedText(result.excluded) +
+        (failed ? `\n${failed} check(s) FAILED${unsure ? `, ${unsure} inconclusive` : ""}.\n`
+          : unsure ? `\nNo failures, but ${unsure} check(s) inconclusive: not a pass.\n`
+          : "\nAll checks passed.\n"));
+      return failed ? 1 : unsure ? 3 : 0;
     }
     process.stderr.write(`db-firewall: unknown command ${command}\n\n${USAGE}`);
     return 2;
@@ -77,11 +89,17 @@ function print(json: boolean | undefined, data: unknown, text: () => string): vo
   process.stdout.write(json ? JSON.stringify(data, null, 2) + "\n" : text());
 }
 
-function tablesText(tables: TableReport[]): string {
-  if (!tables.length) return "No tables with the tenant column.\n";
-  return tables.map((t) => `${t.protected ? "OK  " : "FAIL"}  ${t.table}  (${t.policy_mode}` +
+function tablesText({ tables, excluded }: ScanResult): string {
+  if (!tables.length) return "FAIL  no tables with the tenant column (wrong --column or --schema?)\n" +
+    skippedText(excluded);
+  return tables.map((t) => `${t.protected ? "OK  " : "FAIL"}  ${t.schema}.${t.table}  (${t.policy_mode}` +
     (t.protected ? ")" : `; ${reasons(t)})`) +
-    (t.stale_base_policy ? "  warning: stale base policy, re-run migrate" : "")).join("\n") + "\n";
+    (t.stale_base_policy ? "  warning: stale base policy, re-run migrate" : "")).join("\n") + "\n" +
+    skippedText(excluded);
+}
+
+function skippedText(excluded: string[]): string {
+  return excluded.length ? `Skipped (excluded): ${excluded.join(", ")}\n` : "";
 }
 
 function reasons(t: TableReport): string {
@@ -99,7 +117,7 @@ function reasons(t: TableReport): string {
 
 function checksText(checks: Check[]): string {
   return checks.map((c) => `${c.ok === true ? "OK  " : c.ok === false ? "FAIL" : "--  "}  ` +
-    `${c.table.padEnd(20)} ${c.check.padEnd(28)} ${c.detail}`).join("\n") + "\n";
+    `${c.table.padEnd(24)} ${c.check.padEnd(36)} ${c.detail}`).join("\n") + "\n";
 }
 
 main(process.argv.slice(2)).then((code) => { process.exitCode = code; }, (err) => {

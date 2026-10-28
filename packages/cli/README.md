@@ -27,23 +27,32 @@ Lists every table in the schema that has the tenant column, and reports whether 
 - Each policy applies to `PUBLIC`, covers its own command, and uses exactly the migration's predicate. The CLI asks PostgreSQL to deparse that predicate on a temporary copy of the table, which is rolled back.
 - In permissive mode, no other permissive policy exists on the table.
 
-`--strict` exits 1 when a table is unprotected. `--json` prints the full report, which has the same fields as the Python scanner (`hooks/scanner.py`). When the predicate check cannot run (a read-only transaction, or no `TEMP` privilege), the report says why in `predicate_check`, and the table counts as unprotected.
+`--strict` exits 1 when a table is unprotected or no table is found (a wrong `--column` or `--schema`). `--json` prints `{ tables, excluded }`. Each table report has the Python scanner's fields (`hooks/scanner.py`) plus `schema` and `owner`. When the predicate check cannot run (a read-only transaction, no `TEMP` privilege, or no `SELECT` on the table), the report says why in `predicate_check`, and the table counts as unprotected.
 
-`--exclude <glob>` (repeatable) replaces the default exclusions: `_firewall_*`, the common migration-history tables, `app_config` and `feature_flags`.
+`--schema` is repeatable. `--exclude <glob>` (repeatable, `*`, `?`, `[abc]`) replaces the default exclusions, which are exactly the tables the migration skips: `_firewall_*` and the migration-history tables (`schema_migrations`, `alembic_version`, `knex_migrations`, `prisma_migrations`, `__diesel_schema_migrations`, `flyway_schema_history`). Excluded tables are always listed in the output.
 
 ## verify
 
-Connect with your app's own URL and role, not an admin's. `verify` tests behaviour, not only the policies. Each check runs in a transaction that is rolled back:
+Connect with your app's own URL and role, not an admin's. `verify` tests behaviour, not only the policies. It is read-only by default: each check runs in a transaction that is rolled back.
 
-1. **The role:** RLS applies to it, so it is not a superuser, not `BYPASSRLS`, and not in `_firewall_bypass_roles`.
-2. **The policies:** the scan above passes for each table.
-3. **No tenant:** the role sees no rows.
-4. **As `--tenant`:** every visible row belongs to that tenant.
-5. **Cross-tenant insert:** an insert of a row for another tenant is refused by RLS. Any other error is reported as inconclusive (`--`), not as a pass.
+1. **The role:** RLS applies to it and to every role it can `SET ROLE` to or inherits. None is a superuser, has `BYPASSRLS` or is in `_firewall_bypass_roles`.
+2. **Firewall tables:** the role cannot write `_firewall_bypass_roles` or `_firewall_tenant_map` (else it could add itself as a bypass role).
+3. **Tables found:** at least one table has the tenant column.
+4. **Per table:**
+   - the scan above passes;
+   - the role does not own the table (an owner can turn RLS off);
+   - the role has no `TRUNCATE` (RLS does not apply to it);
+   - with no tenant, the role sees no rows;
+   - as `--tenant`, every visible row belongs to that tenant.
+5. **Tenant has rows:** `--tenant` sees at least one row somewhere. A tenant with no rows proves nothing, so this fails.
+6. **Read paths RLS does not guard:** in the scanned schemas, no materialized view over a tenant table, no view that runs as an owner who skips RLS (use `security_invoker = true`), and no `SECURITY DEFINER` function owned by such a role that the app can execute.
+7. **Other schemas:** no table with the tenant column that the role can read outside `--schema`.
 
-It exits 1 when any check fails. A table the role cannot `SELECT` is skipped and reported.
+A table the role cannot `SELECT` gets no row checks, and that is reported as inconclusive.
 
-Exit codes: 0 ok, 1 a check failed, 2 usage or connection error.
+`--write-probe` also tries, per table, to insert a row for another tenant, which RLS must refuse. It is rolled back, but it fires `BEFORE INSERT` triggers and uses up a sequence value, so it is off by default. A refusal by anything other than RLS is inconclusive.
+
+Exit codes: 0 all checks passed; 1 a check failed; 2 usage or connection error; 3 no failure, but a check was inconclusive (not a pass).
 
 ## Tests
 
@@ -52,4 +61,4 @@ cd packages/cli && npm ci
 DBFW_PG_URL="postgres://postgres@localhost:5432/dbfw_test" npm test
 ```
 
-The tests run the CLI against a live PostgreSQL. They cover protected, unprotected, widened and altered tables, the superuser role check, and both policy modes.
+The tests run the CLI against a live PostgreSQL. They cover protected, unprotected, widened and altered tables, both policy modes, and each verify failure: a bypass role reachable by `SET ROLE`, table ownership, `TRUNCATE`, a writable bypass list, definer views, materialized views, `SECURITY DEFINER` functions, other schemas, no tables, a tenant with no rows and an inconclusive probe.
