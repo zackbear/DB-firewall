@@ -10,13 +10,24 @@
   tenant, so the model cannot pick it. `assertSafeRole(db)` refuses a
   superuser, a `BYPASSRLS` role or a bypass role. No runtime dependencies.
   Tested live in CI with the real migration, including through the AI SDK's
-  `generateText`. Not yet published to npm.
+  `generateText`. Not yet published to npm. From the PR 12 review: only real
+  `pg.Pool` / `pg.Client`, postgres.js and Drizzle databases are accepted (a
+  pool wrapper such as pg-promise mixed connections and returned another
+  tenant's rows); the handle given to `fn` stops working when `fn` settles; a
+  nested call or a raw Drizzle transaction is refused; streaming tools stay in
+  scope; a session-level tenant is cleared before a pooled `pg` connection is
+  released.
 - **PostgreSQL `policy_mode: restrictive`** (`engines.postgresql.policy_mode`,
   `dbfw.policy_mode`): the tenant policies are created `AS RESTRICTIVE`, so
   they AND with the app's own RLS policies instead of being OR-ed with them.
   A table with no permissive policy of its own gets `fw_<hash>_base`. The
   scanner accepts other permissive policies when all four tenant policies are
   restrictive, and reports `policy_mode`. The default stays `permissive`.
+- **Scanner (PostgreSQL): firewall policies are checked by shape**, not only by
+  name: each must apply to `PUBLIC`, cover its own command and read
+  `app.current_tenant`. An altered policy is reported in `altered_policies`
+  and the table counts as unprotected. `stale_base_policy` flags a base
+  policy left next to app policies in restrictive mode.
 
 ## 2026-10-28: live CI and attack corpus (PR #11)
 

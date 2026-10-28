@@ -28,21 +28,61 @@ export interface DrizzleTx {
 }
 
 const SET_TENANT = `SELECT set_config('${TENANT_SETTING}', $1, true)`;
+// Clears a session-level value fn may have set (SET app.current_tenant = ...)
+// before a pooled connection goes back to the pool.
+const CLEAR_TENANT = `SELECT set_config('${TENANT_SETTING}', '', false)`;
 
+// Detection is exact: an object that only looks like a client (a pool wrapper
+// such as pg-promise) would run BEGIN, the tenant and COMMIT on different
+// pooled connections. Anything not recognised is refused.
 function isPgPool(db: any): db is PgPool {
   return typeof db?.connect === "function" && typeof db?.query === "function"
-    && typeof db?.totalCount === "number";
+    && typeof db?.totalCount === "number" && typeof db?.idleCount === "number";
 }
 function isPgClient(db: any): db is PgQueryable {
-  return typeof db?.query === "function" && typeof db?.connect === "function"
-    && typeof db?.totalCount !== "number";
+  return typeof db?.query === "function" && typeof db?.connectionParameters === "object"
+    && db.connectionParameters !== null && typeof db?.totalCount !== "number";
 }
 function isPostgresJs(db: any): db is PostgresJs {
   return typeof db === "function" && typeof db.begin === "function" && typeof db.unsafe === "function";
 }
 function isDrizzle(db: any): db is DrizzleDb {
   return typeof db?.transaction === "function" && typeof db?.execute === "function"
-    && typeof db?.select === "function";
+    && typeof db?.select === "function" && typeof db?.rollback !== "function";
+}
+function isDrizzleTx(db: any): boolean {
+  return typeof db?.transaction === "function" && typeof db?.rollback === "function";
+}
+
+// Handles given to fn. A handle passed back into withTenant is a nested call:
+// refused, since an inner tenant would outlive its savepoint (Drizzle) or
+// commit the outer transaction early (pg).
+const handles = new WeakSet<object>();
+
+/**
+ * Run fn with a handle that stops working when fn settles: a query fired
+ * later (a timer, an un-awaited promise) throws instead of running on the
+ * connection's next borrower. Query builders made inside fn must be awaited
+ * inside fn.
+ */
+async function withHandle<H extends object, T>(target: H, fn: (h: H) => Promise<T>): Promise<T> {
+  const { proxy, revoke } = Proxy.revocable(target, {});
+  handles.add(proxy);
+  try {
+    return await fn(proxy);
+  } finally {
+    revoke();
+  }
+}
+
+function refuseNested(db: unknown): void {
+  if ((typeof db === "object" || typeof db === "function") && db !== null && handles.has(db)) {
+    throw new TypeError("DB Firewall: nested withTenant() on a handle it gave you; " +
+                        "use that handle directly, or pass the pool / database");
+  }
+  if (isDrizzleTx(db)) {
+    throw new TypeError("DB Firewall: pass the Drizzle database, not a transaction");
+  }
 }
 
 /**
@@ -56,6 +96,10 @@ export async function withTenantPg<T>(
   db: PgPool | PgQueryable, tenantOrFn: string | ((client: PgQueryable) => Promise<T>),
   maybeFn?: (client: PgQueryable) => Promise<T>,
 ): Promise<T> {
+  refuseNested(db);
+  if (!isPgPool(db) && !isPgClient(db)) {
+    throw new TypeError("DB Firewall: withTenantPg needs a pg.Pool or a pg.Client / PoolClient");
+  }
   const [tenant, fn] = split(tenantOrFn, maybeFn);
   const pooled = isPgPool(db) ? await db.connect() : undefined;
   const client: PgQueryable = pooled ?? db;
@@ -69,7 +113,7 @@ export async function withTenantPg<T>(
     }
     try {
       await client.query(SET_TENANT, [tenant]);
-      const result = await fn(client);
+      const result = await withHandle(client, fn);
       await client.query("COMMIT");
       return result;
     } catch (err) {
@@ -77,7 +121,10 @@ export async function withTenantPg<T>(
       throw err;
     }
   } finally {
-    pooled?.release(failed);          // a failed ROLLBACK destroys the connection
+    if (pooled && !failed) {
+      await client.query(CLEAR_TENANT).catch((e) => { failed = e as Error; });
+    }
+    pooled?.release(failed);          // a failed ROLLBACK or clear destroys the connection
   }
 }
 
@@ -86,10 +133,12 @@ export async function withTenantPostgres<T>(
   sql: PostgresJs, tenantOrFn: string | ((tx: PostgresJsTx) => Promise<T>),
   maybeFn?: (tx: PostgresJsTx) => Promise<T>,
 ): Promise<T> {
+  refuseNested(sql);
+  if (!isPostgresJs(sql)) throw new TypeError("DB Firewall: withTenantPostgres needs a postgres() instance");
   const [tenant, fn] = split(tenantOrFn, maybeFn);
   return sql.begin(async (tx) => {
     await tx.unsafe(SET_TENANT, [tenant]);
-    return fn(tx);
+    return withHandle(tx, fn);
   });
 }
 
@@ -98,11 +147,13 @@ export async function withTenantDrizzle<T>(
   db: DrizzleDb, tenantOrFn: string | ((tx: DrizzleTx) => Promise<T>),
   maybeFn?: (tx: DrizzleTx) => Promise<T>,
 ): Promise<T> {
+  refuseNested(db);
+  if (!isDrizzle(db)) throw new TypeError("DB Firewall: withTenantDrizzle needs a Drizzle database");
   const [tenant, fn] = split(tenantOrFn, maybeFn);
   const { sql } = await import("drizzle-orm");       // optional peer: only Drizzle users need it
   return db.transaction(async (tx) => {
     await tx.execute(sql`SELECT set_config(${TENANT_SETTING}, ${tenant}, true)`);
-    return fn(tx);
+    return withHandle(tx, fn);
   });
 }
 
@@ -110,16 +161,18 @@ export async function withTenantDrizzle<T>(
  * Run fn in one transaction as one tenant, on a node-postgres Pool or client,
  * a postgres.js instance, or a Drizzle database. The tenant is the explicit
  * one, else the one from runWithTenant() / bindTenant(); with neither it
- * throws before touching the database (fail closed).
+ * throws before touching the database (fail closed). fn gets a handle that
+ * stops working when fn settles.
  */
-export function withTenant<T>(db: unknown, tenantOrFn: string | ((tx: any) => Promise<T>),
-                              maybeFn?: (tx: any) => Promise<T>): Promise<T> {
+export async function withTenant<T>(db: unknown, tenantOrFn: string | ((tx: any) => Promise<T>),
+                                    maybeFn?: (tx: any) => Promise<T>): Promise<T> {
+  refuseNested(db);
   if (isDrizzle(db)) return withTenantDrizzle(db, tenantOrFn, maybeFn);
   if (isPostgresJs(db)) return withTenantPostgres(db, tenantOrFn, maybeFn);
   if (isPgPool(db) || isPgClient(db)) return withTenantPg(db, tenantOrFn, maybeFn);
-  return Promise.reject(new TypeError(
-    "DB Firewall: withTenant() supports node-postgres, postgres.js and Drizzle; " +
-    "use withTenantPg / withTenantPostgres / withTenantDrizzle for a wrapped client"));
+  throw new TypeError(
+    "DB Firewall: withTenant() supports pg.Pool / pg.Client, postgres.js and Drizzle databases; " +
+    "a wrapper (pg-promise, Knex, ...) could run each statement on a different connection");
 }
 
 /** Run one read-only statement outside any tenant (used by assertSafeRole). */
@@ -130,7 +183,8 @@ export async function queryRows(db: unknown, text: string): Promise<any[]> {
   }
   if (isPostgresJs(db)) return db.unsafe(text);
   if (isPgPool(db) || isPgClient(db)) return (await db.query(text)).rows;
-  throw new TypeError("DB Firewall: unsupported database client");
+  throw new TypeError("DB Firewall: unsupported database client (pg.Pool / pg.Client, " +
+                      "postgres.js or a Drizzle database)");
 }
 
 function split<F>(tenantOrFn: string | F, maybeFn?: F): [string, F] {

@@ -19,8 +19,13 @@ describe("tenant ids", () => {
     it(`refuses ${JSON.stringify(bad)}`, () => assert.throws(() => validateTenantId(bad)));
   }
   it("fails closed with no tenant, before touching the database", async () => {
-    const db = { query: () => { throw new Error("must not be called"); }, connect() {} };
+    const db = { query: () => { throw new Error("must not be called"); }, connectionParameters: {} };
     await assert.rejects(withTenant(db, async () => 1), /no tenant/);
+  });
+  it("refuses an object that only looks like a client (pool wrappers such as pg-promise)", async () => {
+    const wrapper = { query: async () => ({ rows: [] }), connect: async () => ({}) };
+    await assert.rejects(withTenant(wrapper, "A", async () => 1), /wrapper/);
+    await assert.rejects(withTenantPg(wrapper, "A", async () => 1), /pg.Pool or a pg.Client/);
   });
   it("scopes nest and do not leak between concurrent calls", async () => {
     const seen = await Promise.all(["A", "B"].map((t) =>
@@ -58,6 +63,19 @@ describe("node-postgres", live, () => {
     assert.equal(rows[0].body, "a-doc");
     assert.deepEqual(ids(await withTenant(pool, "A", async (c) => (await c.query(SELECT)).rows)), [1]);
   });
+  it("the handle stops working when fn returns (no late query on the next borrower)", async () => {
+    let kept;                                     // what a stray timer or closure would hold
+    await withTenant(pool, "A", async (c) => { kept = c; });
+    assert.throws(() => kept.query(SELECT), TypeError);
+    await assert.rejects(withTenant(pool, "A", async (c) => c), TypeError);   // returning it fails too
+  });
+  it("a nested call on the handle is refused", async () => {
+    await assert.rejects(withTenant(pool, "A", (c) => withTenant(c, "B", async () => 1)), /nested/);
+  });
+  it("a session-level tenant set inside fn does not survive the release", async () => {
+    await withTenant(pool, "A", (c) => c.query("SET app.current_tenant = 'B'"));
+    assert.deepEqual(ids((await pool.query(SELECT)).rows), []);
+  });
   it("assertSafeRole accepts the app role and refuses a superuser and a bypass role", async () => {
     await assertSafeRole(pool);
     admin = new pg.Pool({ connectionString: ADMIN_URL, max: 1 });
@@ -85,6 +103,12 @@ describe("postgres.js", live, () => {
     assert.deepEqual(ids(await sql.unsafe(SELECT)), []);
     await assertSafeRole(sql);
   });
+  it("late queries and nested calls are refused", async () => {
+    let kept;
+    await withTenant(sql, "A", async (tx) => { kept = tx; });
+    assert.throws(() => kept.unsafe(SELECT), TypeError);
+    await assert.rejects(withTenant(sql, "A", (tx) => withTenant(tx, "B", async () => 1)), /nested/);
+  });
 });
 
 describe("Drizzle", live, () => {
@@ -102,6 +126,13 @@ describe("Drizzle", live, () => {
     assert.deepEqual(ids(await withTenant(db, "B", read)), [2]);
     assert.deepEqual(ids((await db.execute(dsql.raw(SELECT))).rows), []);
     await assertSafeRole(db);
+  });
+  it("late queries, nested calls and a raw Drizzle transaction are refused", async () => {
+    let kept;
+    await withTenant(db, "A", async (tx) => { kept = tx; });
+    assert.throws(() => kept.execute(dsql.raw(SELECT)), TypeError);
+    await assert.rejects(withTenant(db, "A", (tx) => withTenant(tx, "B", async () => 1)), /nested/);
+    await assert.rejects(db.transaction((tx) => withTenant(tx, "B", async () => 1)), /not a transaction/);
   });
 });
 

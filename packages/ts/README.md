@@ -2,9 +2,9 @@
 
 Tenant isolation for TypeScript AI agents on PostgreSQL.
 
-Every query runs in a transaction that is bound to one tenant. PostgreSQL row-level security (RLS) enforces it, so a bug in your code or a prompt-injected agent cannot read or write another tenant's rows. The tenant comes from your server's session, never from the model.
+Every query runs in a transaction that is bound to one tenant. PostgreSQL row-level security (RLS) enforces it, so the queries your tools run cannot read or write another tenant's rows, whatever the model asks for. The tenant comes from your server's session, never from the model. See "Limits" for what this does not cover.
 
-- Works with node-postgres (`pg`), postgres.js and Drizzle.
+- Works with node-postgres (`pg.Pool`, `pg.Client`), postgres.js and Drizzle databases. Anything else is refused, including pool wrappers such as pg-promise or Knex: they can run each statement on a different connection.
 - No runtime dependencies. Drizzle is an optional peer dependency.
 - Node 20 or later.
 - The RLS policies come from the DB Firewall migration (`migrations/001_postgresql.sql` in this repo).
@@ -61,6 +61,8 @@ const rows = await withTenant(db, tenantId, (tx) => tx.select().from(docs));
 
 With no tenant, `withTenant` throws before it touches the database. RLS also returns no rows to a connection that has no tenant set.
 
+The handle your function gets (`client`, `tx`) stops working when the function settles. A query fired later, from a timer or an un-awaited promise, throws instead of running on the connection's next borrower. Await every query, including Drizzle query builders, inside the function. A nested `withTenant` on that handle, or on a Drizzle transaction you opened yourself, is refused: pass the pool or database instead. With a `pg.Pool`, a tenant set at session level inside the function (`SET app.current_tenant = ...`) is cleared before the connection goes back.
+
 When you pass a single `pg` client instead of a pool, it must not be inside a transaction: the `COMMIT` would also commit the caller's work.
 
 ## 4. Bind AI SDK tools to the tenant
@@ -83,9 +85,16 @@ const tools = {
 const result = await generateText({ model, tools: bindTenant(tools, session.tenantId), prompt });
 ```
 
-`bindTenant` wraps each tool's `execute` so that `withTenant(db, fn)` inside it uses the bound tenant. A tool called outside `bindTenant` throws (`no tenant`). Concurrent requests keep separate tenants (AsyncLocalStorage).
+`bindTenant` wraps each tool's `execute` so that `withTenant(db, fn)` inside it uses the bound tenant. This includes streaming tools (`async *execute`): every step runs as the bound tenant. A tool called outside `bindTenant` throws (`no tenant`). Concurrent requests keep separate tenants (AsyncLocalStorage).
 
 `runWithTenant(tenantId, fn)` does the same for any code path, for example a job or an MCP tool handler.
+
+## Limits
+
+- **Model-written SQL.** If a tool runs SQL text that the model wrote, the model can switch tenants inside the transaction (`SELECT set_config('app.current_tenant', 'other', true)`). Tools must build their queries from typed parameters, as in the example above. For agents that send raw SQL, put the Python MCP wrapper (`hooks/mcp_wrapper.py`) in front: it parses and scopes every statement and refuses the ones it cannot scope.
+- **The role.** A superuser, a `BYPASSRLS` role or the table owner without `FORCE ROW LEVEL SECURITY` skips RLS. The migration forces RLS. `assertSafeRole` checks the role.
+- **Tenant ids that differ only in case**, on a tenant column with a case-insensitive (nondeterministic) collation, match each other. Use the default collation for the tenant column.
+- **Restrictive mode** with an app policy that covers only `SELECT` leaves no permissive policy for `INSERT`, `UPDATE` or `DELETE`, so those are refused (fail closed). Give the app policy those commands too, or add one for them.
 
 ## Tenant ids
 

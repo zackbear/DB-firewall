@@ -110,7 +110,16 @@ PostgreSQL policy mode (`engines.postgresql.policy_mode`, `dbfw.policy_mode`):
   widen past it, and the scanner accepts them. PostgreSQL needs one permissive
   policy before it allows any row: a table with none of its own gets
   `fw_<hash>_base` (`USING (true)`). Re-run the migration after adding the
-  first policy of your own to a table, so the base policy is removed.
+  first policy of your own to a table, so the base policy is removed; until
+  then it ORs with your policy inside the tenant, and the scanner reports
+  `stale_base_policy`. An app policy that covers only `SELECT` leaves no
+  permissive policy for writes, so they are refused.
+
+The scanner also checks each firewall policy's shape: it must apply to
+`PUBLIC`, cover its own command, and read `app.current_tenant`. A policy
+altered after the migration (`ALTER POLICY ... TO some_role`, `USING (true)`)
+is listed in `altered_policies` and the table counts as unprotected. This is a
+shape check, not a proof: the predicate text is matched, not evaluated.
 
 Oracle: run as SYS. The logon/logoff triggers call the package, and any other
 DBA user needs a direct grant from the schema owner first (see section 6b of

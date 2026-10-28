@@ -48,7 +48,21 @@ _PG_SQL = """
                              FROM pg_policies p
                              WHERE p.schemaname = t.nspname AND p.tablename = t.relname
                                AND p.policyname IN (t.stem || '_sel', t.stem || '_ins',
-                                                    t.stem || '_upd', t.stem || '_del')), false)
+                                                    t.stem || '_upd', t.stem || '_del')), false),
+                   -- A firewall policy that was altered: applies to a role other than
+                   -- PUBLIC, covers another command, or no longer reads the tenant.
+                   ARRAY(SELECT p.policyname FROM pg_policies p
+                         JOIN unnest(ARRAY['sel', 'ins', 'upd', 'del'],
+                                     ARRAY['SELECT', 'INSERT', 'UPDATE', 'DELETE']) AS o(op, cmd)
+                           ON p.policyname IN (t.stem || '_' || o.op, t.legacy || '_' || o.op)
+                         WHERE p.schemaname = t.nspname AND p.tablename = t.relname
+                           AND (p.roles <> '{public}'::name[] OR p.cmd <> o.cmd
+                                OR (o.op <> 'ins' AND COALESCE(p.qual, '') NOT LIKE '%%app.current_tenant%%')
+                                OR (o.op IN ('ins', 'upd')
+                                    AND COALESCE(p.with_check, '') NOT LIKE '%%app.current_tenant%%'))),
+                   EXISTS (SELECT 1 FROM pg_policies p
+                           WHERE p.schemaname = t.nspname AND p.tablename = t.relname
+                             AND p.policyname = t.stem || '_base')
             FROM t
             ORDER BY t.relname
 """
@@ -97,7 +111,7 @@ _ORACLE_SQL = """
 def _scan_postgres(cursor, tenant_col, excluded, opts) -> Dict[str, dict]:
     results = {}
     cursor.execute(_PG_SQL, (opts.get("schema") or "public", tenant_col))
-    for table, enabled, forced, missing, extra, restrictive in cursor.fetchall():
+    for table, enabled, forced, missing, extra, restrictive, altered, base in cursor.fetchall():
         if _is_excluded_table(table, excluded):
             continue
         missing, extra = sorted(missing), sorted(extra)
@@ -106,7 +120,11 @@ def _scan_postgres(cursor, tenant_col, excluded, opts) -> Dict[str, dict]:
             "missing_policies": missing, "extra_permissive_policies": extra,
             "rls_enabled": bool(enabled), "rls_forced": bool(forced),
             "policy_mode": "restrictive" if restrictive else "permissive",
-            "protected": bool(enabled) and bool(forced) and not missing
+            "altered_policies": sorted(altered),
+            # restrictive mode: "<stem>_base" (USING true) next to the app's own
+            # permissive policies ORs with them inside the tenant: re-run the migration.
+            "stale_base_policy": bool(base) and any(not e.endswith("_base") for e in extra),
+            "protected": bool(enabled) and bool(forced) and not missing and not altered
                          and (bool(restrictive) or not extra),
         }
     return results

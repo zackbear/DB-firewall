@@ -76,6 +76,9 @@ class TestValidation:
         {"excluded_users": [""]},
         {"audit": {"table_name": "log; --"}},
         {"engines": {"oracle": {"audit_table": "a b"}}},
+        {"engines": {"postgresql": {"policy_mode": "sideways"}}},
+        {"engines": {"postgresql": {"policy_mode": ""}}},
+        {"engines": {"postgresql": {"policy_mode": False}}},
     ])
     def test_bad_settings_raise(self, tmp_path, bad):
         with pytest.raises(ValueError):

@@ -6,7 +6,7 @@ import pg from "pg";
 import { generateText, tool } from "ai";
 import { MockLanguageModelV4 } from "ai/test";
 import { z } from "zod";
-import { bindTenant, withTenant } from "../dist/index.js";
+import { bindTenant, runWithTenant, withTenant } from "../dist/index.js";
 import { SCHEMA, appUrl, live, setup } from "./setup.mjs";
 
 const usage = {
@@ -46,6 +46,25 @@ describe("AI SDK generateText", live, () => {
     const [a, b] = await Promise.all([run("A"), run("B")]);
     assert.deepEqual(a.toolResults[0].output, { seen: "B", ids: [1] });   // asked for B, got A
     assert.deepEqual(b.toolResults[0].output, { seen: "B", ids: [2] });
+  });
+
+  it("a streaming tool (async *execute) runs every step as the bound tenant", async () => {
+    const streaming = {
+      listDocs: tool({
+        description: "List documents, streaming",
+        inputSchema: z.object({ search: z.string() }).passthrough(),
+        async *execute() {
+          yield { status: "loading" };
+          const rows = await withTenant(pool, async (c) => (await c.query(`SELECT id FROM ${SCHEMA}.docs`)).rows);
+          yield { ids: rows.map((r) => r.id) };
+        },
+      }),
+    };
+    const run = (tenant) => generateText({ model: model(), tools: bindTenant(streaming, tenant), prompt: "list" });
+    // An outer scope for B must not leak into a tool bound to A.
+    const [a, b] = await runWithTenant("B", () => Promise.all([run("A"), run("B")]));
+    assert.deepEqual(a.toolResults[0].output, { ids: [1] });
+    assert.deepEqual(b.toolResults[0].output, { ids: [2] });
   });
 
   it("unbound tools fail the call (no tenant)", async () => {

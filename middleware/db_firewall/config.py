@@ -113,9 +113,8 @@ def validate_config(config: dict) -> None:
                              f"{RESOLUTION_SOURCES}, got {entry!r}")
         if entry.get("table") is not None:
             check_table_name(entry["table"])
-    mode = (((config.get("engines") or {}).get("postgresql") or {}).get("policy_mode")
-            or "permissive")
-    if mode not in ("permissive", "restrictive"):
+    mode = ((config.get("engines") or {}).get("postgresql") or {}).get("policy_mode", "permissive")
+    if not isinstance(mode, str) or mode.lower() not in ("permissive", "restrictive"):
         raise ValueError(f"DB Firewall: engines.postgresql.policy_mode must be permissive "
                          f"or restrictive, got {mode!r}")
     users = config.get("excluded_users") or []

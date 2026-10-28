@@ -114,6 +114,41 @@ def test_scanner_accepts_app_policies_in_restrictive_mode():
     assert report["plain"]["protected"]
 
 
+def _stem(table):
+    with psycopg.connect(DSN) as c:
+        return c.execute("SELECT 'fw_' || left(md5(%s || '.' || %s), 12)", (SCHEMA, table)).fetchone()[0]
+
+
+@pytest.mark.parametrize("alter", [
+    "ALTER POLICY {p}_sel ON {t} TO pg_monitor",          # applies to another role only
+    "ALTER POLICY {p}_sel ON {t} USING (true)",           # no longer reads the tenant
+    "ALTER POLICY {p}_ins ON {t} WITH CHECK (true)",
+])
+def test_scanner_flags_an_altered_firewall_policy(alter):
+    t, p = f"{SCHEMA}.plain", _stem("plain")
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute(alter.format(p=p, t=t))
+        try:
+            report = scan_tables(c, DBEngine.POSTGRESQL, _cfg("restrictive"))["plain"]
+        finally:
+            _migrate("restrictive")                       # restore the policies
+    assert report["protected"] is False and report["altered_policies"]
+
+
+def test_scanner_reports_a_stale_base_policy():
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute(f"CREATE POLICY app_late ON {SCHEMA}.plain USING (id = 1)")   # added after the run
+        try:
+            report = scan_tables(c, DBEngine.POSTGRESQL, _cfg("restrictive"))["plain"]
+            assert report["stale_base_policy"] is True          # base ORs with app_late
+            _migrate("restrictive")                             # the documented fix
+            after = scan_tables(c, DBEngine.POSTGRESQL, _cfg("restrictive"))["plain"]
+            assert after["stale_base_policy"] is False and after["protected"]
+        finally:
+            c.execute(f"DROP POLICY IF EXISTS app_late ON {SCHEMA}.plain")
+            _migrate("restrictive")
+
+
 def test_permissive_rerun_removes_base_and_scanner_flags_app_policy():
     _migrate("permissive")
     try:

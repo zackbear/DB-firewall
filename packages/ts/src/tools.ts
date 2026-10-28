@@ -16,8 +16,23 @@ export function bindTenant<T extends Record<string, unknown>>(tools: T, tenantId
     const execute = (tool as { execute?: unknown } | null)?.execute;
     bound[name] = typeof execute === "function"
       ? { ...(tool as object), execute: (...args: unknown[]) =>
-            runWithTenant(tenant, () => execute.apply(tool, args)) }
+            inScope(tenant, runWithTenant(tenant, () => execute.apply(tool, args))) }
       : tool;
   }
   return bound as T;
+}
+
+/**
+ * A streaming tool (async *execute) returns an async iterator whose body runs
+ * on each next(), outside the call above: run every step in the scope too.
+ */
+function inScope(tenant: string, result: unknown): unknown {
+  const it = result as AsyncIterator<unknown> & AsyncIterable<unknown>;
+  if (!it || typeof it.next !== "function" || typeof (it as any)[Symbol.asyncIterator] !== "function") {
+    return result;
+  }
+  const step = (name: "next" | "return" | "throw") => (...a: unknown[]) =>
+    runWithTenant(tenant, () => (it as any)[name]?.(...a) ?? Promise.resolve({ done: true, value: a[0] }));
+  return { next: step("next"), return: step("return"), throw: step("throw"),
+           [Symbol.asyncIterator]() { return this; } };
 }
