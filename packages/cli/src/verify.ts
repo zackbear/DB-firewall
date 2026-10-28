@@ -80,6 +80,20 @@ export async function roleChecks(client: pg.ClientBase): Promise<Check[]> {
     // a search_path the app role sets for itself (ALTER ROLE ... SET persists
     // across sessions, and no reset can undo it). The migration refuses planted
     // _firewall_* objects and pins search_path; nothing else should rely on that.
+    // TRIGGER on a table lets the app attach a deferred trigger: it fires at
+    // COMMIT, after an in-transaction session reset (postgres.js), and can
+    // leave state for the connection's next user.
+    () => guard("cannot create triggers", async () => {
+      const { rows } = await client.query(
+        `SELECT c.oid::regclass::text AS name FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE c.relkind IN ('r', 'p', 'v', 'f') AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+           AND n.nspname NOT LIKE 'pg#_toast%' ESCAPE '#'
+           AND ${anyRole("has_table_privilege(m.oid, c.oid, 'TRIGGER')")}
+         ORDER BY 1 LIMIT 20`);
+      return { ok: rows.length === 0, detail: rows.length
+        ? `TRIGGER is granted on ${rows.map((r) => r.name).join(", ")}: REVOKE TRIGGER ... FROM the app role`
+        : "no TRIGGER on any table" };
+    }),
     () => guard("cannot create in any schema", async () => {
       const { rows } = await client.query(
         `SELECT n.nspname FROM pg_namespace n

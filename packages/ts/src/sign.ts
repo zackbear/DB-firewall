@@ -30,91 +30,68 @@ export function signTenant(key: Buffer, nonce: string, tenant: string): string {
 /** Runs one statement in the transaction and returns its rows. */
 export type Run = (text: string, values?: unknown[]) => Promise<any[]>;
 
+/** What enter() saw before fn ran: the settings to restore and the driver's own prepared statements. */
+export interface Entered { keep: string; drivers: string[] }
+
+// Snapshot taken in the transaction, before fn: the session-level settings
+// and role (_firewall_session_settings()) and the protocol-level prepared
+// statements the driver made.
+const SNAPSHOT = "public._firewall_session_settings() AS keep, " +
+  "(SELECT coalesce(pg_catalog.array_agg(name), '{}') FROM pg_catalog.pg_prepared_statements WHERE NOT from_sql) AS drivers";
+
 /**
- * Set the tenant for the current transaction, signed when the key is set.
- * Without it the tenant is set unsigned (warned once): a database migrated
- * with the default signed context then shows no rows (fail closed). Returns
- * the session settings to restore afterwards (_firewall_session_settings()).
+ * In the open transaction, before fn: set the tenant, signed when the key is
+ * set. Without it the tenant is set unsigned (warned once): a database
+ * migrated with the default signed context then shows no rows (fail closed).
  */
-async function setTenant(run: Run, tenant: string): Promise<unknown> {
+export async function enter(run: Run, tenant: string): Promise<Entered> {
   const key = tenantKey();
+  let row: any;
   if (!key) {
     if (!warned) {
       warned = true;
       console.warn(`DB Firewall: ${TENANT_KEY_ENV} is not set: the tenant context is unsigned. ` +
                    "A database migrated with the default signed context then shows no rows.");
     }
-    const [row] = await run(`SELECT set_config('${TENANT_SETTING}', $1, true), ` +
-                            "public._firewall_session_settings() AS keep", [tenant]);
-    return row.keep;
+    [row] = await run(`SELECT set_config('${TENANT_SETTING}', $1, true), ${SNAPSHOT}`, [tenant]);
+  } else {
+    [row] = await run(`SELECT public._firewall_nonce() AS nonce, ${SNAPSHOT}`);
+    await run(`SELECT set_config('${TENANT_SETTING}', $1, true), set_config('${SIG_SETTING}', $2, true)`,
+              [tenant, signTenant(key, String(row.nonce), tenant)]);
   }
-  const [row] = await run("SELECT public._firewall_nonce() AS nonce, public._firewall_session_settings() AS keep");
-  await run(`SELECT set_config('${TENANT_SETTING}', $1, true), set_config('${SIG_SETTING}', $2, true)`,
-            [tenant, signTenant(key, String(row.nonce), tenant)]);
-  return row.keep;
+  // Drivers differ: pg parses jsonb, postgres.js returns it as text.
+  return { keep: typeof row.keep === "string" ? row.keep : JSON.stringify(row.keep),
+           drivers: Array.isArray(row.drivers) ? row.drivers : [] };
 }
 
-const SAVEPOINT = "_dbfw_fn";
 // Casts qualified: a temp type named jsonb would shadow the plain name.
 // $1::text: postgres.js would JSON-encode a jsonb-typed parameter a second time.
-// planted: SQL-level prepared statements fn made, counted before the reset
-// drops them. A driver whose statement fn replaced now has a stale cache.
-const RESET = "WITH c AS MATERIALIZED (SELECT count(*) AS n FROM pg_catalog.pg_prepared_statements WHERE from_sql) " +
-  "SELECT c.n::int AS planted, public._firewall_reset_session($1::pg_catalog.text::pg_catalog.jsonb) FROM c";
+// suspect: SQL-level prepared statements fn made, plus driver statements fn
+// removed, counted before the reset. The driver's statement cache is then
+// stale, so the connection is better discarded.
+const RESET = "WITH c AS MATERIALIZED (SELECT " +
+  "(SELECT count(*) FROM pg_catalog.pg_prepared_statements WHERE from_sql) " +
+  "OPERATOR(pg_catalog.+) (SELECT count(*) FROM pg_catalog.unnest($2::pg_catalog.text[]) d WHERE NOT EXISTS " +
+  "(SELECT 1 FROM pg_catalog.pg_prepared_statements p WHERE NOT p.from_sql AND p.name OPERATOR(pg_catalog.=) d)) AS n) " +
+  "SELECT c.n::int AS suspect, public._firewall_reset_session($1::pg_catalog.text::pg_catalog.jsonb) FROM c";
 
-/** fn left the transaction unusable; it was rolled back and the session reset.
- *  The connection should still be discarded where the driver allows it. */
+/** fn left the transaction or the session unusable; it was rolled back and the
+ *  session reset. The connection should still be discarded where the driver allows it. */
 export class SessionResetError extends Error {}
 
 /**
- * In the open transaction: set the tenant, run body, then undo the session
- * state body left (public._firewall_reset_session: temp objects, SQL-level
- * prepared statements, custom settings, cursors, LISTEN, advisory locks), on
- * success and on error, so the connection's next user (another tenant) cannot
- * run into it. body runs in a savepoint, so the reset also runs after a failed
- * statement. When body broke the transaction (left it aborted, released the
- * savepoint), the transaction is rolled back, the reset runs outside it, and
- * SessionResetError is thrown. terminate: end the backend if even that fails
- * (postgres.js recovers; node-postgres would crash on the error event, so its
- * adapter destroys the client instead).
+ * After COMMIT or ROLLBACK, outside any transaction: undo the session state fn
+ * left (public._firewall_reset_session: temp objects, SQL-level prepared
+ * statements, custom settings, cursors, LISTEN, advisory locks), so the
+ * connection's next user (another tenant) cannot run into it. After the
+ * transaction ended, so a deferred trigger firing at COMMIT cannot undo it.
+ * RESET ALL runs alone first, so a short statement_timeout fn set cannot stop
+ * the rest. Returns true when the connection should be discarded. Throws when
+ * the reset fails: the connection must then be discarded.
  */
-export async function scoped<T>(run: Run, tenant: string, body: () => Promise<T>,
-                                terminate = false, onPlanted?: () => void): Promise<T> {
-  const snapshot = await setTenant(run, tenant);
-  // Drivers differ: pg parses jsonb, postgres.js returns it as text.
-  const keep = typeof snapshot === "string" ? snapshot : JSON.stringify(snapshot);
-  await run(`SAVEPOINT ${SAVEPOINT}`);
-  let result: T;
-  try {
-    result = await body();
-  } catch (err) {
-    await reset(run, keep, true, terminate, onPlanted);
-    throw err;
-  }
-  await reset(run, keep, false, terminate, onPlanted);
-  return result;
+export async function resetOutside(run: Run, e: Entered): Promise<boolean> {
+  await run("RESET ALL");
+  await run("SELECT pg_catalog.pg_advisory_unlock_all()");
+  const [r] = await run(RESET, [e.keep, e.drivers]);
+  return r?.suspect > 0;
 }
-
-async function reset(run: Run, keep: string, failed: boolean, terminate: boolean,
-                     onPlanted?: () => void): Promise<void> {
-  const once = async () => { const [r] = await run(RESET, [keep]); if (r?.planted > 0) onPlanted?.(); };
-  try {
-    if (failed) await run(`ROLLBACK TO SAVEPOINT ${SAVEPOINT}`);
-    await once();
-    return;
-  } catch (err) {
-    onPlanted?.();                    // the connection is suspect either way
-    try {
-      await run("ROLLBACK");
-      await once();
-    } catch {
-      if (terminate) await run("SELECT pg_catalog.pg_terminate_backend(pg_catalog.pg_backend_pid())").catch(() => {});
-    }
-    throw new SessionResetError("DB Firewall: the function left the transaction unusable " +
-      `(${(err as Error).message}); it was rolled back and the session reset`);
-  }
-}
-
-/** Clears session-level values fn may have set, before a connection goes back to a pool. */
-export const CLEAR_TENANT =
-  `SELECT set_config('${TENANT_SETTING}', '', false), set_config('${SIG_SETTING}', '', false)`;

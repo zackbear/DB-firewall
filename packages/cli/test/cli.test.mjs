@@ -246,6 +246,8 @@ describe("migrate, scan, verify", live, () => {
                             current_setting('app.tenant_sig', true) AS s) g
     WHERE sha256(convert_to(g.s, 'UTF8')) = sha256(convert_to(public._firewall_sign(g.t), 'UTF8'));
       $f$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp;`],
+    ["it has TRIGGER on a table", "-: cannot create triggers",
+     `GRANT TRIGGER ON ${S}.docs TO ${ROLE};`, `REVOKE TRIGGER ON ${S}.docs FROM ${ROLE};`],
     ["it can CREATE in public", "-: cannot create in any schema",
      `GRANT CREATE ON SCHEMA public TO ${ROLE};`, `REVOKE CREATE ON SCHEMA public FROM ${ROLE};`],
     ["it can CREATE in its own schema", "-: cannot create in any schema",

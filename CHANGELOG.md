@@ -59,6 +59,19 @@
   - **Scanners:** they check every function the migration creates and flag
     extra `_firewall_*` functions. Several superuser owners are accepted.
     `verify` fails on `CREATE` in any schema.
+- From the third review round:
+  - **TS:** every adapter now holds one connection for the call (Drizzle via
+    `db.$client`; postgres.js via `sql.reserve()` with `begin`/`savepoint`
+    added) and resets the session after COMMIT, so a deferred trigger cannot
+    undo the reset. `RESET ALL` and the advisory-lock release run first, so a
+    short `statement_timeout` cannot stop the reset.
+  - **Failed resets:** node-postgres connections are destroyed. postgres.js
+    connections are retired, because ending them crashed postgres.js. A
+    node-postgres connection whose driver statements were removed is also
+    destroyed.
+  - **Migration:** the guard is two `DO` blocks, so no TEMP privilege is
+    needed.
+  - **`verify`** also fails on `TRIGGER` on any table.
 - **Upgrade:** set `DB_FIREWALL_TENANT_KEY` in the app before re-running the
   migration, or set `tenant_context: plain`. PostgreSQL 13+ for signed.
 

@@ -1,4 +1,4 @@
-import { CLEAR_TENANT, SessionResetError, scoped } from "./sign.js";
+import { type Entered, type Run, SessionResetError, enter, resetOutside } from "./sign.js";
 import { resolveTenant } from "./tenant.js";
 
 // Structural types: the package has no runtime dependency on any driver.
@@ -60,7 +60,8 @@ const handles = new WeakSet<object>();
 
 // Lifecycle calls fn must not make: releasing or ending the connection while
 // this function still owns it hands it to the next borrower mid-transaction.
-const BLOCKED = new Set<PropertyKey>(["release", "connect", "end"]);
+// begin / reserve: a nested transaction would COMMIT this one early.
+const BLOCKED = new Set<PropertyKey>(["release", "connect", "end", "begin", "reserve"]);
 // Methods that call back with a handle (a nested Drizzle transaction, a
 // postgres.js savepoint): the callback gets wrapped arguments and `this`.
 const HANDLE_CALLBACKS = new Set<PropertyKey>(["transaction", "savepoint"]);
@@ -161,11 +162,47 @@ function refuseNested(db: unknown): void {
 }
 
 /**
+ * A transaction on one node-postgres client, then the session reset outside
+ * it (after COMMIT, so a deferred trigger cannot undo it). tx runs the
+ * transaction and calls enter() in it. A pooled client is destroyed when the
+ * reset failed or fn tampered with the driver's prepared statements; a
+ * standalone client cannot be, so the call throws SessionResetError instead.
+ */
+interface ClientState { entered?: Entered; suspect?: Error }
+
+async function onClient<T>(client: PgQueryable, pooled: { release(err?: Error | boolean): void } | undefined,
+                           tx: (state: ClientState) => Promise<T>): Promise<T> {
+  const run: Run = async (text, values) => (await client.query(text, values)).rows;
+  const state: ClientState = {};
+  let failed: Error | undefined, discard = false, threw = false;
+  try {
+    return await tx(state);
+  } catch (err) {
+    threw = true;
+    throw err;
+  } finally {
+    if (state.entered && !state.suspect) {
+      // The statements node-postgres believes it prepared on this connection
+      // (also those prepared during fn): if fn removed one, the cache is stale.
+      const cached = Object.keys((client as any).connection?.parsedStatements ?? {});
+      const entered = { ...state.entered, drivers: [...new Set([...state.entered.drivers, ...cached])] };
+      try { discard = await resetOutside(run, entered); } catch (e) { failed = e as Error; }
+    }
+    pooled?.release(state.suspect ?? failed ?? (discard ? new Error("DB Firewall: session tampered with") : undefined));
+    if (failed && !pooled && !threw) {
+      // eslint-disable-next-line no-unsafe-finally
+      throw new SessionResetError(`DB Firewall: could not reset the session (${failed.message}); ` +
+                                  "do not reuse this client");
+    }
+  }
+}
+
+/**
  * node-postgres: BEGIN, set the tenant for this transaction only, run fn with
- * the transaction's client, then COMMIT (ROLLBACK if fn throws). A Pool lends
- * one client for the call and gets it back clean. Pass a Pool, or a client
- * that is not inside a transaction: this function's COMMIT would also commit
- * a transaction the caller opened.
+ * the transaction's client, then COMMIT (ROLLBACK if fn throws), then reset the
+ * session. A Pool lends one client for the call and gets it back clean. Pass a
+ * Pool, or a client that is not inside a transaction: this function's COMMIT
+ * would also commit a transaction the caller opened.
  */
 export async function withTenantPg<T>(
   db: PgPool | PgQueryable, tenantOrFn: string | ((client: PgQueryable) => Promise<T>),
@@ -178,36 +215,96 @@ export async function withTenantPg<T>(
   const [tenant, fn] = split(tenantOrFn, maybeFn);
   const pooled = isPgPool(db) ? await db.connect() : undefined;
   const client: PgQueryable = pooled ?? db;
-  let failed: Error | undefined;
-  let discard = false;
-  try {
+  return onClient(client, pooled, async (state) => {
     try {
       await client.query("BEGIN");
     } catch (err) {
-      failed = err as Error;          // the connection is suspect: discard it
+      state.suspect = err as Error;                     // the connection is suspect: discard it
       throw err;
     }
     try {
-      const result = await scoped(async (text, values) => (await client.query(text, values)).rows, tenant,
-                                  () => withHandle(client, fn), false,
-                                  () => { discard = true; });   // a driver statement may be stale
-      await client.query("COMMIT");
+      state.entered = await enter(async (text, values) => (await client.query(text, values)).rows, tenant);
+      const result = await withHandle(client, fn);
+      const done: any = await client.query("COMMIT");
+      if (done?.command === "ROLLBACK") {            // fn left the transaction aborted
+        throw new SessionResetError("DB Firewall: the function left the transaction aborted; it was rolled back");
+      }
       return result;
     } catch (err) {
-      if (err instanceof SessionResetError) failed = err;   // discard the connection
-      await client.query("ROLLBACK").catch((e) => { failed = e as Error; });
+      await client.query("ROLLBACK").catch((e) => { state.suspect = e as Error; });
       throw err;
     }
-  } finally {
-    if (!failed) {                    // pooled or not: no session-level tenant survives
-      await client.query(CLEAR_TENANT).catch((e) => { failed = e as Error; });
+  });
+}
+
+/** postgres.js resolves an array of queries returned from a transaction. */
+const settle = async (x: unknown) => (Array.isArray(x) ? Promise.all(x) : x);
+
+/**
+ * A reserved postgres.js connection, so the transaction and the session reset
+ * after it run on one connection. Reserved connections have no begin() or
+ * savepoint(), so these are added: begin(fn) runs BEGIN, fn, COMMIT (ROLLBACK
+ * on error) and savepoint(fn) the same with a savepoint, as postgres.js does.
+ */
+async function reservePostgres(sql: PostgresJs): Promise<any> {
+  const r: any = await (sql as any).reserve();
+  let n = 0;
+  const around = async (open: string, close: string, undo: string, fn: (s: unknown) => unknown) => {
+    await r.unsafe(open);
+    try {
+      const res = await settle(await fn(r));
+      await r.unsafe(close);
+      return res;
+    } catch (err) {
+      await r.unsafe(undo).catch(() => {});
+      throw err;
     }
-    // A failed ROLLBACK, clear or reset, or a replaced prepared statement destroys the connection.
-    pooled?.release(failed ?? (discard ? new Error("DB Firewall: session tampered with") : undefined));
+  };
+  const fnOf = (a: unknown, b?: unknown) => (typeof a === "function" ? a : b) as (s: unknown) => unknown;
+  r.begin = (a: unknown, b?: unknown) => around("BEGIN", "COMMIT", "ROLLBACK", fnOf(a, b));
+  r.savepoint = (a: unknown, b?: unknown) => {
+    const name = `_dbfw_sp${n++}`;
+    return around(`SAVEPOINT ${name}`, `RELEASE SAVEPOINT ${name}`, `ROLLBACK TO SAVEPOINT ${name}`, fnOf(a, b));
+  };
+  return r;
+}
+
+/**
+ * On a reserved postgres.js connection: tx runs the transaction (r.begin) and
+ * calls enter() in it; then the session is reset outside it. postgres.js does
+ * not survive a reserved connection being ended (it throws from its socket
+ * code), so a connection whose reset failed is never released: nothing else
+ * can use it, at the cost of one pool slot. A connection whose prepared
+ * statements fn tampered with is released (the SQL-level ones are gone; at
+ * worst postgres.js's statement cache fails on it, which leaks nothing).
+ */
+async function onReserved<T>(r: any, tx: (state: ClientState) => Promise<T>): Promise<T> {
+  const run: Run = (text, values) => r.unsafe(text, values);
+  const state: ClientState = {};
+  let failed: Error | undefined, threw = false;
+  try {
+    return await tx(state);
+  } catch (err) {
+    threw = true;
+    throw err;
+  } finally {
+    if (state.entered) {
+      try { await resetOutside(run, state.entered); } catch (e) { failed = e as Error; }
+    }
+    if (!failed) r.release();
+    else if (!threw) {
+      // eslint-disable-next-line no-unsafe-finally
+      throw new SessionResetError(`DB Firewall: could not reset the session (${failed.message}); ` +
+                                  "the connection was retired (kept reserved, never reused)");
+    }
   }
 }
 
-/** postgres.js: sql.begin(), tenant set first, fn gets the transaction's sql. */
+/**
+ * postgres.js: a reserved connection, BEGIN, tenant set first, fn gets the
+ * transaction's sql (tx`...`, tx.unsafe, tx.savepoint), COMMIT, then the
+ * session reset.
+ */
 export async function withTenantPostgres<T>(
   sql: PostgresJs, tenantOrFn: string | ((tx: PostgresJsTx) => Promise<T>),
   maybeFn?: (tx: PostgresJsTx) => Promise<T>,
@@ -215,17 +312,20 @@ export async function withTenantPostgres<T>(
   refuseNested(sql);
   if (!isPostgresJs(sql)) throw new TypeError("DB Firewall: withTenantPostgres needs a postgres() instance");
   const [tenant, fn] = split(tenantOrFn, maybeFn);
-  return sql.begin(async (tx) => {
-    // postgres.js resolves an array of queries returned from begin(): settle it
-    // here, while the handle is still open.
-    return scoped((text, values) => tx.unsafe(text, values), tenant, () => withHandle(tx, async (h) => {
-      const result: unknown = await fn(h);
-      return (Array.isArray(result) ? await Promise.all(result) : result) as T;
-    }), true);
-  });
+  const r = await reservePostgres(sql);
+  return onReserved(r, (state) => r.begin(async () => {
+    state.entered = await enter((text, values) => r.unsafe(text, values), tenant);
+    // Settle an array of queries here, while the handle is still open.
+    return withHandle(r, async (h: PostgresJsTx) => (await settle(await fn(h))) as T);
+  }));
 }
 
-/** Drizzle: db.transaction(), tenant set first with Drizzle's own sql template. */
+/**
+ * Drizzle: db.transaction(), tenant set first with Drizzle's own sql template.
+ * The transaction runs on one connection this function holds (a pg client, or
+ * a reserved postgres.js connection), with the same dialect, schema and
+ * logger, and the session is reset after COMMIT.
+ */
 export async function withTenantDrizzle<T>(
   db: DrizzleDb, tenantOrFn: string | ((tx: DrizzleTx) => Promise<T>),
   maybeFn?: (tx: DrizzleTx) => Promise<T>,
@@ -234,15 +334,48 @@ export async function withTenantDrizzle<T>(
   if (!isDrizzle(db)) throw new TypeError("DB Firewall: withTenantDrizzle needs a Drizzle database");
   const [tenant, fn] = split(tenantOrFn, maybeFn);
   const { sql } = await import("drizzle-orm");       // optional peer: only Drizzle users need it
-  return db.transaction(async (tx) => {
-    // Drizzle's own sql template; $n placeholders map to the values in order.
-    const run = async (text: string, values: unknown[] = []) => {
-      const parts = text.split(/\$\d+/);
-      return rowsOf(await tx.execute(sql.join(parts.flatMap((p, i) =>
-        i < values.length ? [sql.raw(p), sql`${values[i]}`] : [sql.raw(p)]))));
-    };
-    return scoped(run, tenant, () => withHandle(tx, fn));
-  });
+  // Drizzle's own sql template; $n placeholders map to the values in order.
+  const runOn = (tx: DrizzleTx): Run => async (text, values = []) => {
+    const parts = text.split(/\$\d+/);
+    return rowsOf(await tx.execute(sql.join(parts.flatMap((p, i) =>
+      i < values.length ? [sql.raw(p), sql`${values[i]}`] : [sql.raw(p)]))));
+  };
+  const base = (db as any).$client;
+  if (isPostgresJs(base)) {
+    const r = await reservePostgres(base);
+    let bound: DrizzleDb;
+    try {
+      bound = rebind(db, r);
+    } catch (err) { r.release(); throw err; }
+    return onReserved(r, (state) => bound.transaction(async (tx) => {
+      state.entered = await enter(runOn(tx), tenant);
+      return withHandle(tx, fn);
+    }));
+  }
+  if (isPgPool(base) || isPgClient(base)) {
+    const pooled = isPgPool(base) ? await base.connect() : undefined;
+    const client: PgQueryable = pooled ?? base;
+    let bound: DrizzleDb;
+    try {
+      bound = rebind(db, client);
+    } catch (err) { pooled?.release(); throw err; }
+    return onClient(client, pooled, (state) => bound.transaction(async (tx) => {
+      state.entered = await enter(runOn(tx), tenant);
+      return withHandle(tx, fn);
+    }));
+  }
+  throw new TypeError("DB Firewall: withTenantDrizzle supports Drizzle on node-postgres or postgres.js");
+}
+
+/** The same Drizzle database (dialect, relational schema, session options such
+ *  as the logger) on one client. Fails closed if Drizzle's shape is unknown. */
+function rebind(db: DrizzleDb, client: unknown): DrizzleDb {
+  const d = db as any;
+  if (typeof d.constructor !== "function" || typeof d.session?.constructor !== "function" || !d.dialect || !d._) {
+    throw new TypeError("DB Firewall: unsupported Drizzle version (cannot hold one connection for the call)");
+  }
+  const session = new d.session.constructor(client, d.dialect, d._.schema, d.session.options);
+  return new d.constructor(d.dialect, session, d._.schema);
 }
 
 /**

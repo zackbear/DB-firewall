@@ -123,19 +123,23 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
 * **Session reset.** SQL run in one tenant's transaction could leave session
   state for the connection's next user: a temp view that shadows a table, a
   SQL-level prepared statement under a driver's statement name, or a custom
-  setting used as a drop box. `withTenant` (TypeScript) runs
-  `public._firewall_reset_session` after every call, also when the function
-  throws. Python's `release()` and `pool_checkin` run it on return. It drops
+  setting used as a drop box. `withTenant` (TypeScript) holds one connection
+  for the call (a pg client, or a reserved postgres.js connection) and runs
+  `public._firewall_reset_session` on it after COMMIT or ROLLBACK, also when
+  the function throws. After the transaction, so a deferred trigger that fires
+  at COMMIT cannot undo it. Python's `release()` and `pool_checkin` run it on
+  return. It drops
   temp objects and SQL-level prepared statements, closes cursors, stops
   `LISTEN`, releases advisory locks, and resets every setting. It then
   restores the session settings and role the connection had before: in
   TypeScript from before the call, in Python from when the middleware first
   set a tenant on the connection. The driver's own prepared statements stay.
-  When the function broke its transaction (left it aborted, released the
-  savepoint), the transaction is rolled back, the reset runs outside it, and
-  `withTenant` throws. node-postgres connections are then destroyed, also when
-  the function replaced a driver's prepared statement. In Python a reset that
-  fails closes the connection, and `pool_checkin` raises so the pool drops it.
+  When the reset fails, a node-postgres connection is destroyed, and a
+  postgres.js connection is retired (kept reserved, never reused: postgres.js
+  does not survive a reserved connection being ended). A node-postgres
+  connection is also destroyed when the function replaced or removed one of
+  the driver's prepared statements. In Python a reset that fails closes the
+  connection, and `pool_checkin` raises so the pool drops it.
   The reset costs about 1 ms per call. [Inference] It was measured on localhost.
 * **The migration protects itself.** It binds every name and operator in
   `pg_catalog`, so a planted operator such as `public.=` for `varchar, text`
@@ -151,7 +155,8 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
   PostgreSQL 15). An app role can set its own defaults (`ALTER ROLE ... SET
   search_path`), which no reset undoes. Without `CREATE` it cannot plant
   anything for that path to reach, but it can still make its own connections
-  fail. `npx db-firewall verify` checks `CREATE` in every schema.
+  fail. `npx db-firewall verify` checks `CREATE` in every schema and `TRIGGER`
+  on every table.
 * **The key in logs.** A key you pass in (`dbfw.tenant_key`,
   `DB_FIREWALL_TENANT_KEY` at migration time) is SQL text. If statement or
   parameter logging is on, it reaches the server log. `run_migration` and

@@ -31,10 +31,11 @@ SET LOCAL search_path = pg_catalog, pg_temp;
 --    could create _firewall_keys first (and read the key this script then
 --    writes into it) or a _firewall_* function (and stay its owner through
 --    CREATE OR REPLACE). Every existing public._firewall_* object must belong
---    to the role running this script or to a superuser. It runs first and
+--    to the role running this script or to a superuser. The same block runs
 --    again as the last statement: a role could plant one while this script
---    waits on a lock (say, in section 6).
-CREATE OR REPLACE FUNCTION pg_temp._firewall_guard() RETURNS VOID AS $$
+--    waits on a lock (say, in section 6). Two DO blocks, not a pg_temp
+--    function, so the script needs no TEMP privilege.
+DO $$
 DECLARE
     bad TEXT;
 BEGIN
@@ -54,8 +55,7 @@ BEGIN
         RAISE EXCEPTION 'DB Firewall: % not owned by % or a superuser. Another role may have planted them: drop them, or ALTER ... OWNER TO a trusted role, and re-run.', bad, current_user;
     END IF;
 END;
-$$ LANGUAGE plpgsql;
-DO $$ BEGIN PERFORM pg_temp._firewall_guard(); END $$;
+$$;
 
 -- 1. Tenant mapping table
 CREATE TABLE IF NOT EXISTS public._firewall_tenant_map (
@@ -466,6 +466,27 @@ BEGIN
 END;
 $$;
 
-DO $$ BEGIN PERFORM pg_temp._firewall_guard(); END $$;
+-- The same check as section 0, again (see there). Kept identical to it.
+DO $$
+DECLARE
+    bad TEXT;
+BEGIN
+    SELECT string_agg(o.name || ' (owner ' || pg_get_userbyid(o.owner) || ')', ', ') INTO bad
+    FROM (SELECT c.oid::regclass::text AS name, c.relowner AS owner FROM pg_class c
+          WHERE c.relnamespace = 'public'::regnamespace AND c.relname LIKE '#_firewall#_%' ESCAPE '#'
+          UNION ALL
+          SELECT p.oid::regprocedure::text, p.proowner FROM pg_proc p
+          WHERE p.pronamespace = 'public'::regnamespace AND p.proname LIKE '#_firewall#_%' ESCAPE '#'
+          UNION ALL
+          SELECT t.oid::regtype::text, t.typowner FROM pg_type t
+          WHERE t.typnamespace = 'public'::regnamespace AND t.typname LIKE '#_firewall#_%' ESCAPE '#'
+            AND t.typrelid = 0) o
+    JOIN pg_roles r ON r.oid = o.owner
+    WHERE r.rolname <> current_user AND NOT r.rolsuper;
+    IF bad IS NOT NULL THEN
+        RAISE EXCEPTION 'DB Firewall: % not owned by % or a superuser. Another role may have planted them: drop them, or ALTER ... OWNER TO a trusted role, and re-run.', bad, current_user;
+    END IF;
+END;
+$$;
 
 COMMIT;
