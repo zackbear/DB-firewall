@@ -1,5 +1,40 @@
 # Changelog
 
+## 2026-10-28: Strict mode and hardening (PR #15)
+
+- **`db-firewall verify --strict`:** an allowlist instead of a list of known
+  leak paths. Everything a role the app can use can read must be protected
+  tenant data: a protected table, a `security_invoker` view whose chain
+  reaches only protected tables (it must read at least one table and call no
+  function outside `pg_catalog`), or a sequence a protected table owns. No
+  large object may be readable, and the role may not read other sessions' SQL
+  in `pg_stat_activity` or `pg_stat_statements` (`--allow-query-text` accepts
+  it, for managed PostgreSQL). No `SECURITY DEFINER` function outside the
+  firewall's may exist, executable or not.
+  `--allow-global` (repeatable, globs, needs `--strict`) marks shared data:
+  `schema.name` for a relation, `schema.name(argtypes)` for a function. In
+  the bypass-objects check it clears only functions and foreign tables
+  without the tenant column, never a view over a tenant table.
+- **verify, all modes:** fails on any rule other than a view's own (its
+  actions run as the owner), on a `SECURITY DEFINER` function PostgreSQL runs
+  without checking `EXECUTE` (triggers, aggregate, range and index support,
+  operator family operators, estimators, planner support, type I/O,
+  conversions, transforms, text search parsers and templates, FDW and
+  language handlers and validators), and when a role the app can use owns
+  the database or any object in it (an owner can change a domain constraint
+  or a function body, or grant itself `CREATE` and `TRIGGER` back). A new information line reports whether the role can read other
+  sessions' SQL. `--exclude` globs read `[^a]` as fnmatch does (a literal
+  `^`).
+- **`migrate --harden --app-role <role>`** (`dbfw.harden`, `dbfw.app_role`,
+  `engines.postgresql.harden` / `app_role`): revokes, from `PUBLIC` and the
+  app role, by any grantor: `CREATE` on the database and every schema,
+  `TRIGGER` and `TRUNCATE` on every table and in default privileges,
+  `pg_stat_activity` with `pg_stat_get_activity` and
+  `pg_stat_get_backend_activity`, `pg_stat_statements` when installed, and
+  the backend signals. It refuses, and changes nothing, when the app role can
+  act as the owner of the database or any object in it, or still has one of
+  these through a role it is a member of. It needs a superuser and is off by default.
+
 ## 2026-10-28: Signed tenant context (PR #14), breaking
 
 - **PostgreSQL tenant context is signed by default** (`dbfw.context` /

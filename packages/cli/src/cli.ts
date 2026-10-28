@@ -28,12 +28,28 @@ Options:
   --harden-signals   migrate: revoke pg_terminate_backend / pg_cancel_backend from
                      PUBLIC in this database (needs a superuser), so tenants sharing
                      the app role cannot end each other's requests
+  --harden           migrate: also revoke CREATE on the database and every schema,
+                     TRIGGER and TRUNCATE on every table (default privileges
+                     too), and pg_stat_activity, from PUBLIC and --app-role, by
+                     any grantor (what verify fails on); needs a superuser.
+                     Refuses if --app-role owns the database, a schema or a table
+  --app-role <name>  migrate --harden: the app's role, revoked from as well
   --tenant <id>      verify: a tenant id that has rows in your data
   --write-probe      verify: also try a cross-tenant insert (rolled back, but it
                      fires BEFORE INSERT triggers and uses up a sequence value)
   --exclude <glob>   scan/verify: skip tables matching (repeatable; replaces the
                      defaults, which are the tables the migration skips)
-  --strict           scan: exit 1 if any table is unprotected or none is found
+  --strict           scan: exit 1 if any table is unprotected or none is found.
+                     verify: also fail on anything the app role can read that is
+                     not protected tenant data, and on SECURITY DEFINER functions
+  --allow-global <glob>  verify --strict: schema.name of a table, view or
+                     sequence, or schema.name(argtypes) of a function, that the
+                     app may reach without tenant scoping (shared reference
+                     data, say); repeatable. For array types, use * (app.f(*))
+  --allow-query-text verify --strict: accept that the role can read other
+                     sessions' SQL (managed PostgreSQL, where only the provider's
+                     superuser can revoke pg_stat_activity); send values as
+                     parameters
   --json             machine-readable output
   -h, --help
 
@@ -48,6 +64,8 @@ async function main(argv: string[]): Promise<number> {
     options: {
       url: { type: "string" }, column: { type: "string" }, schema: { type: "string", multiple: true },
       "write-probe": { type: "boolean" }, "harden-signals": { type: "boolean" },
+      harden: { type: "boolean" }, "app-role": { type: "string" },
+      "allow-global": { type: "string", multiple: true }, "allow-query-text": { type: "boolean" },
       mode: { type: "string" }, context: { type: "string" }, tenant: { type: "string" },
       exclude: { type: "string", multiple: true },
       strict: { type: "boolean" }, json: { type: "boolean" }, help: { type: "boolean", short: "h" },
@@ -76,7 +94,8 @@ async function main(argv: string[]): Promise<number> {
     if (command === "migrate") {
       for (const schema of values.schema?.length ? values.schema : ["public"]) {
         await migrate(client, { schema, column: values.column, mode: values.mode, context,
-                                hardenSignals: values["harden-signals"] });
+                                hardenSignals: values["harden-signals"], harden: values.harden,
+                                appRole: values["app-role"] });
       }
       const result = await scan(client, common);
       print(values.json, { migrated: true, ...result }, () => `Migration applied. ` +
@@ -97,8 +116,13 @@ async function main(argv: string[]): Promise<number> {
     }
     if (command === "verify") {
       if (!values.tenant) { process.stderr.write("db-firewall verify: --tenant is required\n"); return 2; }
+      if ((values["allow-global"]?.length || values["allow-query-text"]) && !values.strict) {
+        process.stderr.write("db-firewall verify: --allow-global and --allow-query-text need --strict\n"); return 2;
+      }
       const result = await verify(client, { ...common, tenant: values.tenant, key: key!,
-                                            writeProbe: values["write-probe"] });
+                                            writeProbe: values["write-probe"], strict: values.strict,
+                                            allowGlobal: values["allow-global"],
+                                            allowQueryText: values["allow-query-text"] });
       const failed = result.checks.filter((c) => c.ok === false).length;
       const unsure = result.checks.filter((c) => c.ok === null).length;
       print(values.json, result, () => checksText(result.checks) + skippedText(result.excluded) +

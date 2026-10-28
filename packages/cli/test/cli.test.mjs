@@ -34,6 +34,15 @@ describe("usage", () => {
     assert.equal((await run([])).code, 2);
     assert.equal((await run(["scan"])).code, 2);
   });
+  it("globs match as Python's fnmatch: [!a] negates, [^a] is a literal ^ or a", async () => {
+    const { globMatch } = await import("../dist/scan.js");
+    assert.deepEqual(["app.b", "app.a", "app.^"].map((n) => globMatch("app.[^a]", n)), [false, true, true]);
+    assert.deepEqual(["app.b", "app.a"].map((n) => globMatch("app.[!a]", n)), [true, false]);
+    assert.equal(globMatch("app.f(*)", "app.f(text, integer)"), true);
+    // A leading "]" is literal, also after "!".
+    assert.deepEqual(["]", "a", "b"].map((n) => globMatch("[]a]", n)), [true, true, false]);
+    assert.deepEqual(["]", "a", "b"].map((n) => globMatch("[!]a]", n)), [false, false, true]);
+  });
   it("ships the repository's migration unchanged", () => {
     assert.equal(readFileSync(new URL("../sql/001_postgresql.sql", import.meta.url), "utf8"),
                  readFileSync(new URL("../../../migrations/001_postgresql.sql", import.meta.url), "utf8"));
@@ -412,6 +421,180 @@ describe("migrate, scan, verify", live, () => {
     } finally {
       await sql(restore);
     }
+  });
+
+  // What migrate --harden revokes from PUBLIC besides grants, and how to give it back.
+  const RESTORE = "GRANT EXECUTE ON FUNCTION pg_catalog.pg_terminate_backend(integer, bigint), " +
+    "pg_catalog.pg_cancel_backend(integer), pg_catalog.pg_stat_get_activity(integer), " +
+    "pg_catalog.pg_stat_get_backend_activity(integer) TO PUBLIC; GRANT SELECT ON pg_catalog.pg_stat_activity TO PUBLIC";
+
+  describe("verify --strict (allowlist)", () => {
+    // The excluded tables are readable but outside the scan: allowlist them.
+    const strict = ["--strict", "--allow-global", `${S}.late`, "--allow-global", `${S}.open_t`];
+    const NO_ACTIVITY = "REVOKE SELECT ON pg_catalog.pg_stat_activity FROM PUBLIC; REVOKE EXECUTE ON FUNCTION " +
+      "pg_catalog.pg_stat_get_activity(integer), pg_catalog.pg_stat_get_backend_activity(integer) FROM PUBLIC";
+    const verifyStrict = (...more) => json(["verify", ...APP(), "--tenant", "A", ...clean, ...strict, ...more]);
+    const failedWith = async (check, pattern, ...more) => {
+      const r = await verifyStrict(...more);
+      assert.equal(r.code, 1);
+      const c = r.data.checks.find((x) => x.check === check);
+      assert.equal(c.ok, false, check);
+      assert.match(c.detail, pattern);
+    };
+    before(() => sql(NO_ACTIVITY));
+    after(() => sql(RESTORE));
+    it("passes when everything readable is protected tenant data", async () => {
+      const r = await verifyStrict();
+      assert.equal(r.code, 0, failed(r.data.checks).join("; "));
+      assert.ok(r.data.checks.some((c) => c.check === "strict: only tenant data readable" && c.ok));
+    });
+    it("fails while the role can read other sessions' SQL (plain verify: an info line)", async () => {
+      await withChange("GRANT SELECT ON pg_catalog.pg_stat_activity TO PUBLIC", NO_ACTIVITY, async () => {
+        await failedWith("strict: cannot read other sessions' SQL", /^yes/);
+        const plain = await json(["verify", ...APP(), "--tenant", "A", ...clean]);
+        assert.equal(plain.code, 0, failed(plain.data.checks).join("; "));
+        assert.match(plain.data.checks.find((c) => c.check === "reads other sessions' SQL (info)").detail, /^yes/);
+      });
+    });
+    it("a readable table without the tenant column fails until allowlisted; invoker views over it too", async () => {
+      await withChange(`CREATE TABLE ${S}.settings (k text); GRANT SELECT ON ${S}.settings TO ${ROLE};
+          CREATE VIEW ${S}.my_docs WITH (security_invoker = true) AS SELECT * FROM ${S}.docs;
+          CREATE VIEW ${S}.all_settings WITH (security_invoker = true) AS SELECT * FROM ${S}.settings;
+          GRANT SELECT ON ${S}.my_docs, ${S}.all_settings TO ${ROLE};`,
+        `DROP VIEW ${S}.my_docs, ${S}.all_settings; DROP TABLE ${S}.settings;`, async () => {
+          const r = await verifyStrict();
+          assert.equal(r.code, 1);
+          const d = r.data.checks.find((c) => c.check === "strict: only tenant data readable").detail;
+          assert.match(d, new RegExp(`${S}\\.all_settings, ${S}\\.settings`));
+          assert.doesNotMatch(d, /my_docs/);                            // an invoker view over protected data
+          const ok = await verifyStrict("--allow-global", `${S}.settings`);
+          assert.equal(ok.code, 0, failed(ok.data.checks).join("; "));
+        });
+    });
+    it("an invoker view of constants, or one that calls a function, fails", async () => {
+      await withChange(`CREATE VIEW ${S}.consts WITH (security_invoker = true) AS VALUES ('B', 'b-ceo@example.com');
+          CREATE FUNCTION ${S}.k() RETURNS text LANGUAGE sql AS 'SELECT 1::text';
+          CREATE VIEW ${S}.fv WITH (security_invoker = true) AS SELECT ${S}.k() AS k, d.* FROM ${S}.docs d;
+          GRANT SELECT ON ${S}.consts, ${S}.fv TO ${ROLE};`,
+        `DROP VIEW ${S}.consts, ${S}.fv; DROP FUNCTION ${S}.k();`,
+        () => failedWith("strict: only tenant data readable", new RegExp(`${S}\\.consts, ${S}\\.fv`)));
+    });
+    it("a SECURITY DEFINER function fails until allowlisted by its signature (in both checks)", async () => {
+      await withChange(`CREATE FUNCTION ${S}.now_utc() RETURNS timestamptz LANGUAGE sql SECURITY DEFINER AS 'SELECT now()';
+          CREATE TABLE ${S}.now_utc (k text); GRANT SELECT ON ${S}.now_utc TO ${ROLE};`,
+        `DROP FUNCTION ${S}.now_utc(); DROP TABLE ${S}.now_utc;`, async () => {
+          const r = await verifyStrict("--allow-global", `${S}.now_utc`);     // the table only
+          assert.ok(failed(r.data.checks).includes("-: strict: no SECURITY DEFINER functions"));
+          assert.ok(failed(r.data.checks).includes("-: no RLS-bypassing views or functions"));
+          const ok = await verifyStrict("--allow-global", `${S}.now_utc`, "--allow-global", `${S}.now_utc()`);
+          assert.equal(ok.code, 0, failed(ok.data.checks).join("; "));
+        });
+    });
+    it("a SECURITY DEFINER trigger function fails even with EXECUTE revoked", async () => {
+      await withChange(`CREATE FUNCTION ${S}.tg() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS 'BEGIN RETURN NEW; END';
+          REVOKE EXECUTE ON FUNCTION ${S}.tg() FROM PUBLIC;
+          CREATE TRIGGER tg AFTER INSERT ON ${S}.docs FOR EACH ROW EXECUTE FUNCTION ${S}.tg();`,
+        `DROP TRIGGER tg ON ${S}.docs; DROP FUNCTION ${S}.tg();`, async () => {
+          await failedWith("strict: no SECURITY DEFINER functions", /tg\(\)/);
+          await failedWith("no RLS-bypassing views or functions", /tg\(\)/);
+        });
+    });
+    it("a rule on a table the app writes fails, and --allow-global cannot clear a definer view", async () => {
+      await withChange(`CREATE TABLE ${S}.audit (who text);
+          CREATE RULE leak AS ON INSERT TO ${S}.docs DO ALSO SELECT who FROM ${S}.audit;
+          CREATE VIEW ${S}.ref_docs AS SELECT * FROM ${S}.docs; GRANT SELECT ON ${S}.ref_docs TO ${ROLE};`,
+        `DROP RULE leak ON ${S}.docs; DROP TABLE ${S}.audit; DROP VIEW ${S}.ref_docs;`,
+        () => failedWith("no RLS-bypassing views or functions", new RegExp(`view ${S}\\.ref_docs.*rule leak on ${S}\\.docs`),
+                         "--allow-global", `${S}.ref_*`));
+    });
+    it("an aggregate over a SECURITY DEFINER function fails, even with EXECUTE revoked (in both checks)", async () => {
+      await withChange(`CREATE FUNCTION ${S}.sfunc(text, text) RETURNS text LANGUAGE sql SECURITY DEFINER AS 'SELECT $1';
+          REVOKE EXECUTE ON FUNCTION ${S}.sfunc(text, text) FROM PUBLIC;
+          CREATE AGGREGATE ${S}.agg(text) (SFUNC = ${S}.sfunc, STYPE = text);`,
+        `DROP AGGREGATE ${S}.agg(text); DROP FUNCTION ${S}.sfunc(text, text);`, async () => {
+          await failedWith("strict: no SECURITY DEFINER functions", /sfunc\(text,text\)/);
+          await failedWith("no RLS-bypassing views or functions", /sfunc\(text,text\)/);
+        });
+    });
+    it("a rule fails even when the app writes only through a column grant or a view", async () => {
+      await withChange(`CREATE TABLE ${S}.audit2 (who text); CREATE TABLE ${S}.notes2 (body text);
+          GRANT INSERT (body) ON ${S}.notes2 TO ${ROLE};
+          CREATE RULE leak2 AS ON INSERT TO ${S}.notes2 DO ALSO SELECT who FROM ${S}.audit2;`,
+        `DROP TABLE ${S}.notes2, ${S}.audit2;`,
+        () => failedWith("no RLS-bypassing views or functions", /rule leak2 on/));
+    });
+    it("--allow-query-text accepts other sessions' SQL (an info line)", async () => {
+      await withChange("GRANT SELECT ON pg_catalog.pg_stat_activity TO PUBLIC", NO_ACTIVITY, async () => {
+        const r = await verifyStrict("--allow-query-text");
+        assert.equal(r.code, 0, failed(r.data.checks).join("; "));
+        assert.ok(r.data.checks.some((c) => c.check === "reads other sessions' SQL (info)"));
+      });
+    });
+    it("a readable large object fails", async () => {
+      await withChange(`SELECT lo_from_bytea(424242, 'tenant B contract'); ALTER LARGE OBJECT 424242 OWNER TO ${ROLE}`,
+        "SELECT lo_unlink(424242)", () => failedWith("strict: no readable large objects", /^1 large object/));
+    });
+    it("--allow-global without --strict exits 2", async () => {
+      assert.equal((await run(["verify", ...APP(), "--tenant", "A", "--allow-global", `${S}.x`])).code, 2);
+    });
+  });
+
+  it("migrate --harden --app-role removes what verify fails on, by any grantor and in default privileges", async () => {
+    await sql(`CREATE TABLE ${S}.notes (n text); GRANT SELECT, TRIGGER, TRUNCATE ON ${S}.notes TO ${ROLE};
+               GRANT CREATE ON SCHEMA ${S} TO ${ROLE}; GRANT CREATE ON DATABASE ${DB} TO ${ROLE};
+               CREATE ROLE dbfw_cli_mid; GRANT USAGE ON SCHEMA ${S} TO dbfw_cli_mid;
+               GRANT TRIGGER ON ${S}.notes TO dbfw_cli_mid WITH GRANT OPTION;
+               SET ROLE dbfw_cli_mid; GRANT TRIGGER ON ${S}.notes TO ${ROLE}; RESET ROLE;
+               ALTER DEFAULT PRIVILEGES IN SCHEMA ${S} GRANT ALL ON TABLES TO ${ROLE};`);
+    try {
+      const before = await json(["verify", ...APP(), "--tenant", "A", ...clean]);
+      for (const c of ["-: cannot create in any schema", "-: cannot create triggers"]) {
+        assert.ok(failed(before.data.checks).includes(c), c);
+      }
+      const r = await run(["migrate", "--url", ADMIN_URL, ...scope, "--mode", "restrictive", "--harden", "--app-role", ROLE]);
+      assert.equal(r.code, 0, r.stderr);
+      await sql(`CREATE TABLE ${S}.later (n text)`);              // after harden: default privileges
+      const after = await json(["verify", ...APP(), "--tenant", "A", ...clean, "--exclude", "later"]);
+      assert.equal(after.code, 0, failed(after.data.checks).join("; "));
+      const [p] = await sql(`SELECT has_table_privilege('${ROLE}', '${S}.notes', 'SELECT') AS sel,
+                                    has_table_privilege('${ROLE}', '${S}.notes', 'TRIGGER, TRUNCATE') AS notes,
+                                    has_table_privilege('${ROLE}', '${S}.later', 'TRIGGER, TRUNCATE') AS later,
+                                    has_table_privilege('${ROLE}', 'pg_catalog.pg_stat_activity', 'SELECT') AS activity`);
+      assert.deepEqual({ ...p }, { sel: true, notes: false, later: false, activity: false });
+    } finally {
+      await sql(`DROP TABLE ${S}.notes, ${S}.later; REVOKE CREATE ON DATABASE ${DB} FROM ${ROLE};
+                 ALTER DEFAULT PRIVILEGES IN SCHEMA ${S} REVOKE ALL ON TABLES FROM ${ROLE};
+                 DROP OWNED BY dbfw_cli_mid; DROP ROLE dbfw_cli_mid; ${RESTORE}`);
+    }
+  });
+
+  it("an app session's temporary table does not fail verify", async () => {
+    const held = new pg.Client({ connectionString: appUrl() }); await held.connect();
+    try {
+      await held.query("CREATE TEMP TABLE scratch (x int)");
+      const r = await json(["verify", ...APP(), "--tenant", "A", ...clean]);
+      assert.equal(r.code, 0, failed(r.data.checks).join("; "));
+    } finally { await held.end(); }
+  });
+
+  it("migrate --harden refuses when the app role owns a domain, and verify fails on it", async () => {
+    await withChange(`CREATE DOMAIN ${S}.sec AS text; ALTER DOMAIN ${S}.sec OWNER TO ${ROLE}`, `DROP DOMAIN ${S}.sec`, async () => {
+      const v = await json(["verify", ...APP(), "--tenant", "A", ...clean]);
+      assert.ok(failed(v.data.checks).includes("-: owns no database objects"));
+      const r = await run(["migrate", "--url", ADMIN_URL, ...scope, "--mode", "restrictive", "--harden", "--app-role", ROLE]);
+      assert.equal(r.code, 2);
+      assert.match(r.stderr, new RegExp(`owner of type ${S}.sec`));
+    });
+  });
+
+  it("migrate --harden refuses when the app role owns a schema, and verify fails on it", async () => {
+    await withChange(`CREATE SCHEMA ${S}_own AUTHORIZATION ${ROLE}`, `DROP SCHEMA ${S}_own`, async () => {
+      const v = await json(["verify", ...APP(), "--tenant", "A", ...clean]);
+      assert.ok(failed(v.data.checks).includes("-: cannot create in any schema"));
+      const r = await run(["migrate", "--url", ADMIN_URL, ...scope, "--mode", "restrictive", "--harden", "--app-role", ROLE]);
+      assert.equal(r.code, 2);
+      assert.match(r.stderr, new RegExp(`owner of schema ${S}_own`));
+    });
   });
 
   it("key prints the database's key", async () => {

@@ -89,15 +89,21 @@ export function globMatch(pattern: string, name: string): boolean {
     const ch = pattern[i]!;
     if (ch === "*") re += ".*";
     else if (ch === "?") re += ".";
-    else if (ch === "[" && pattern.indexOf("]", i + 2) > i) {
-      const end = pattern.indexOf("]", i + 2);
+    else if (ch === "[") {
+      // As fnmatch: a leading "!" negates, then a leading "]" is literal.
+      let j = i + 1;
+      if (pattern[j] === "!") j++;
+      if (pattern[j] === "]") j++;
+      const end = pattern.indexOf("]", j);
+      if (end < 0) { re += "\\["; continue; }
       let body = pattern.slice(i + 1, end).replace(/\\/g, "\\\\");
-      if (body.startsWith("!")) body = "^" + body.slice(1);
+      if (body.startsWith("!")) body = "^" + body.slice(1).replace(/[[\]]/g, "\\$&");
+      else body = (body.startsWith("^") ? "\\" : "") + body.replace(/[[\]]/g, "\\$&");  // "^": a literal, as fnmatch reads it
       re += `[${body}]`;
       i = end;
     } else re += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
   }
-  return new RegExp(`^${re}$`).test(name);
+  try { return new RegExp(`^${re}$`).test(name); } catch { return false; }   // a reversed range ([z-a]): no match, as fnmatch
 }
 
 /**
