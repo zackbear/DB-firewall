@@ -24,6 +24,19 @@ export interface TableReport {
   altered_policies: string[];
   stale_base_policy: boolean;
   predicate_check: string;
+  /** The context the policies use: signed, plain, or altered (neither); null without policies. */
+  tenant_context: "signed" | "plain" | "altered" | null;
+}
+
+export type Context = "signed" | "plain";
+
+/** The migration's predicate for dbfw.context signed (default) or plain. */
+export function predicate(column: string, context: Context): string {
+  return context === "plain"
+    ? `${ident(column)} = NULLIF(current_setting('app.current_tenant', true), '') ` +
+      "OR public._firewall_is_bypass_role(current_user::text)"
+    : `${ident(column)} = (SELECT public._firewall_tenant()) ` +
+      "OR (SELECT public._firewall_is_bypass_role(current_user::text))";
 }
 
 // Exact schema.table match. Protected = RLS enabled AND forced AND all four
@@ -91,10 +104,9 @@ export function globMatch(pattern: string, name: string): boolean {
  * columns, read back, then rolled back. Exact comparison catches a changed
  * cast, constant or function overload.
  */
-async function reference(client: pg.ClientBase, rel: string, column: string):
+async function reference(client: pg.ClientBase, rel: string, column: string, context: Context):
     Promise<[string | null, string | null]> {
-  const pred = `${ident(column)} = NULLIF(current_setting('app.current_tenant', true), '') ` +
-    "OR public._firewall_is_bypass_role(current_user::text)";
+  const pred = predicate(column, context);
   await client.query("BEGIN");
   try {
     await client.query(`CREATE TEMP TABLE _fw_ref (LIKE ${rel})`);
@@ -114,8 +126,9 @@ export interface ScanResult { tables: TableReport[]; excluded: string[] }
 
 /** Scan every table in the schemas that has the tenant column. */
 export async function scan(client: pg.ClientBase, opts: {
-  schemas?: string[]; column?: string; exclude?: string[];
+  schemas?: string[]; column?: string; exclude?: string[]; context?: Context;
 } = {}): Promise<ScanResult> {
+  const context: Context = opts.context ?? "signed";
   const schemas = opts.schemas?.length ? opts.schemas : ["public"];
   const column = opts.column ?? "tenant_id";
   const exclude = opts.exclude ?? DEFAULT_EXCLUDED;
@@ -125,15 +138,23 @@ export async function scan(client: pg.ClientBase, opts: {
   for (const r of rows) {
     if (exclude.some((p) => globMatch(p, r.table))) { excluded.push(`${schema}.${r.table}`); continue; }
     const policies: [string, string, string[], string | null, string | null][] = r.policies;
-    const [ref, why] = policies.length ? await reference(client, r.ref_rel, column) : [null, null];
+    const [ref, why] = policies.length ? await reference(client, r.ref_rel, column, context) : [null, null];
     const unverified = policies.length > 0 && ref === null;
-    const altered = ref === null ? [] : policies.filter(([name, cmd, roles, qual, check]) => {
+    const alteredFrom = (want: string) => policies.filter(([name, cmd, roles, qual, check]) => {
       const op = name.slice(name.lastIndexOf("_") + 1);
-      const wantQual = ["sel", "upd", "del"].includes(op) ? ref : null;
-      const wantCheck = ["ins", "upd"].includes(op) ? ref : null;
+      const wantQual = ["sel", "upd", "del"].includes(op) ? want : null;
+      const wantCheck = ["ins", "upd"].includes(op) ? want : null;
       return !(roles.length === 1 && roles[0] === "public") || cmd !== CMD[op]
         || qual !== wantQual || check !== wantCheck;
     }).map(([name]) => name).sort();
+    const altered = ref === null ? [] : alteredFrom(ref);
+    // Policies in the other context count as altered; the report names it.
+    let found: TableReport["tenant_context"] = policies.length && !unverified && !altered.length ? context : null;
+    if (policies.length && !unverified && altered.length) {
+      const other: Context = context === "signed" ? "plain" : "signed";
+      const [ref2] = await reference(client, r.ref_rel, column, other);
+      found = ref2 !== null && !alteredFrom(ref2).length ? other : "altered";
+    }
     const extra: string[] = [...r.extra].sort();
     out.push({
       schema, table: r.table, has_tenant_col: true, has_rls_policy: r.missing.length === 0, owner: r.owner,
@@ -142,6 +163,7 @@ export async function scan(client: pg.ClientBase, opts: {
       missing_policies: [...r.missing].sort(),
       extra_permissive_policies: extra,
       altered_policies: altered,
+      tenant_context: found,
       stale_base_policy: r.base && extra.some((e) => !e.endsWith("_base")),
       predicate_check: unverified
         ? `unavailable: ${why} (run outside a read-only transaction, with the TEMP privilege and SELECT on the table)`

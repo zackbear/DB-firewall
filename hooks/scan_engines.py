@@ -114,15 +114,24 @@ def _pg_ident(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
 
 
-def _pg_reference(cursor, schema: str, table: str, tenant_col: str):
+def _pg_predicate(tenant_col: str, context: str) -> str:
+    """The migration's predicate for dbfw.context signed (default) or plain."""
+    col = _pg_ident(tenant_col)
+    if context == "plain":
+        return (f"{col} = NULLIF(current_setting('app.current_tenant', true), '') "
+                "OR public._firewall_is_bypass_role(current_user::text)")
+    return (f"{col} = (SELECT public._firewall_tenant()) "
+            "OR (SELECT public._firewall_is_bypass_role(current_user::text))")
+
+
+def _pg_reference(cursor, schema: str, table: str, tenant_col: str, context: str = "signed"):
     """The firewall predicate exactly as PostgreSQL deparses it for this table:
     a policy with the migration's predicate on a temporary copy of the table's
     columns, read back from pg_policies, then rolled back. Comparing deparsed
     text exactly catches a changed cast, an overloaded function or a changed
     constant that a normalised comparison would miss. Returns (text, None),
     or (None, reason) when it cannot be built."""
-    pred = (f"{_pg_ident(tenant_col)} = NULLIF(current_setting('app.current_tenant', true), '') "
-            "OR public._firewall_is_bypass_role(current_user::text)")
+    pred = _pg_predicate(tenant_col, context)
     autocommit = bool(getattr(getattr(cursor, "connection", None), "autocommit", False))
     cursor.execute("BEGIN" if autocommit else "SAVEPOINT _fw_ref")
     try:
@@ -162,17 +171,27 @@ def _scan_postgres(cursor, tenant_col, excluded, opts) -> Dict[str, dict]:
             continue
         if isinstance(policies, str):
             policies = json.loads(policies)
-        reference, why = _pg_reference(cursor, schema, table, tenant_col) if policies else (None, None)
+        # The expected context (engines.postgresql.tenant_context, default
+        # signed). Policies in the other context count as altered, but the
+        # report names the context they use.
+        context = (opts.get("tenant_context") or "signed").lower()
+        reference, why = _pg_reference(cursor, schema, table, tenant_col, context) if policies else (None, None)
         unverified = bool(policies) and reference is None
         # Without a reference the predicates cannot be checked: report that,
         # and fail closed, instead of calling every policy altered.
         altered = _pg_altered(policies, reference) if reference is not None else []
+        found = context if policies and not altered and not unverified else None
+        if policies and altered and not unverified:
+            other = "plain" if context == "signed" else "signed"
+            ref2, _ = _pg_reference(cursor, schema, table, tenant_col, other)
+            found = other if ref2 is not None and not _pg_altered(policies, ref2) else "altered"
         missing, extra = sorted(missing), sorted(extra)
         results[table] = {
             "has_tenant_col": True, "has_rls_policy": not missing,
             "missing_policies": missing, "extra_permissive_policies": extra,
             "rls_enabled": bool(enabled), "rls_forced": bool(forced),
             "policy_mode": "restrictive" if restrictive else "permissive",
+            "tenant_context": found,
             "altered_policies": altered,
             "predicate_check": ("unavailable: " + str(why)
                                 + " (run the scanner outside a read-only transaction, with the "

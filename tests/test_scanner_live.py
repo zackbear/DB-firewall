@@ -23,6 +23,7 @@ ROOT = os.path.join(os.path.dirname(__file__), '..')
 sys.path.insert(0, ROOT)
 from hooks.scanner import scan_tables  # noqa: E402
 from middleware.db_firewall import DBEngine, load_config  # noqa: E402
+from middleware.db_firewall.db_context import _set_context_postgres  # noqa: E402
 
 FULL, NO_RLS, NOT_FORCED, SEL_ONLY, SHADOW = (
     "sc_full", "sc_no_rls", "sc_not_forced", "sc_sel_only", "sc_shadow")
@@ -37,8 +38,8 @@ OPS = {"sel": "SELECT", "ins": "INSERT", "upd": "UPDATE", "del": "DELETE"}
 def _policies(c, schema, table, ops, legacy=False):
     stem = (f"firewall_rls_{table}" if legacy else
             c.execute("SELECT 'fw_' || left(md5(%s || '.' || %s), 12)", (schema, table)).fetchone()[0])
-    pred = ("tenant_id = NULLIF(current_setting('app.current_tenant', true), '') "   # the migration's
-            "OR public._firewall_is_bypass_role(current_user::text)")
+    pred = ("tenant_id = (SELECT public._firewall_tenant()) "   # the migration's (signed context)
+            "OR (SELECT public._firewall_is_bypass_role(current_user::text))")
     for suffix in ops:
         clause = {"ins": f"WITH CHECK ({pred})",
                   "upd": f"USING ({pred}) WITH CHECK ({pred})"}.get(suffix, f"USING ({pred})")
@@ -186,7 +187,7 @@ def test_migration_and_scanner_with_custom_column_and_schema():
             assert report["orders"]["protected"] is True and "plain" not in report
             assert scan_tables(c, DBEngine.POSTGRESQL, load_config()) == {}   # public has none
         with psycopg.connect(make_conninfo(DSN, dbname="dbfw_scan_col", user="dbfw_col_app")) as app:
-            app.execute("SELECT set_config('app.current_tenant', 'A', true)")
+            _set_context_postgres(app, "A")
             assert app.execute("SELECT id FROM app.orders").fetchall() == [(1,)]
     finally:
         with psycopg.connect(DSN, autocommit=True) as admin:

@@ -14,12 +14,11 @@ Every query runs in a transaction that is bound to one tenant. PostgreSQL row-le
 Run the migration as a database admin. Set the tenant column, and the policy mode if your app already has RLS policies of its own:
 
 ```bash
-psql "$ADMIN_URL" \
-  -c "SET dbfw.tenant_column = 'tenant_id'" \
-  -c "SET dbfw.schema = 'public'" \
-  -c "SET dbfw.policy_mode = 'restrictive'" \
-  -f migrations/001_postgresql.sql
+export DB_FIREWALL_TENANT_KEY=$(openssl rand -hex 32)   # the app needs the same value
+npx db-firewall migrate --url "$ADMIN_URL" --mode restrictive
 ```
+
+Set `DB_FIREWALL_TENANT_KEY` in the app's environment too. `withTenant` signs the tenant with it for each transaction (signed tenant context, the migration's default), so SQL run inside the function cannot switch to another tenant. Without the key, `withTenant` warns once and sets the tenant unsigned, and a signed database shows no rows. If you let `migrate` generate the key, `npx db-firewall key --url "$ADMIN_URL"` prints it.
 
 - `permissive` (the default): the tenant policies are the only policies on the table. Another permissive policy on the same table would be OR-ed with them and could widen access, so the scanner reports one.
 - `restrictive`: the tenant policies are AND-ed with your own policies, such as Supabase or Drizzle `pgPolicy`. Your policies decide which of the tenant's rows a user sees, and they can never reach past the tenant. A table with no permissive policy of its own gets `fw_<hash>_base` (`USING (true)`). Re-run the migration after you add the first policy of your own to a table.
@@ -47,7 +46,7 @@ const docs = await withTenant(pool, tenantId, async (client) =>
   (await client.query("SELECT * FROM docs")).rows);   // only tenantId's rows
 ```
 
-`withTenant` opens a transaction, sets `app.current_tenant` for that transaction only (`set_config(..., true)`), runs your function, and commits. If the function throws, it rolls back. The setting ends with the transaction, so a pooled connection never carries a tenant to its next user (tested with a one-connection pool). Transaction-mode poolers such as PgBouncer keep a transaction on one server connection, so this should hold behind them too; that is not tested here.
+`withTenant` opens a transaction, sets `app.current_tenant` and its signature `app.tenant_sig` for that transaction only (`set_config(..., true)`), runs your function, and commits. If the function throws, it rolls back. The setting ends with the transaction, so a pooled connection never carries a tenant to its next user (tested with a one-connection pool). Transaction-mode poolers such as PgBouncer keep a transaction on one server connection, so this should hold behind them too; that is not tested here.
 
 The same call works with each driver:
 
@@ -91,7 +90,7 @@ const result = await generateText({ model, tools: bindTenant(tools, session.tena
 
 ## Limits
 
-- **Model-written SQL.** If a tool runs SQL text that the model wrote, the model can switch tenants inside the transaction (`SELECT set_config('app.current_tenant', 'other', true)`). Tools must build their queries from typed parameters, as in the example above. For agents that send raw SQL, put the Python MCP wrapper (`hooks/mcp_wrapper.py`) in front: it parses and scopes every statement and refuses the ones it cannot scope.
+- **Model-written SQL.** With the signed context, SQL the model wrote cannot switch tenants: it can set `app.current_tenant`, but not sign it, so the policies show no rows. It can still read tables without the tenant column and anything else the app role can reach. So build queries from typed parameters, as in the example above, and give the app role only what it needs. With `tenant_context: plain`, model-written SQL can switch tenants (`SELECT set_config('app.current_tenant', 'other', true)`). For agents that send raw SQL, put the Python MCP wrapper (`hooks/mcp_wrapper.py`) in front as well: it parses and scopes every statement and refuses the ones it cannot scope.
 - **Shared batchers and caches.** A module-level DataLoader, request coalescer or cache shared between requests runs its query as the tenant of whichever request triggered it, and hands that result to every waiting caller. Create batchers per request (per tenant), or key caches by tenant.
 - **The role.** A superuser, a `BYPASSRLS` role or the table owner without `FORCE ROW LEVEL SECURITY` skips RLS. The migration forces RLS. `assertSafeRole` checks the role.
 - **Tenant ids that differ only in case**, on a tenant column with a case-insensitive (nondeterministic) collation, match each other. Use the default collation for the tenant column.

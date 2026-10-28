@@ -163,6 +163,10 @@ engines:
     use_rls: true
     schema: "public"
     policy_mode: "permissive"
+    # signed (default): the tenant is signed per transaction with
+    # DB_FIREWALL_TENANT_KEY, so SQL the app runs cannot switch tenants.
+    # plain: app.current_tenant alone, which any SQL in the transaction can set.
+    tenant_context: "signed"
   mysql:
     use_views: true
     schema: null

@@ -1,4 +1,5 @@
-import { TENANT_SETTING, resolveTenant } from "./tenant.js";
+import { CLEAR_TENANT, setTenant } from "./sign.js";
+import { resolveTenant } from "./tenant.js";
 
 // Structural types: the package has no runtime dependency on any driver.
 
@@ -27,10 +28,8 @@ export interface DrizzleTx {
   execute(query: unknown): Promise<unknown>;
 }
 
-const SET_TENANT = `SELECT set_config('${TENANT_SETTING}', $1, true)`;
-// Clears a session-level value fn may have set (SET app.current_tenant = ...)
-// before a pooled connection goes back to the pool.
-const CLEAR_TENANT = `SELECT set_config('${TENANT_SETTING}', '', false)`;
+// A Drizzle or driver result as rows.
+const rowsOf = (res: any): any[] => (Array.isArray(res) ? res : res?.rows ?? []);
 
 // Detection is exact: an object that only looks like a client (a pool wrapper
 // such as pg-promise) would run BEGIN, the tenant and COMMIT on different
@@ -188,7 +187,7 @@ export async function withTenantPg<T>(
       throw err;
     }
     try {
-      await client.query(SET_TENANT, [tenant]);
+      await setTenant(async (text, values) => (await client.query(text, values)).rows, tenant);
       const result = await withHandle(client, fn);
       await client.query("COMMIT");
       return result;
@@ -213,7 +212,7 @@ export async function withTenantPostgres<T>(
   if (!isPostgresJs(sql)) throw new TypeError("DB Firewall: withTenantPostgres needs a postgres() instance");
   const [tenant, fn] = split(tenantOrFn, maybeFn);
   return sql.begin(async (tx) => {
-    await tx.unsafe(SET_TENANT, [tenant]);
+    await setTenant((text, values) => tx.unsafe(text, values), tenant);
     // postgres.js resolves an array of queries returned from begin(): settle it
     // here, while the handle is still open.
     return withHandle(tx, async (h) => {
@@ -233,7 +232,12 @@ export async function withTenantDrizzle<T>(
   const [tenant, fn] = split(tenantOrFn, maybeFn);
   const { sql } = await import("drizzle-orm");       // optional peer: only Drizzle users need it
   return db.transaction(async (tx) => {
-    await tx.execute(sql`SELECT set_config(${TENANT_SETTING}, ${tenant}, true)`);
+    // Drizzle's own sql template; $n placeholders map to the values in order.
+    await setTenant(async (text, values = []) => {
+      const parts = text.split(/\$\d+/);
+      return rowsOf(await tx.execute(sql.join(parts.flatMap((p, i) =>
+        i < values.length ? [sql.raw(p), sql`${values[i]}`] : [sql.raw(p)]))));
+    }, tenant);
     return withHandle(tx, fn);
   });
 }
@@ -259,8 +263,7 @@ export async function withTenant<T>(db: unknown, tenantOrFn: string | ((tx: any)
 /** Run one read-only statement outside any tenant (used by assertSafeRole). */
 export async function queryRows(db: unknown, text: string): Promise<any[]> {
   if (isDrizzle(db)) {
-    const res: any = await db.execute(text);
-    return Array.isArray(res) ? res : res.rows;
+    return rowsOf(await db.execute(text));
   }
   if (isPostgresJs(db)) return db.unsafe(text);
   if (isPgPool(db) || isPgClient(db)) return (await db.query(text)).rows;

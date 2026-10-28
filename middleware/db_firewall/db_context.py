@@ -1,6 +1,9 @@
 """DB Firewall: Database-side tenant context: set, clear, pool check-in."""
 
+import hashlib
+import hmac
 import logging
+import os
 from typing import Optional
 
 from .engines import placeholder, DBEngine, _is_autocommit, _pg_transaction_idle, detect_engine
@@ -11,12 +14,40 @@ logger = logging.getLogger("db_firewall")
 # DATABASE-SPECIFIC CONTEXT SETTERS
 # ============================================================================
 
+TENANT_KEY_ENV = "DB_FIREWALL_TENANT_KEY"
+_warned_unsigned = False
+
+
+def tenant_key() -> Optional[bytes]:
+    """The signing key from DB_FIREWALL_TENANT_KEY (hex), or None when unset."""
+    raw = os.environ.get(TENANT_KEY_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        key = bytes.fromhex(raw)
+    except ValueError:
+        raise RuntimeError(f"DB Firewall: {TENANT_KEY_ENV} must be hex") from None
+    if not 32 <= len(key) <= 64:
+        raise RuntimeError(f"DB Firewall: {TENANT_KEY_ENV} must be 32 to 64 bytes")
+    return key
+
+
+def sign_tenant(key: bytes, nonce: str, tenant_id: str) -> str:
+    """hex(HMAC-SHA256(key, nonce:tenant)), as public._firewall_sign() computes it."""
+    return hmac.new(key, f"{nonce}:{tenant_id}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 def _set_context_postgres(connection, tenant_id: str):
     """Set tenant via a TRANSACTION-local GUC (set_config(..., true)).
 
     Session scope (false) survives commit and leaks to the next borrower of a
     pooled connection. Local scope dies with the transaction, so it needs one:
     in the DB-API default (autocommit=False) the driver opens it implicitly.
+
+    Signed context (the migration's default): app.tenant_sig signs the tenant
+    for this transaction with DB_FIREWALL_TENANT_KEY, so SQL run later in the
+    transaction cannot switch tenants. Without the key the tenant is set
+    unsigned, which a signed database treats as no tenant (no rows).
     """
     if _is_autocommit(connection):
         raise RuntimeError(
@@ -25,8 +56,21 @@ def _set_context_postgres(connection, tenant_id: str):
             "(connection.autocommit = False). Only fail_mode: open falls back "
             "to middleware-only enforcement, with a warning."
         )
+    global _warned_unsigned
+    key = tenant_key()
     cursor = connection.cursor()
-    cursor.execute("SELECT set_config('app.current_tenant', %s, true)", (tenant_id,))
+    if key is None:
+        if not _warned_unsigned:
+            _warned_unsigned = True
+            logger.warning(f"DB Firewall: {TENANT_KEY_ENV} is not set: the PostgreSQL tenant "
+                           "context is unsigned. A database migrated with the default signed "
+                           "context then shows no rows. Set it, or migrate with tenant_context: plain.")
+        cursor.execute("SELECT set_config('app.current_tenant', %s, true)", (tenant_id,))
+    else:
+        cursor.execute("SELECT public._firewall_nonce()")
+        sig = sign_tenant(key, cursor.fetchone()[0], tenant_id)
+        cursor.execute("SELECT set_config('app.current_tenant', %s, true), "
+                       "set_config('app.tenant_sig', %s, true)", (tenant_id, sig))
     cursor.close()
 
 
@@ -42,7 +86,8 @@ def _clear_context_postgres(connection):
     # pool reset hook (pool_checkin) rolls back first and then clears.
     was_idle = _pg_transaction_idle(connection)
     cursor = connection.cursor()
-    cursor.execute("SELECT set_config('app.current_tenant', '', false)")
+    cursor.execute("SELECT set_config('app.current_tenant', '', false), "
+                   "set_config('app.tenant_sig', '', false)")
     cursor.close()
     if was_idle and not _is_autocommit(connection) and hasattr(connection, "commit"):
         connection.commit()

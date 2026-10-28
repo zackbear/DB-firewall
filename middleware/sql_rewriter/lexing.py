@@ -44,7 +44,7 @@ _RESET_RE = re.compile(rf"^\s*RESET\s+({_NAME})", re.I)
 _SET_OR_RESET_RE = re.compile(r"^\s*(?:SET|RESET)\b", re.I)
 # Settings that move the tenant, the role or name resolution: never from the app.
 DENIED_SETTINGS = frozenset({
-    "app.current_tenant", "role", "session_authorization", "authorization", "session",
+    "app.current_tenant", "app.tenant_sig", "role", "session_authorization", "authorization", "session",
     "search_path", "row_security", "all", "@_fw_tenant_id"})
 _UNICODE_ESCAPE_RE = re.compile(r"\bU&\s*[\"']", re.I)
 _SET_CONFIG_RE = re.compile(r"\bset_config\b", re.I)

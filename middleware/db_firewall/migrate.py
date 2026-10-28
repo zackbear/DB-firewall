@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from .config import engine_options, load_config
+from .db_context import tenant_key
 from .engines import DBEngine, detect_engine, placeholder
 
 logger = logging.getLogger("db_firewall")
@@ -32,14 +33,19 @@ _CLIENT_ONLY = {
 
 
 def _set_migration_settings(connection, cursor, engine: str, config: dict) -> None:
-    """Pass the tenant column (and the PostgreSQL schema) to the script."""
+    """Pass the tenant column (and the PostgreSQL schema, policy mode, tenant
+    context and DB_FIREWALL_TENANT_KEY, when set) to the script."""
     col = config.get("tenant_column", "tenant_id")
     if engine == DBEngine.POSTGRESQL:
         opts = engine_options(config, engine)
+        key = tenant_key()
         cursor.execute("SELECT set_config('dbfw.tenant_column', %s, false), "
                        "set_config('dbfw.schema', %s, false), "
-                       "set_config('dbfw.policy_mode', %s, false)",
-                       (col, opts.get("schema") or "public", opts.get("policy_mode") or "permissive"))
+                       "set_config('dbfw.policy_mode', %s, false), "
+                       "set_config('dbfw.context', %s, false), "
+                       "set_config('dbfw.tenant_key', %s, false)",
+                       (col, opts.get("schema") or "public", opts.get("policy_mode") or "permissive",
+                        opts.get("tenant_context") or "signed", key.hex() if key else ""))
     elif engine == DBEngine.MYSQL:
         cursor.execute("SET @dbfw_tenant_column = %s", (col,))
     elif engine == DBEngine.SQLSERVER:

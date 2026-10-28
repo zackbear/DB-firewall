@@ -27,11 +27,14 @@ export PYTHONPATH="$PWD/middleware:$PYTHONPATH"   # no pip package yet: import f
 ### 2. Run the migration for your database
 
 ```bash
-# PostgreSQL (or run_migration(conn), which passes tenant_column, schema and
-# policy_mode from your config). policy_mode: restrictive when the app has RLS
-# policies of its own (Supabase, Drizzle pgPolicy); see below.
+# PostgreSQL (or run_migration(conn), which passes tenant_column, schema,
+# policy_mode, tenant_context and DB_FIREWALL_TENANT_KEY from your config and
+# environment). policy_mode: restrictive when the app has RLS policies of its
+# own (Supabase, Drizzle pgPolicy); see below. The app needs the same key.
+export DB_FIREWALL_TENANT_KEY=$(openssl rand -hex 32)   # store it as a secret
 psql -c "SET dbfw.tenant_column = 'tenant_id'" -c "SET dbfw.schema = 'public'" \
-     -c "SET dbfw.policy_mode = 'permissive'" -f migrations/001_postgresql.sql
+     -c "SET dbfw.policy_mode = 'permissive'" -c "SET dbfw.tenant_key = '$DB_FIREWALL_TENANT_KEY'" \
+     -f migrations/001_postgresql.sql
 
 # MySQL (or run_migration(conn)). Step 2 creates the views and prints the
 # trigger DDL, which step 3 runs: MySQL cannot create a trigger from a routine.
@@ -99,6 +102,35 @@ MySQL has no RLS. Its layer is views plus triggers, keyed on the user variable
   (`v_<first 40>_<16 hex>`), so the names fit MySQL's 64 characters. A user
   with DDL rights could create a table named like another table's stem and
   take over its view and triggers; keep DDL away from app users.
+
+PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
+
+* `signed` (default): the app sets `app.current_tenant` and
+  `app.tenant_sig = hex(HMAC-SHA256(key, _firewall_nonce() || ':' || tenant))`.
+  The key is `DB_FIREWALL_TENANT_KEY` (hex, 32 to 64 bytes) in the app, and
+  `public._firewall_keys` in the database, which no app role can read. The
+  nonce is the backend and the transaction's start time, so a signature holds
+  for one transaction only. SQL the app or an AI agent runs inside the
+  transaction can still set `app.current_tenant`, but cannot sign it, so the
+  policies treat it as no tenant: no rows. The Python middleware and
+  `@db-firewall/pg` sign for you. Without the key they set the tenant unsigned
+  (warned once), which a signed database answers with no rows. The migration
+  installs `dbfw.tenant_key` when set (this also rotates it). Otherwise it keeps
+  the key, or generates one on the first run: read it with
+  `SELECT encode(key, 'hex') FROM public._firewall_keys` or `npx db-firewall key`.
+  The policies check the signature once per query, not once per row (an
+  InitPlan). Needs PostgreSQL 13+.
+* `plain`: `app.current_tenant` alone. Any SQL in the transaction can set it,
+  so it relies on the middleware's SQL rewriter. The scanner reports a plain
+  table as unprotected unless `tenant_context: plain` is configured.
+
+Upgrading from an earlier version: re-running the migration switches to
+signed. Set `DB_FIREWALL_TENANT_KEY` in the app before (or with) the
+migration, or set `tenant_context: plain` to keep the old behaviour. The
+migration also revokes every grant on the key, the bypass list, the tenant
+map, `_firewall_sign` and `_firewall_set_tenant` except the owner's. This
+covers platforms such as Supabase that grant new objects to their roles
+directly. `_firewall_set_tenant` is now for admins only.
 
 PostgreSQL policy mode (`engines.postgresql.policy_mode`, `dbfw.policy_mode`):
 
@@ -175,7 +207,7 @@ The default rewriter (`rewriter: "ast"`, built on [sqlglot](https://github.com/t
 
 * `SELECT` / `UNION` / `INTERSECT` / `EXCEPT`, `INSERT`, `UPDATE`, `DELETE` — optionally `WITH`-wrapped or parenthesised. Every reference to a protected table (a table that has the tenant column and is not in `excluded_tables`; unquoted names are case-folded per engine, quoted names keep their case) gets `<alias>.tenant_id = '<tenant>'`, not just the first `FROM`.
 * transaction control: `BEGIN` / `START TRANSACTION`, `COMMIT` / `END`, `ROLLBACK` / `ABORT`, `SAVEPOINT`, `RELEASE`, `ROLLBACK TO`.
-* `SET` / `RESET` of any setting **except** `app.current_tenant`, `role`, `session_authorization` / `SET SESSION AUTHORIZATION`, `search_path`, `row_security`, `RESET ALL` and MySQL's `@_fw_tenant_id` (so `SET statement_timeout`, `SET TIME ZONE`, `SET LOCAL lock_timeout` work; nothing that moves the tenant or the role does). `set_config()` inside a `SELECT` follows the same list and must name its setting with a literal.
+* `SET` / `RESET` of any setting **except** `app.current_tenant`, `app.tenant_sig`, `role`, `session_authorization` / `SET SESSION AUTHORIZATION`, `search_path`, `row_security`, `RESET ALL` and MySQL's `@_fw_tenant_id` (so `SET statement_timeout`, `SET TIME ZONE`, `SET LOCAL lock_timeout` work; nothing that moves the tenant or the role does). `set_config()` inside a `SELECT` follows the same list and must name its setting with a literal.
 * `SELECT` without tables (`SELECT 1`, `SELECT now()`).
 
 Everything else — `DO`, `CALL`, `EXECUTE`, `PREPARE`, `DECLARE`, `EXPLAIN`, `SHOW`, `COPY`, `TRUNCATE`, `MERGE`, `VACUUM`, every `CREATE`/`ALTER`/`DROP`/`GRANT`, `TABLE t`, `VALUES`, several statements in one string, `U&"…"` unicode-escaped identifiers/literals, nested `/* /* */ */` comments, anything sqlglot cannot parse — raises `PermissionError` while a tenant is set, whatever tables it names. With no tenant and `fail_mode: closed` the same allow-list applies and any statement touching a protected table is refused.
@@ -221,7 +253,7 @@ In both modes the database-native RLS/VPD policy remains the second layer: the r
 
 | Database | Native Security | Middleware | Migration Script |
 | --- | --- | --- | --- |
-| **PostgreSQL** 9.5+ | ✅ Row-Level Security | ✅ | `001_postgresql.sql` |
+| **PostgreSQL** 13+ (9.5+ with `tenant_context: plain`) | ✅ Row-Level Security, signed tenant context | ✅ | `001_postgresql.sql` |
 | **MySQL** 5.7+ / MariaDB | ❌ (Views + Triggers) | ✅ | `002_mysql.sql` |
 | **SQL Server** 2016+ | ✅ Security Policies | ✅ | `003_sqlserver.sql` |
 | **Oracle** 10g+ | ✅ Virtual Private Database | ✅ | `004_oracle.sql` |
@@ -436,7 +468,7 @@ A failure to set the DB-side context raises when `fail_mode: closed` (the defaul
 | **Defense in depth** | Middleware + database-native RLS/VPD. Two independent layers. |
 | **Full DML protection** | SELECT, INSERT, UPDATE, AND DELETE are all filtered — every table reference, in every CTE, branch and subquery. |
 | **Audit trail** | With `audit.enabled`, the middleware writes a `_firewall_audit_log` row per DB-side tenant assignment (PostgreSQL, MySQL, SQL Server; same transaction). On Oracle, `set_tenant` logs to `VPD_AUDIT_LOG` in an autonomous transaction. `purge_audit(conn)` applies `retention_days`; `log_queries` logs each executed statement. |
-| **Zero trust the agent** | The AI doesn't know about tenancy. The database enforces it. |
+| **Zero trust the agent** | The AI doesn't know about tenancy. The database enforces it. On PostgreSQL the tenant is signed per transaction, so SQL the agent runs cannot switch it. |
 | **Connection pool safe** | Postgres context is transaction-local; every engine is cleared on `release()`/`pool_checkin`. See "Connection pooling". |
 
 ---

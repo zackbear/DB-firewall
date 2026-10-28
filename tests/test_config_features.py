@@ -17,6 +17,7 @@ pytest.importorskip("sqlglot")
 import db_firewall  # noqa: E402
 from db_firewall import (DBEngine, ProtectedConnection, load_config, protect,  # noqa: E402
                          purge_audit, tenant_scope)
+from db_firewall.db_context import _set_context_postgres  # noqa: E402
 from db_firewall.resolution import resolve_tenant  # noqa: E402
 
 DSN = os.environ.get("DBFW_PG_DSN")
@@ -127,6 +128,9 @@ class TestResolution:
     def test_custom_session_var_name(self, cfg):
         cfg["resolution"] = [{"source": "session_var", "variable": "app.org"}]
         conn = fake("psycopg2", **{"current_setting": "S"})
+        with pytest.raises(ValueError, match="app.current_tenant only"):     # cannot be signed
+            resolve_tenant(conn, DBEngine.POSTGRESQL, cfg)
+        cfg["engines"]["postgresql"]["tenant_context"] = "plain"
         assert resolve_tenant(conn, DBEngine.POSTGRESQL, cfg) == "S"
         assert conn.log[-1][1] == ("app.org",)
 
@@ -319,9 +323,20 @@ class TestLivePostgres:
         pg.rollback()
 
     def test_session_var_source(self, pg, cfg):
-        pg.execute("SELECT set_config('app.current_tenant', 'S', true)")
+        _set_context_postgres(pg, "S")                      # signed for this transaction
         cfg["resolution"] = [{"source": "session_var", "variable": "app.current_tenant"}]
         assert protect(pg, config=cfg)._tenant_id == "S"
+        pg.rollback()
+
+    def test_session_var_ignores_an_unsigned_tenant(self, pg, cfg):
+        # SQL the app ran can set app.current_tenant; resolving it would sign it.
+        pg.execute("SELECT set_config('app.current_tenant', 'S', true)")
+        cfg["resolution"] = [{"source": "session_var", "variable": "app.current_tenant"}]
+        assert resolve_tenant(pg, DBEngine.POSTGRESQL, cfg) is None
+        pg.rollback()
+        cfg["resolution"] = [{"source": "session_var", "variable": "app.other"}]
+        with pytest.raises(ValueError, match="app.current_tenant only"):
+            protect(pg, config=cfg)
         pg.rollback()
 
     def test_use_rls_false_sets_no_guc(self, pg, cfg):

@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-10-28: Signed tenant context (PR #14), breaking
+
+- **PostgreSQL tenant context is signed by default** (`dbfw.context` /
+  `engines.postgresql.tenant_context`: `signed`). The app sets
+  `app.tenant_sig = hex(HMAC-SHA256(key, nonce:tenant))` next to
+  `app.current_tenant`. The nonce is the backend and the transaction's start,
+  and the key is `DB_FIREWALL_TENANT_KEY` in the app and `_firewall_keys` in the
+  database. SQL the app or an AI agent runs can set `app.current_tenant`, but
+  cannot sign it, so it can no longer switch tenants. This closes the gap in
+  `@db-firewall/pg`, where SQL run inside `withTenant` could switch, and makes
+  the Python SQL rewriter a second layer, not the only one.
+- The policies check the signature once per query (`(SELECT f())`, an
+  InitPlan), so they run faster than the plain policies (200k-row count:
+  15 ms, against 341 ms).
+- Python middleware and `@db-firewall/pg` sign with `DB_FIREWALL_TENANT_KEY`
+  and clear `app.tenant_sig` too. The `session_var` resolution source takes
+  only a signed tenant. The SQL rewriter refuses `app.tenant_sig`.
+- The migration revokes every non-owner grant on the key, the bypass list,
+  the tenant map, `_firewall_sign` and `_firewall_set_tenant`, which covers
+  platforms that grant new objects directly. `_firewall_set_tenant` is now for
+  admins only. `_firewall_auto_resolve` maps `session_user`, not the
+  function owner.
+- Scanners report `tenant_context` and expect `signed`. The CLI adds
+  `migrate --context`, `scan --context` and `db-firewall key`. `verify` needs
+  the key and also checks that an unsigned tenant sees nothing, that the app
+  cannot read the key or sign, and that the signing functions match the
+  migration.
+- **Upgrade:** set `DB_FIREWALL_TENANT_KEY` in the app before re-running the
+  migration, or set `tenant_context: plain`. PostgreSQL 13+ for signed.
+
 ## 2026-10-28: Node CLI (PR #13)
 
 - **`db-firewall` CLI** (`packages/cli`, `npx db-firewall`), for PostgreSQL:

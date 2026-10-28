@@ -104,6 +104,42 @@ describe("node-postgres", live, () => {
     await withTenant(pool, "A", async (c) => { conn = c.connection; });
     assert.throws(() => conn.query, TypeError);
   });
+  for (const [how, sql] of [["SET LOCAL", "SET LOCAL app.current_tenant = 'B'"],
+                           ["set_config", "SELECT set_config('app.current_tenant', 'B', true)"]]) {
+    it(`SQL run inside fn cannot switch tenants (${how})`, async () => {
+      const rows = await withTenant(pool, "A", async (c) => {
+        await c.query(sql);
+        return (await c.query(SELECT)).rows;
+      });
+      assert.deepEqual(ids(rows), []);                  // B's row stays hidden: B is not signed
+    });
+  }
+  it("a forged or replayed signature sees nothing", async () => {
+    const sig = await withTenant(pool, "A", async (c) =>
+      (await c.query("SELECT current_setting('app.tenant_sig') AS s")).rows[0].s);
+    const seen = async (tenant, s) => {
+      const c = await pool.connect();
+      try {
+        await c.query("BEGIN");
+        await c.query("SELECT set_config('app.current_tenant', $1, true), set_config('app.tenant_sig', $2, true)",
+                      [tenant, s]);
+        return ids((await c.query(SELECT)).rows);
+      } finally { await c.query("ROLLBACK"); c.release(); }
+    };
+    assert.deepEqual(await seen("A", sig), []);           // new transaction, new nonce
+    assert.deepEqual(await seen("B", "0".repeat(64)), []);
+  });
+  it("without the key the context is unsigned and shows nothing", async () => {
+    const saved = process.env.DB_FIREWALL_TENANT_KEY;
+    delete process.env.DB_FIREWALL_TENANT_KEY;
+    try {
+      assert.deepEqual(ids(await withTenant(pool, "A", async (c) => (await c.query(SELECT)).rows)), []);
+    } finally { process.env.DB_FIREWALL_TENANT_KEY = saved; }
+    process.env.DB_FIREWALL_TENANT_KEY = "abcd";
+    try {
+      await assert.rejects(withTenant(pool, "A", async () => {}), /32 to 64 bytes/);
+    } finally { process.env.DB_FIREWALL_TENANT_KEY = saved; }
+  });
   it("a session-level tenant set inside fn does not survive the release", async () => {
     await withTenant(pool, "A", (c) => c.query("SET app.current_tenant = 'B'"));
     assert.deepEqual(ids((await pool.query(SELECT)).rows), []);
