@@ -9,8 +9,9 @@
 -- Adapted:  Production-hardened with audit logging, error handling,
 --           multi-table support, and DML protection.
 --
--- Usage:    Run as SYS or a DBA-privileged user.
---           Customize TENANT_TABLES and SCHEMA_OWNER before deploying.
+-- Usage:    Run with SQL*Plus or SQLcl as SYS (see 6b for other DBA users).
+--           Set SCHEMA_OWNER and TENANT_COLUMN below before deploying.
+--           Every table in SCHEMA_OWNER with TENANT_COLUMN gets the policy.
 -- ============================================================================
 
 
@@ -23,6 +24,7 @@ DEFINE CONTEXT_NAME   = 'CTX_SAAS'
 DEFINE PACKAGE_NAME   = 'PKG_SAAS_SECURITY'
 DEFINE POLICY_PREFIX   = 'VPD_TENANT_ISOLATION'
 DEFINE AUDIT_TABLE     = 'VPD_AUDIT_LOG'
+DEFINE TENANT_COLUMN   = 'TENANT_ID'
 
 
 -- ============================================================================
@@ -115,15 +117,10 @@ CREATE OR REPLACE PACKAGE BODY &SCHEMA_OWNER..&PACKAGE_NAME AS
   -- --------------------------------------------------------
   -- SET TENANT: Assigns tenant context + writes audit log
   -- --------------------------------------------------------
-  PROCEDURE set_tenant(p_tenant_id IN VARCHAR2) IS
+  PROCEDURE log_assignment(p_tenant_id IN VARCHAR2) IS
+    -- Autonomous: the audit row commits on its own, never the caller's work.
+    PRAGMA AUTONOMOUS_TRANSACTION;
   BEGIN
-    IF p_tenant_id IS NULL THEN
-      RAISE_APPLICATION_ERROR(-20001, 'VPD: tenant_id cannot be NULL');
-    END IF;
-
-    DBMS_SESSION.SET_CONTEXT('&CONTEXT_NAME', 'tenant_id', p_tenant_id);
-
-    -- Audit the assignment
     INSERT INTO &SCHEMA_OWNER..&AUDIT_TABLE
       (session_id, db_user, os_user, ip_address, tenant_id, auth_method, module, action)
     VALUES (
@@ -137,11 +134,21 @@ CREATE OR REPLACE PACKAGE BODY &SCHEMA_OWNER..&PACKAGE_NAME AS
       SYS_CONTEXT('USERENV', 'ACTION')
     );
     COMMIT;
-
   EXCEPTION
     WHEN OTHERS THEN
-      -- Log but don't block — audit failure shouldn't prevent access
-      NULL;
+      ROLLBACK;             -- audit failure must not block access
+  END log_assignment;
+
+  PROCEDURE set_tenant(p_tenant_id IN VARCHAR2) IS
+  BEGIN
+    IF p_tenant_id IS NULL THEN
+      RAISE_APPLICATION_ERROR(-20001, 'VPD: tenant_id cannot be NULL');
+    END IF;
+
+    -- Not inside an exception handler: if the context cannot be set, the
+    -- caller sees the error (the middleware fails closed on it).
+    DBMS_SESSION.SET_CONTEXT('&CONTEXT_NAME', 'tenant_id', p_tenant_id);
+    log_assignment(p_tenant_id);
   END set_tenant;
 
   -- --------------------------------------------------------
@@ -226,7 +233,7 @@ BEGIN
   END IF;
 
   -- Return the invisible WHERE clause
-  RETURN 'tenant_id = SYS_CONTEXT(''' || '&CONTEXT_NAME' || ''', ''tenant_id'')';
+  RETURN '"' || '&TENANT_COLUMN' || '" = SYS_CONTEXT(''' || '&CONTEXT_NAME' || ''', ''tenant_id'')';
 END;
 /
 
@@ -234,74 +241,53 @@ END;
 -- ============================================================================
 -- 6. APPLY VPD POLICIES TO ALL TENANT TABLES
 -- ============================================================================
--- Add every table that contains a tenant_id column.
--- Covers SELECT, INSERT, UPDATE, DELETE — full DML protection.
---
--- IMPORTANT: Extend this list for your schema. Every table with tenant_id
--- should be listed here.
+-- Every table in SCHEMA_OWNER that has TENANT_COLUMN gets one policy for
+-- SELECT, INSERT, UPDATE and DELETE. Re-running replaces the policies.
 
 BEGIN
-  -- ============================================
-  -- TABLE: ORDERS
-  -- ============================================
-  DBMS_RLS.ADD_POLICY (
-    object_schema   => '&SCHEMA_OWNER',
-    object_name     => 'ORDERS',
-    policy_name     => '&POLICY_PREFIX._ORDERS',
-    function_schema => '&SCHEMA_OWNER',
-    policy_function => 'FN_TENANT_ISOLATION',
-    statement_types => 'SELECT,INSERT,UPDATE,DELETE',
-    update_check    => TRUE,
-    enable          => TRUE
-  );
-
-  -- ============================================
-  -- TABLE: CUSTOMERS
-  -- ============================================
-  DBMS_RLS.ADD_POLICY (
-    object_schema   => '&SCHEMA_OWNER',
-    object_name     => 'CUSTOMERS',
-    policy_name     => '&POLICY_PREFIX._CUSTOMERS',
-    function_schema => '&SCHEMA_OWNER',
-    policy_function => 'FN_TENANT_ISOLATION',
-    statement_types => 'SELECT,INSERT,UPDATE,DELETE',
-    update_check    => TRUE,
-    enable          => TRUE
-  );
-
-  -- ============================================
-  -- TABLE: INVOICES
-  -- ============================================
-  DBMS_RLS.ADD_POLICY (
-    object_schema   => '&SCHEMA_OWNER',
-    object_name     => 'INVOICES',
-    policy_name     => '&POLICY_PREFIX._INVOICES',
-    function_schema => '&SCHEMA_OWNER',
-    policy_function => 'FN_TENANT_ISOLATION',
-    statement_types => 'SELECT,INSERT,UPDATE,DELETE',
-    update_check    => TRUE,
-    enable          => TRUE
-  );
-
-  -- ============================================
-  -- TABLE: TRANSACTIONS
-  -- ============================================
-  DBMS_RLS.ADD_POLICY (
-    object_schema   => '&SCHEMA_OWNER',
-    object_name     => 'TRANSACTIONS',
-    policy_name     => '&POLICY_PREFIX._TRANSACTIONS',
-    function_schema => '&SCHEMA_OWNER',
-    policy_function => 'FN_TENANT_ISOLATION',
-    statement_types => 'SELECT,INSERT,UPDATE,DELETE',
-    update_check    => TRUE,
-    enable          => TRUE
-  );
-
-  -- ADD MORE TABLES HERE:
-  -- Copy the block above and change object_name and policy_name.
-
+  FOR t IN (
+    SELECT c.table_name
+    FROM all_tab_columns c
+    JOIN all_tables tb ON tb.owner = c.owner AND tb.table_name = c.table_name
+    WHERE c.owner = '&SCHEMA_OWNER'
+      AND c.column_name = '&TENANT_COLUMN'
+      AND c.table_name NOT IN ('&AUDIT_TABLE', 'TENANT_USER_MAP')
+  ) LOOP
+    BEGIN
+      DBMS_RLS.DROP_POLICY(
+        object_schema => '&SCHEMA_OWNER',
+        object_name   => t.table_name,
+        policy_name   => SUBSTR('&POLICY_PREFIX._' || t.table_name, 1, 128));
+    EXCEPTION
+      WHEN OTHERS THEN
+        IF SQLCODE != -28102 THEN RAISE; END IF;      -- ORA-28102: policy does not exist
+    END;
+    DBMS_RLS.ADD_POLICY (
+      object_schema   => '&SCHEMA_OWNER',
+      object_name     => t.table_name,
+      policy_name     => SUBSTR('&POLICY_PREFIX._' || t.table_name, 1, 128),
+      function_schema => '&SCHEMA_OWNER',
+      policy_function => 'FN_TENANT_ISOLATION',
+      statement_types => 'SELECT,INSERT,UPDATE,DELETE',
+      update_check    => TRUE,
+      enable          => TRUE
+    );
+    DBMS_OUTPUT.PUT_LINE('DB Firewall: VPD policy applied to &SCHEMA_OWNER..' || t.table_name);
+  END LOOP;
 END;
 /
+
+
+-- ============================================================================
+-- 6b. NOTE ON THE TRIGGERS
+-- ============================================================================
+-- The logon/logoff triggers below belong to the user running this script and
+-- call the package. Run the script as SYS. Any other DBA user needs a direct
+-- grant from the owner (Oracle does not let a user grant to itself):
+--   as SCHEMA_OWNER:  GRANT EXECUTE ON PKG_SAAS_SECURITY TO <dba_user>;
+--   then:             ALTER TRIGGER trg_vpd_logon_set_tenant COMPILE; (and ENABLE)
+-- A trigger that does not compile is disabled at the end of this script, so
+-- it cannot block logins.
 
 
 -- ============================================================================
@@ -343,6 +329,24 @@ BEGIN
 EXCEPTION
   WHEN OTHERS THEN
     NULL;
+END;
+/
+
+
+-- Safety: never leave an invalid logon/logoff trigger behind (it would block
+-- logins). Disable any that failed to compile and stop with an error.
+DECLARE
+  v_bad NUMBER;
+BEGIN
+  SELECT COUNT(*) INTO v_bad FROM user_objects
+  WHERE object_name IN ('TRG_VPD_LOGON_SET_TENANT', 'TRG_VPD_LOGOFF_CLEAR_TENANT')
+    AND status != 'VALID';
+  IF v_bad > 0 THEN
+    EXECUTE IMMEDIATE 'ALTER TRIGGER trg_vpd_logon_set_tenant DISABLE';
+    EXECUTE IMMEDIATE 'ALTER TRIGGER trg_vpd_logoff_clear_tenant DISABLE';
+    RAISE_APPLICATION_ERROR(-20010,
+      'DB Firewall: logon/logoff triggers are invalid and were disabled. Run as SYS (see 6b).');
+  END IF;
 END;
 /
 

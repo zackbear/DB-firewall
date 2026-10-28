@@ -89,6 +89,29 @@ def _reject_unsafe_shape(clean: str) -> None:
             "cannot be safely scoped to a tenant")
 
 
+_FROM_LIST_END_RE = re.compile(
+    r"\b(?:WHERE|ORDER\s+BY|GROUP\s+BY|HAVING|LIMIT|OFFSET|FETCH|FOR|WINDOW|RETURNING"
+    r"|ON\s+DUPLICATE|ON\s+CONFLICT|SET|VALUES)\b", re.IGNORECASE)
+
+
+def _hidden_table_shape(clean: str):
+    """A shape that can put a table where _extract_tables does not look: the
+    regex path refuses it instead of passing the statement through unscoped."""
+    if re.search(r"\bSTRAIGHT_JOIN\b", clean, re.IGNORECASE):
+        return "STRAIGHT_JOIN"
+    if re.search(r"\b(?:FROM|JOIN)\s*\(", clean, re.IGNORECASE):
+        return "parenthesised table or derived table"
+    for m in _FROM_RE.finditer(clean):
+        rest = clean[m.end():]
+        end = _FROM_LIST_END_RE.search(rest)
+        depth = 0
+        for ch in rest[:end.start()] if end else rest:
+            depth += (ch == "(") - (ch == ")")
+            if ch == "," and depth == 0:
+                return "comma join"
+    return None
+
+
 def _is_excluded_table(table: str, excluded: List[str]) -> bool:
     """Check if table matches exclusion patterns."""
     import fnmatch
@@ -107,6 +130,8 @@ def validate_tenant_id(tenant_id: str) -> str:
     """Reject tenant ids that cannot be safely embedded in SQL or session state."""
     if not isinstance(tenant_id, str) or not tenant_id:
         raise ValueError("DB Firewall: tenant_id must be a non-empty string")
+    if tenant_id.casefold() == "__bypass__":
+        raise ValueError("DB Firewall: __BYPASS__ is reserved (MySQL bypass marker)")
     if any(c in tenant_id for c in _BAD_TENANT_CHARS):
         raise ValueError("DB Firewall: tenant_id contains NUL/newline/backslash characters")
     if _sqlr._PH_PREFIX in tenant_id:
@@ -118,6 +143,37 @@ def _sql_literal(tenant_id: str) -> str:
     """Return tenant_id as a quoted SQL string literal (single quotes doubled)."""
     validate_tenant_id(tenant_id)
     return "'" + tenant_id.replace("'", "''") + "'"
+
+
+# The MySQL layer keys on the user variable @_fw_tenant_id and these routines.
+_FIREWALL_NAMES_RE = re.compile(
+    r"_fw_tenant_id|_firewall_(?:set_tenant|clear_tenant|apply_all|init_connection)"
+    r"|dbfw_tenant_column", re.I)
+# MySQL folds variable names (escapes, accents: @'_fw_tenant_i\d', @_fw_tenänt_id),
+# so matching the name is not enough: on MySQL no user variable gets through at
+# all (an "@" outside single-quoted literals and comments), nor the statements
+# that run SQL built at run time. The ast rewriter refuses those heads too.
+_MYSQL_DYNAMIC_RE = re.compile(r"^\s*(?:PREPARE|EXECUTE|DEALLOCATE|CALL|DO|HANDLER)\b", re.I)
+
+
+# MySQL runs the text inside /*! ... */ (MariaDB: /*M! ... */) as SQL, so a
+# checker that treats it as a comment is blind to it: refused on every engine.
+_EXEC_COMMENT_RE = re.compile(r"/\*M?!", re.I)
+
+
+def _refuse_firewall_names(sql: str, engine: str = None) -> None:
+    if _EXEC_COMMENT_RE.search(sql):
+        raise PermissionError("DB Firewall: MySQL executable comments (/*! */) are refused")
+    if _FIREWALL_NAMES_RE.search(sql):
+        raise PermissionError("DB Firewall: statement names the firewall's tenant "
+                              "variable or routines; refused")
+    if engine in (DBEngine.MYSQL, DBEngine.UNKNOWN, None):     # unknown: could be MySQL
+        clean = _strip_sql(sql)
+        # "#" starts a comment on MySQL that strip_sql does not blank: a trailing
+        # "# x" would comment out a predicate appended after it.
+        if "@" in clean or "#" in clean or _MYSQL_DYNAMIC_RE.match(clean):
+            raise PermissionError("DB Firewall: MySQL user variables, # comments and "
+                                  "dynamic SQL (PREPARE/EXECUTE/CALL/DO/HANDLER) are refused")
 
 
 def rewrite_query(sql: str, tenant_id: str, config: dict,
@@ -135,6 +191,7 @@ def rewrite_query(sql: str, tenant_id: str, config: dict,
     """
     if not sql or not sql.strip():
         return sql
+    _refuse_firewall_names(sql, engine)
 
     # No tenant → don't rewrite (fail-closed is enforced by check_no_tenant)
     if tenant_id is None:
@@ -179,6 +236,7 @@ def check_no_tenant(sql: str, config: dict, connection=None, engine: str = None)
     statement is on the pass-through list or touches no protected table."""
     if not sql or not sql.strip():
         return
+    _refuse_firewall_names(sql, engine)
     if config.get("rewriter", "ast") != "regex":
         _sqlr.rewrite(sql, None, config.get("tenant_column", "tenant_id"),
                       _protected_predicate(config, connection, engine), engine)
@@ -216,6 +274,10 @@ def _rewrite_query_regex(sql: str, tenant_id: str, config: dict, is_protected) -
         if head.startswith(op.upper()) and not protect.get(op, True):
             return sql
 
+    shape = _hidden_table_shape(clean)
+    if shape:
+        raise PermissionError(f"DB Firewall: unsupported statement shape ({shape}) for "
+                              "rewriter: regex; use the default ast rewriter")
     if not protected_tables:
         return sql
 

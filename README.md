@@ -16,23 +16,92 @@ When you give an AI agent access to your database, it will happily run `SELECT *
 pip install -r requirements.txt        # sqlglot (AST rewriter) + pyyaml
 cp config/firewall.yaml .db-firewall.yaml
 export DB_FIREWALL_CONFIG="$PWD/.db-firewall.yaml"
+export PYTHONPATH="$PWD/middleware:$PYTHONPATH"   # no pip package yet: import from the checkout
 ```
+
+> **Upgrading from an earlier version?** Read [CHANGELOG.md](CHANGELOG.md) first.
+> Four changes can break an existing setup: the config path, the `X-Tenant-ID`
+> header and `protect()` can refuse queries or leave tables unscoped; the CLI
+> change breaks scripts that call the removed commands.
 
 ### 2. Run the migration for your database
 
 ```bash
-# PostgreSQL
-psql -f migrations/001_postgresql.sql
+# PostgreSQL (or run_migration(conn), which passes tenant_column and schema from your config)
+psql -c "SET dbfw.tenant_column = 'tenant_id'" -c "SET dbfw.schema = 'public'" \
+     -f migrations/001_postgresql.sql
 
-# MySQL
-mysql < migrations/002_mysql.sql
+# MySQL (or run_migration(conn)). Step 2 creates the views and prints the
+# trigger DDL, which step 3 runs: MySQL cannot create a trigger from a routine.
+mysql db < migrations/002_mysql.sql
+mysql -N -B -r db -e "SET @dbfw_tenant_column = 'tenant_id'; CALL _firewall_apply_all()" | mysql db
 
-# SQL Server
-sqlcmd -i migrations/003_sqlserver.sql
+# SQL Server (or run_migration(conn)); set the column in the same session first.
+# set_col.sql holds one line: EXEC sp_set_session_context N'dbfw.tenant_column', N'tenant_id';
+sqlcmd -i set_col.sql,migrations/003_sqlserver.sql
 
-# Oracle
-sqlplus sys/pass@db @migrations/004_oracle.sql
+# Oracle: edit SCHEMA_OWNER and TENANT_COLUMN at the top, then run as SYS
+sqlplus / as sysdba @migrations/004_oracle.sql
 ```
+
+Each script protects every table that has the tenant column (PostgreSQL: in the
+chosen schema; MySQL: the current database; SQL Server: all schemas; Oracle:
+`SCHEMA_OWNER`). Re-run it after adding tables (MySQL: steps 2 and 3).
+`run_migration()` handles PostgreSQL, MySQL and SQL Server; Oracle needs sqlplus.
+Tested live: PostgreSQL 16, MySQL 8.4, SQL Server 2022 and Oracle Database Free
+23ai (see "Tests" for the live suites).
+
+MySQL has no RLS. Its layer is views plus triggers, keyed on the user variable
+`@_fw_tenant_id`:
+
+* A client that can send raw SQL can set that variable (MySQL also accepts
+  escaped and accent-folded spellings of its name). So on MySQL the middleware
+  refuses every statement with a user variable (an `@` outside single-quoted
+  literals and comments, also inside double quotes or backticks) and dynamic
+  SQL (`PREPARE`, `EXECUTE`, `DEALLOCATE`, `CALL`, `DO`, `HANDLER`). Pass
+  values as parameters or single-quoted literals. The same check runs when
+  the engine is not recognised. Agents with a raw connection are not covered.
+* On every engine the middleware refuses MySQL/MariaDB executable comments
+  (`/*! ... */`, `/*M! ... */`): MySQL runs their text as SQL. On MySQL it
+  also refuses `#` comments.
+* `rewriter: regex` on MySQL reads base tables with no database layer behind
+  it. It refuses comma joins, parenthesised or derived tables and
+  `STRAIGHT_JOIN`, because its table finder cannot see every table in those.
+  Use the default `ast` rewriter.
+* Grants for the app user: `SELECT` on the `v_` views; `SELECT`, `INSERT`,
+  `UPDATE`, `DELETE` on the base tables (the middleware's `UPDATE`/`DELETE`
+  adds a `WHERE` on the tenant column, which needs `SELECT`; the triggers
+  check every write); `INSERT` on `_firewall_audit_log` when `audit.enabled`;
+  `EXECUTE` only on `_firewall_init_connection` (for pools). So reads of the
+  base tables are scoped by the middleware alone; the views are the read path
+  the database layer covers. Views and triggers run as their definer, so the
+  app needs no other routine. Never grant it `EXECUTE ON db.*`,
+  `CREATE TEMPORARY TABLES`, DDL rights, or other rights on the `_firewall_`
+  tables.
+* A user with a `_firewall_tenant_map` row gets that tenant whenever none is
+  set. The map uses the user part of the login (`USER()`, before the first
+  `@`): keep no anonymous accounts and no user names that contain `@`.
+* The views and triggers compare tenants exactly (`BINARY`). The middleware's
+  rewrite uses `=`, which ignores case under MySQL's default collation: keep
+  tenant ids unique ignoring case, and use a string tenant column. `BINARY`
+  stops the views from seeking on an index of the tenant column, so large
+  tables read slower through them.
+* Re-running drops and re-creates each trigger, so writes in between are not
+  checked, and `CREATE OR REPLACE VIEW` waits for open transactions that read
+  the view. Re-run when the app is quiet. It also drops and re-creates the
+  routines, and MySQL deletes a routine's grants with it: run the
+  `GRANT EXECUTE ON PROCEDURE db._firewall_init_connection` again after each
+  run (until then the app's pool hook fails with "execute command denied").
+* `run_migration()` is tested with PyMySQL. Old mysql-connector versions
+  refuse the multi-statement routines.
+* Tables with names over 57 characters get a hashed name stem
+  (`v_<first 40>_<16 hex>`), so the names fit MySQL's 64 characters. A user
+  with DDL rights could create a table named like another table's stem and
+  take over its view and triggers; keep DDL away from app users.
+
+Oracle: run as SYS. The logon/logoff triggers call the package, and any other
+DBA user needs a direct grant from the schema owner first (see section 6b of
+the script). A trigger that does not compile is disabled, so it cannot block logins.
 
 ### 3. Wrap your connections
 
@@ -79,7 +148,7 @@ The default rewriter (`rewriter: "ast"`, built on [sqlglot](https://github.com/t
 
 * `SELECT` / `UNION` / `INTERSECT` / `EXCEPT`, `INSERT`, `UPDATE`, `DELETE` — optionally `WITH`-wrapped or parenthesised. Every reference to a protected table (a table that has the tenant column and is not in `excluded_tables`; unquoted names are case-folded per engine, quoted names keep their case) gets `<alias>.tenant_id = '<tenant>'`, not just the first `FROM`.
 * transaction control: `BEGIN` / `START TRANSACTION`, `COMMIT` / `END`, `ROLLBACK` / `ABORT`, `SAVEPOINT`, `RELEASE`, `ROLLBACK TO`.
-* `SET` / `RESET` of any setting **except** `app.current_tenant`, `role`, `session_authorization`, `search_path`, `row_security`, `RESET ALL` and MySQL's `@_fw_tenant_id` (so `SET statement_timeout`, `SET TIME ZONE`, `SET LOCAL lock_timeout` work; nothing that moves the tenant or the role does). `set_config()` inside a `SELECT` follows the same list and must name its setting with a literal.
+* `SET` / `RESET` of any setting **except** `app.current_tenant`, `role`, `session_authorization` / `SET SESSION AUTHORIZATION`, `search_path`, `row_security`, `RESET ALL` and MySQL's `@_fw_tenant_id` (so `SET statement_timeout`, `SET TIME ZONE`, `SET LOCAL lock_timeout` work; nothing that moves the tenant or the role does). `set_config()` inside a `SELECT` follows the same list and must name its setting with a literal.
 * `SELECT` without tables (`SELECT 1`, `SELECT now()`).
 
 Everything else — `DO`, `CALL`, `EXECUTE`, `PREPARE`, `DECLARE`, `EXPLAIN`, `SHOW`, `COPY`, `TRUNCATE`, `MERGE`, `VACUUM`, every `CREATE`/`ALTER`/`DROP`/`GRANT`, `TABLE t`, `VALUES`, several statements in one string, `U&"…"` unicode-escaped identifiers/literals, nested `/* /* */ */` comments, anything sqlglot cannot parse — raises `PermissionError` while a tenant is set, whatever tables it names. With no tenant and `fail_mode: closed` the same allow-list applies and any statement touching a protected table is refused.
@@ -137,7 +206,7 @@ In both modes the database-native RLS/VPD policy remains the second layer: the r
 | --- | --- |
 | **Raw DB-API** | `protect(connection)` |
 | **SQLAlchemy** | `sqlalchemy_event_hooks(engine)` |
-| **Django** | `django_middleware_class(tenant_id_source=...)` |
+| **Django** (WSGI and ASGI) | `django_middleware_class(tenant_id_source=...)` |
 | **FastAPI** | `fastapi_middleware(app, tenant_id_source=...)` |
 | **Flask** | `flask_hooks(app, tenant_id_source=...)` |
 | **MCP Servers** | `mcp_wrapper.py` stdio proxy |
@@ -171,6 +240,8 @@ that tenant, or none, and restores the previous context when it ends.
   Firewall in `MIDDLEWARE` (Django's docs already place GZip near the top). If one sits
   below it and the server's send fails mid-stream, that stream's task stays pending and
   its cleanup does not run. No other tenant's code is affected.
+  Under WSGI, a sync body that is closed early (the client goes away) also runs
+  its `finally` as the request's tenant: the wrapper takes over the body's close.
   Flask runs teardown before a streaming body is read, so a Flask generator must
   open its own `tenant_scope(tenant)` or use `protect(conn, tenant_id=...)`.
 - **Outside requests:** prefer `tenant_scope(...)` or `protect(conn, tenant_id=...)`
@@ -178,25 +249,7 @@ that tenant, or none, and restores the previous context when it ends.
 - **`fail_mode: open`:** a request with no verified tenant runs unscoped. Use
   `closed` in production; the web integrations log a warning when they see `open`.
 
-> **Upgrading:** earlier versions read `X-Tenant-ID` (and `?tenant_id=` on FastAPI
-> and Flask) from every request. If you relied on that, pass `tenant_id_source=...`,
-> or set `trust_tenant_header: true` behind an authenticating gateway. Until then,
-> such requests have no tenant: blocked with `fail_mode: closed`, unscoped with
-> `open`. The first ignored header is logged as a warning.
->
-> Config is no longer found automatically in the current folder or the home
-> folder. Set `DB_FIREWALL_CONFIG` to your file, or pass `project_root=`. Until
-> then the built-in defaults apply. If your file set a custom `tenant_column`
-> (for example `org_id`), tables that use it are NOT scoped until you set the
-> path. A `.db-firewall.*` file left in the current folder is logged once as a
-> warning. `sqlalchemy_event_hooks()` now
-> reads config once when you attach it, not on every query.
->
-> `protect(conn, tenant_id="A")` no longer sets the shared tenant, so a later
-> `protect(other_conn)` without a tenant does not inherit "A". It falls back to
-> the `TENANT_ID` environment variable or `_firewall_tenant_map`, then fails
-> closed. Pass `tenant_id=` to every `protect()` call, or wrap the work in
-> `tenant_scope("A")`.
+Upgrade notes for these integrations are in [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
@@ -239,23 +292,11 @@ What the wrapper does with each line from the agent:
 - Limit: prose that starts with a keyword ("Update the report") is treated as SQL, so it is rewritten or refused. A bare SQL Server procedure name without `EXEC` or a `sp_`/`xp_` prefix is not caught: rely on row-level security for those.
 - Defence in depth: run the migrations and give the wrapped server a role without `BYPASSRLS`, so row-level security still blocks anything a string check misses.
 
-> **Upgrading:** earlier versions rewrote only the top-level `query`, `sql`,
-> `statement`, `command` and `code` arguments, passed non-JSON lines through
-> unchanged, and stopped proxying after the first refused query. The
-> `migrate` and `check` commands of the `db_firewall` CLI did nothing
-> and are removed (`python -m middleware.db_firewall info` prints the
-> active config): apply migrations with `psql`/`mysql`/`sqlcmd` or
-> `run_migration(conn)`, and audit with `hooks/scanner.py`. `run_migration()`
-> now finds `migrations/` and raises `FileNotFoundError` instead of logging.
-> The PostgreSQL scanner failed on every run (a literal `%` in a parameterised
-> query) and, had it run, accepted unforced RLS and a single policy. It now
-> uses psycopg 3 when installed, else psycopg2.
-
 ---
 
 ## CI/CD Security Gate
 
-Add the scanner to your pipeline to **fail the build** if unprotected tables exist:
+Add the scanner to your pipeline to **fail the build** if unprotected tables exist. Run it from the repo root (it is the `hooks` module of this checkout). On PostgreSQL it uses psycopg 3 when installed, else psycopg2:
 
 ```yaml
 # GitHub Actions
@@ -270,7 +311,7 @@ db-security-check:
 RUN python -m hooks.scanner --dsn $DATABASE_URL --strict
 ```
 
-The scanner returns exit code 1 if ANY table with a `tenant_id` column is missing RLS/VPD protection. On PostgreSQL a table counts as protected only when row-level security is enabled AND forced (table owners bypass unforced RLS) and all four firewall policies (select, insert, update, delete) exist on that exact `public.<table>`, with no other permissive policy (PostgreSQL ORs permissive policies, so one extra `USING (true)` opens every row). The JSON report lists `missing_policies`, `extra_permissive_policies` and `rls_forced`.
+With `--strict` the scanner returns exit code 1 if ANY non-excluded table with the tenant column is missing protection: PostgreSQL RLS, MySQL views + triggers, a SQL Server security policy named `firewall_rls_<table>`, or an Oracle VPD policy (`FN_TENANT_ISOLATION`, enabled, covering SELECT/INSERT/UPDATE/DELETE with update check; DSN `oracle://user:pass@host:1521/service`, needs `oracledb`). On SQLite every such table is reported unprotected, and an engine the scanner does not know fails the run. `engines.<engine>.schema` sets the schema it checks on PostgreSQL, MySQL and Oracle; on SQL Server it checks all schemas. It reads the schema, not the rows, so empty tables are checked too. On MySQL it checks that the view and the three triggers exist, not what they contain. On PostgreSQL a table counts as protected only when row-level security is enabled AND forced (table owners bypass unforced RLS) and all four firewall policies (select, insert, update, delete) exist on that exact `<schema>.<table>`, with no other permissive policy (PostgreSQL ORs permissive policies, so one extra `USING (true)` opens every row). The JSON report lists `missing_policies`, `extra_permissive_policies` and `rls_forced`.
 
 ---
 
@@ -284,13 +325,14 @@ current folder or your home folder, so a stray file cannot change the policy.
 - Use an absolute path. A relative one is resolved against the current folder each time config is read.
 - Neither set: built-in defaults (`fail_mode: closed`, `tenant_column: tenant_id`). A named file or folder with no config file raises `FileNotFoundError`. A file that does not hold a mapping (empty, `null`, a list) raises `ValueError`. A YAML file without PyYAML raises `ImportError`.
 - `DB_FIREWALL_TENANT_COLUMN`, `DB_FIREWALL_FAIL_MODE` and `DB_FIREWALL_REWRITER` override the file.
+- `config/firewall.yaml` documents every key, including `resolution` (the order `protect()` looks for a tenant), `excluded_users`, `audit` and `engines`. `load_config` rejects an unknown resolution source, a malformed `excluded_users` and unsafe table names.
 
 Example `.db-firewall.yaml`:
 
 ```yaml
 version: "1.0"
 tenant_column: "tenant_id"
-fail_mode: "closed"           # "closed" = no tenant → 0 rows (SAFE)
+fail_mode: "closed"           # "closed" = no tenant → queries on protected tables refused (SAFE)
 rewriter: "ast"               # "ast" (sqlglot, default) or "regex" (legacy, no dependency)
 allow_tenant_placeholder: false   # INSERT ... (tenant_id) VALUES (%s) is refused unless true
 
@@ -300,11 +342,7 @@ protect:
   update: true
   delete: true
 
-audit:
-  enabled: true
-  retention_days: 90
-
-excluded_users: []            # EMPTY by default — see "Bypass roles" below
+excluded_users: []            # EMPTY by default — see "Bypass roles" 
 
 excluded_tables:
   - "_firewall_*"
@@ -319,7 +357,7 @@ Nothing bypasses the firewall by default. Earlier versions hardcoded `postgres`,
 Opt a role in deliberately, at both layers:
 
 ```yaml
-# middleware layer (.db-firewall.yaml)
+# middleware layer (.db-firewall.yaml): exact name as the database reports it
 excluded_users: ["_migrator"]
 ```
 
@@ -327,6 +365,12 @@ excluded_users: ["_migrator"]
 -- database layer (created by the migrations, empty by default)
 INSERT INTO _firewall_bypass_roles (role_name) VALUES ('_migrator');
 ```
+
+The middleware asks the database for the connection's user (`current_user`,
+`CURRENT_USER()`, `SYSTEM_USER`, `USER`) only when `excluded_users` is not
+empty. A listed user's connections are not rewritten, not checked and get no
+DB-side context; a warning is logged once per user. A failed lookup counts as
+not excluded.
 
 Postgres, MySQL and SQL Server migrations all consult `_firewall_bypass_roles`. Oracle's VPD function has no bypass list (use `EXEMPT ACCESS POLICY` deliberately if needed).
 
@@ -359,10 +403,10 @@ A failure to set the DB-side context raises when `fail_mode: closed` (the defaul
 
 | Principle | Implementation |
 | --- | --- |
-| **Fail closed** | No tenant context = 0 rows returned. Never defaults to "show all". |
+| **Fail closed** | No tenant context: the middleware refuses queries on protected tables (`PermissionError`) and RLS returns 0 rows. Never defaults to "show all". |
 | **Defense in depth** | Middleware + database-native RLS/VPD. Two independent layers. |
 | **Full DML protection** | SELECT, INSERT, UPDATE, AND DELETE are all filtered — every table reference, in every CTE, branch and subquery. |
-| **Audit trail** | Every tenant assignment logged with session, IP, timestamp. |
+| **Audit trail** | With `audit.enabled`, the middleware writes a `_firewall_audit_log` row per DB-side tenant assignment (PostgreSQL, MySQL, SQL Server; same transaction). On Oracle, `set_tenant` logs to `VPD_AUDIT_LOG` in an autonomous transaction. `purge_audit(conn)` applies `retention_days`; `log_queries` logs each executed statement. |
 | **Zero trust the agent** | The AI doesn't know about tenancy. The database enforces it. |
 | **Connection pool safe** | Postgres context is transaction-local; every engine is cleared on `release()`/`pool_checkin`. See "Connection pooling". |
 
@@ -372,32 +416,63 @@ A failure to set the DB-side context raises when `fail_mode: closed` (the defaul
 
 ```bash
 db-firewall/
+├── .github/workflows/tests.yml   # CI: pytest on Python 3.11 + 3.13 against PostgreSQL 16
+├── adapters/                     # NoSQL: mongodb.py, redis.py, firestore.py, convex/ (see "NoSQL stores")
 ├── config/
-│   └── firewall.yaml            # Default configuration + documentation
+│   └── firewall.yaml             # Default configuration + documentation
 ├── migrations/
-│   ├── 001_postgresql.sql        # PostgreSQL native RLS (auto-applies to all tables)
+│   ├── 001_postgresql.sql        # PostgreSQL native RLS (auto-applies to public tables with a tenant_id column)
 │   ├── 002_mysql.sql             # MySQL secure views + triggers
 │   ├── 003_sqlserver.sql         # SQL Server security policies
-│   └── 004_oracle.sql            # Oracle VPD (production-hardened)
+│   └── 004_oracle.sql            # Oracle VPD (every SCHEMA_OWNER table with TENANT_COLUMN; run as SYS)
 ├── middleware/
 │   ├── db_firewall/              # Universal Python middleware (DB-agnostic), one module per concern:
-│   │                             #   config, engines, context, introspection, rewrite,
-│   │                             #   db_context, wrappers, web, sqlalchemy_hooks, migrate
+│   │                             #   config, engines, context, introspection, rewrite, db_context,
+│   │                             #   resolution, audit, wrappers, streams, web, sqlalchemy_hooks,
+│   │                             #   migrate (+ __main__ CLI)
 │   └── sql_rewriter/             # sqlglot AST rewriter (scopes every table reference):
 │                                 #   __init__ (rewrite), lexing, astutil, writes
 ├── hooks/
 │   ├── mcp_wrapper.py            # MCP server stdio proxy with SQL rewriting
-│   └── scanner.py                # CI/CD security scanner
-├── tests/
-│   ├── test_firewall.py          # SQL rewriting / context unit tests
-│   ├── test_sql_rewriter.py      # AST rewriter: structural proof per shape (no DB)
-│   ├── test_rewrite_safety.py    # tenant-id injection safety
-│   ├── test_sqlalchemy_hook.py   # SQLAlchemy hook actually swaps the statement (sqlite, no DB)
-│   ├── test_pool_leak.py         # Postgres pool-leak + rewriter-vs-RLS e2e (opt-in: DBFW_PG_DSN)
-│   └── test_gate_live.py         # middleware alone vs RLS-less tables as dbfw_app (opt-in: DBFW_PG_DSN)
+│   ├── scanner.py                # CI/CD security scanner (CLI)
+│   └── scan_engines.py           # per-engine checks (PostgreSQL, MySQL, SQL Server, Oracle, SQLite)
+├── tests/                        # see "Running the tests"
+├── requirements.txt              # core + test dependencies
+├── requirements-adapters.txt     # optional NoSQL drivers
+├── CHANGELOG.md                  # changes and upgrade notes
 ├── SKILL.md                      # Auto-integration trigger for AI workflows
 └── README.md                     # This file
 ```
+
+## Running the tests
+
+```bash
+pip install -r requirements.txt pytest-cov flask starlette httpx sqlalchemy pymongo mongomock django
+python -m pytest -q                                   # no database needed; live tests skip
+DBFW_PG_DSN="host=localhost port=5432 dbname=dbfw_test user=postgres" \
+  python -m pytest -q --cov=middleware                # adds the live PostgreSQL tests
+```
+
+The live tests create the `dbfw_app` role and their own tables, and apply
+`migrations/001_postgresql.sql`, so point `DBFW_PG_DSN` at a throwaway database
+as a superuser. CI does the same with a `postgres:16` service and fails below
+85% coverage.
+
+| Test file | Covers |
+| --- | --- |
+| `test_sql_rewriter.py`, `test_firewall.py`, `test_rewrite_safety.py` | AST and regex rewriters, tenant-id injection safety |
+| `test_engines_fakes.py` | engine detection, DB-side context, cursor mediation, pool check-in, tenant map (fake drivers) |
+| `test_config_loading.py`, `test_package_layout.py` | explicit config path; package re-exports and setting forwarding |
+| `test_request_context.py`, `test_django_asgi.py` | request tenant for Django (WSGI + ASGI, real Django), FastAPI, Flask; streaming bodies |
+| `test_sqlalchemy_hook.py` | SQLAlchemy hook swaps the statement (sqlite) |
+| `test_mcp_wrapper.py`, `test_migration_cli.py` | MCP stdio proxy; `run_migration()` and the CLI |
+| `test_config_features.py` | `excluded_users`, `audit`, `resolution`, `engines` (fakes + live PostgreSQL) |
+| `test_scanner_fakes.py` | scanner logic for MySQL, SQL Server, Oracle (scripted cursors) |
+| `test_oracle_live.py` | live Oracle: VPD migration with a custom column, middleware, scanner (opt-in: `DBFW_ORA_DSN`; setup steps in the file) |
+| `test_mysql_live.py` | live MySQL: `run_migration()` with a custom column, views and triggers, middleware, audit, resolution, scanner (opt-in: `DBFW_MYSQL_DSN`, admin user; run `tests/live_setup/mysql_before.sql` first) |
+| `test_sqlserver_live.py` | live SQL Server: `run_migration()` with a custom column, security policy, middleware, audit, resolution, scanner (opt-in: `DBFW_MSSQL_DSN`, needs `pymssql`; run `tests/live_setup/sqlserver_before.sql` first) |
+| `test_gate_live.py`, `test_pool_leak.py`, `test_scanner_live.py` | live PostgreSQL: middleware vs RLS, pool leaks, scanner (opt-in: `DBFW_PG_DSN`) |
+| `test_adapters_*.py` | MongoDB (mongomock), Redis (skipped unless `redis` is installed and a server runs at `REDIS_URL`, default `localhost:6390`; not run in CI), Firestore (fake client) |
 
 ---
 

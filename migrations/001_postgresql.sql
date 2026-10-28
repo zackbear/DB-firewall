@@ -3,6 +3,11 @@
 -- ============================================================================
 -- Uses native Row-Level Security (RLS), available since PostgreSQL 9.5.
 -- This is the gold standard for tenant isolation in Postgres.
+--
+-- Tenant column and schema (defaults: tenant_id, public). run_migration()
+-- sets them from your config. With psql, set them in the same session:
+--   psql -c "SET dbfw.tenant_column = 'org_id'" -c "SET dbfw.schema = 'app'" \
+--        -f migrations/001_postgresql.sql
 -- ============================================================================
 
 BEGIN;
@@ -134,7 +139,7 @@ $$ LANGUAGE plpgsql STABLE;
 
 
 -- ============================================================================
--- 6. AUTO-APPLY RLS TO ALL TABLES WITH tenant_id
+-- 6. AUTO-APPLY RLS TO ALL TABLES WITH THE TENANT COLUMN (dbfw.tenant_column)
 -- ============================================================================
 -- This DO block scans your schema and applies RLS to every table
 -- that has a tenant_id column. Run after every migration.
@@ -145,6 +150,9 @@ DECLARE
     r RECORD;
     policy_name TEXT;
     legacy_name TEXT;
+    col TEXT := COALESCE(NULLIF(current_setting('dbfw.tenant_column', true), ''), 'tenant_id');
+    sch TEXT := COALESCE(NULLIF(current_setting('dbfw.schema', true), ''), 'public');
+    pred TEXT;
 BEGIN
     FOR r IN
         SELECT c.table_schema, c.table_name
@@ -152,10 +160,10 @@ BEGIN
         JOIN information_schema.tables t
             ON c.table_schema = t.table_schema
             AND c.table_name = t.table_name
-        WHERE c.column_name = 'tenant_id'
+        WHERE c.column_name = col
             AND t.table_type = 'BASE TABLE'
-            AND c.table_schema = 'public'
-            AND c.table_name NOT LIKE '_firewall_%'
+            AND c.table_schema = sch
+            AND c.table_name NOT LIKE '#_firewall#_%' ESCAPE '#'
             AND c.table_name NOT IN (
                 'schema_migrations', 'alembic_version',
                 'knex_migrations', 'prisma_migrations',
@@ -167,6 +175,8 @@ BEGIN
         -- (CREATE POLICY ... already exists). A hash stem is short and unique.
         policy_name := 'fw_' || left(md5(r.table_schema || '.' || r.table_name), 12);
         legacy_name := 'firewall_rls_' || r.table_name;
+        pred := format('%I = NULLIF(current_setting(''app.current_tenant'', true), '''')
+                OR public._firewall_is_bypass_role(current_user::text)', col);
 
         -- Enable RLS on the table
         EXECUTE format('ALTER TABLE %I.%I ENABLE ROW LEVEL SECURITY', r.table_schema, r.table_name);
@@ -190,44 +200,15 @@ BEGIN
         EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', policy_name || '_upd', r.table_schema, r.table_name);
         EXECUTE format('DROP POLICY IF EXISTS %I ON %I.%I', policy_name || '_del', r.table_schema, r.table_name);
 
-        -- SELECT policy
-        EXECUTE format(
-            'CREATE POLICY %I ON %I.%I FOR SELECT USING (
-                tenant_id = NULLIF(current_setting(''app.current_tenant'', true), '''')
-                OR public._firewall_is_bypass_role(current_user::text)
-            )',
-            policy_name || '_sel', r.table_schema, r.table_name
-        );
-
-        -- INSERT policy (ensure new rows match current tenant)
-        EXECUTE format(
-            'CREATE POLICY %I ON %I.%I FOR INSERT WITH CHECK (
-                tenant_id = NULLIF(current_setting(''app.current_tenant'', true), '''')
-                OR public._firewall_is_bypass_role(current_user::text)
-            )',
-            policy_name || '_ins', r.table_schema, r.table_name
-        );
-
-        -- UPDATE policy
-        EXECUTE format(
-            'CREATE POLICY %I ON %I.%I FOR UPDATE USING (
-                tenant_id = NULLIF(current_setting(''app.current_tenant'', true), '''')
-                OR public._firewall_is_bypass_role(current_user::text)
-            ) WITH CHECK (
-                tenant_id = NULLIF(current_setting(''app.current_tenant'', true), '''')
-                OR public._firewall_is_bypass_role(current_user::text)
-            )',
-            policy_name || '_upd', r.table_schema, r.table_name
-        );
-
-        -- DELETE policy
-        EXECUTE format(
-            'CREATE POLICY %I ON %I.%I FOR DELETE USING (
-                tenant_id = NULLIF(current_setting(''app.current_tenant'', true), '''')
-                OR public._firewall_is_bypass_role(current_user::text)
-            )',
-            policy_name || '_del', r.table_schema, r.table_name
-        );
+        EXECUTE format('CREATE POLICY %I ON %I.%I FOR SELECT USING (%s)',
+                       policy_name || '_sel', r.table_schema, r.table_name, pred);
+        -- INSERT: new rows must carry the current tenant
+        EXECUTE format('CREATE POLICY %I ON %I.%I FOR INSERT WITH CHECK (%s)',
+                       policy_name || '_ins', r.table_schema, r.table_name, pred);
+        EXECUTE format('CREATE POLICY %I ON %I.%I FOR UPDATE USING (%s) WITH CHECK (%s)',
+                       policy_name || '_upd', r.table_schema, r.table_name, pred, pred);
+        EXECUTE format('CREATE POLICY %I ON %I.%I FOR DELETE USING (%s)',
+                       policy_name || '_del', r.table_schema, r.table_name, pred);
 
         RAISE NOTICE 'DB Firewall: RLS applied to %.%', r.table_schema, r.table_name;
     END LOOP;

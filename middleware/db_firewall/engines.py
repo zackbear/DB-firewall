@@ -1,6 +1,7 @@
 """DB Firewall: Database engine detection and connection-state helpers."""
 
 import logging
+import sys
 from typing import Optional
 
 logger = logging.getLogger("db_firewall")
@@ -77,3 +78,13 @@ def _pg_transaction_idle(connection) -> Optional[bool]:
     if status is None:
         return None
     return int(status) == 0
+
+
+_PLACEHOLDERS = {"qmark": "?", "numeric": ":1", "named": ":1",
+                 "format": "%s", "pyformat": "%s"}
+
+
+def placeholder(connection) -> str:
+    """The driver's positional parameter marker (psycopg %s, pyodbc ?, oracledb :1)."""
+    module = sys.modules.get(type(connection).__module__.split(".")[0])
+    return _PLACEHOLDERS.get(getattr(module, "paramstyle", "format"), "%s")

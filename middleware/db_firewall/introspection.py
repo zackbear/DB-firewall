@@ -7,7 +7,7 @@ import threading
 import weakref
 from typing import Optional, Dict
 
-from .engines import DBEngine, _pg_transaction_idle
+from .engines import DBEngine, _pg_transaction_idle, placeholder
 
 logger = logging.getLogger("db_firewall")
 
@@ -129,9 +129,10 @@ def _lookup_tenant_column(cursor, table_name: str, engine: str, tenant_column: s
             "WHERE table_name = %s AND column_name = %s AND table_schema = DATABASE()",
             (table_name, tenant_column))
     elif engine == DBEngine.SQLSERVER:
+        ph = placeholder(cursor)            # pyodbc "?", pymssql "%s"
         cursor.execute(
             "SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS "
-            "WHERE LOWER(TABLE_NAME) = LOWER(?) AND LOWER(COLUMN_NAME) = LOWER(?)",
+            f"WHERE LOWER(TABLE_NAME) = LOWER({ph}) AND LOWER(COLUMN_NAME) = LOWER({ph})",
             (table_name, tenant_column))
     elif engine == DBEngine.ORACLE:
         cursor.execute(

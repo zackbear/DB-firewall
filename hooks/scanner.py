@@ -6,13 +6,11 @@ protected by the firewall. Fails the build if unprotected tables exist.
 
 Usage:
     # As a pre-deploy check
-    python -m db_firewall.scanner --dsn postgresql://user:pass@host/db
+    python -m hooks.scanner --dsn postgresql://user:pass@host/db
+    python -m hooks.scanner --dsn oracle://user:pass@host:1521/FREEPDB1
 
     # In CI/CD (returns exit code 1 if unprotected tables found)
-    python -m db_firewall.scanner --dsn $DATABASE_URL --strict
-
-    # Generate missing migration
-    python -m db_firewall.scanner --dsn $DATABASE_URL --fix
+    python -m hooks.scanner --dsn $DATABASE_URL --strict
 """
 
 import sys
@@ -20,12 +18,11 @@ import os
 import json
 import re
 import argparse
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from middleware.db_firewall import (
-    detect_engine, load_config, DBEngine, _is_excluded_table
-)
+from middleware.db_firewall import detect_engine, load_config  # noqa: E402
+from hooks.scan_engines import scan_tables  # noqa: E402,F401  (re-exported)
 
 
 def get_connection(dsn: str):
@@ -50,160 +47,18 @@ def get_connection(dsn: str):
     elif dsn.startswith("mssql://") or dsn.startswith("sqlserver://"):
         import pyodbc
         return pyodbc.connect(dsn)
+    elif dsn.startswith("oracle://"):
+        import oracledb                     # thin mode: no Oracle client install needed
+        from urllib.parse import urlparse, unquote
+        u = urlparse(dsn)
+        return oracledb.connect(user=unquote(u.username or ""), password=unquote(u.password or ""),
+                                dsn=f"{u.hostname}:{u.port or 1521}{u.path}")
     elif dsn.startswith("sqlite"):
         import sqlite3
         path = dsn.replace("sqlite:///", "").replace("sqlite://", "")
         return sqlite3.connect(path)
     else:
         raise ValueError(f"Unsupported DSN format: {dsn[:20]}...")
-
-
-def scan_tables(connection, engine: str, config: dict) -> Dict[str, dict]:
-    """
-    Scan database and return status of all tables with tenant_id columns.
-    Returns: {table_name: {"has_tenant_col": bool, "has_rls": bool, "protected": bool}}
-    """
-    cursor = connection.cursor()
-    tenant_col = config.get("tenant_column", "tenant_id")
-    excluded = config.get("excluded_tables", [])
-    results = {}
-
-    # Get all tables with tenant_id
-    if engine == DBEngine.POSTGRESQL:
-        # Exact schema.table match (pg_class + pg_namespace), so a same-named
-        # table elsewhere cannot vouch for this one. Protected = RLS enabled AND
-        # forced (owners bypass unforced RLS) AND all four firewall policies AND
-        # no other PERMISSIVE policy: PostgreSQL ORs permissive policies, so one
-        # extra "USING (true)" opens every row.
-        cursor.execute("""
-            WITH t AS (
-                SELECT c.oid, n.nspname, c.relname, c.relrowsecurity, c.relforcerowsecurity,
-                       'fw_' || left(md5(n.nspname || '.' || c.relname), 12) AS stem,
-                       'firewall_rls_' || c.relname AS legacy
-                FROM pg_class c
-                JOIN pg_namespace n ON n.oid = c.relnamespace
-                WHERE c.relkind IN ('r', 'p') AND n.nspname = 'public'
-                  AND EXISTS (SELECT 1 FROM pg_attribute a
-                              WHERE a.attrelid = c.oid AND a.attname = %s
-                                AND a.attnum > 0 AND NOT a.attisdropped)
-            )
-            SELECT t.relname, t.relrowsecurity, t.relforcerowsecurity,
-                   ARRAY(SELECT op FROM unnest(ARRAY['sel', 'ins', 'upd', 'del']) AS op
-                         WHERE NOT EXISTS (
-                             SELECT 1 FROM pg_policies p
-                             WHERE p.schemaname = t.nspname AND p.tablename = t.relname
-                               AND p.policyname IN (t.stem || '_' || op, t.legacy || '_' || op))),
-                   ARRAY(SELECT p.policyname FROM pg_policies p
-                         WHERE p.schemaname = t.nspname AND p.tablename = t.relname
-                           AND p.permissive = 'PERMISSIVE'
-                           AND p.policyname NOT IN (
-                               SELECT pre || '_' || op
-                               FROM unnest(ARRAY[t.stem, t.legacy]) AS pre,
-                                    unnest(ARRAY['sel', 'ins', 'upd', 'del']) AS op))
-            FROM t
-            ORDER BY t.relname
-        """, (tenant_col,))
-
-        for table, enabled, forced, missing, extra in cursor.fetchall():
-            if _is_excluded_table(table, excluded):
-                continue
-            missing, extra = sorted(missing), sorted(extra)
-            results[table] = {
-                "has_tenant_col": True,
-                "has_rls_policy": not missing,
-                "missing_policies": missing,
-                "extra_permissive_policies": extra,
-                "rls_enabled": bool(enabled),
-                "rls_forced": bool(forced),
-                "protected": bool(enabled) and bool(forced) and not missing and not extra,
-            }
-
-    elif engine == DBEngine.MYSQL:
-        cursor.execute("""
-            SELECT c.TABLE_NAME
-            FROM INFORMATION_SCHEMA.COLUMNS c
-            JOIN INFORMATION_SCHEMA.TABLES t
-                ON c.TABLE_SCHEMA = t.TABLE_SCHEMA AND c.TABLE_NAME = t.TABLE_NAME
-            WHERE c.COLUMN_NAME = %s
-                AND t.TABLE_TYPE = 'BASE TABLE'
-                AND c.TABLE_SCHEMA = DATABASE()
-            ORDER BY c.TABLE_NAME
-        """, (tenant_col,))
-
-        for row in cursor.fetchall():
-            table = row[0]
-            if _is_excluded_table(table, excluded):
-                continue
-
-            # Check for view and triggers
-            has_view = False
-            has_triggers = False
-            try:
-                cursor.execute(f"SELECT 1 FROM INFORMATION_SCHEMA.VIEWS WHERE TABLE_NAME = 'v_{table}'")
-                has_view = cursor.fetchone() is not None
-
-                cursor.execute(f"SELECT 1 FROM INFORMATION_SCHEMA.TRIGGERS WHERE TRIGGER_NAME = '_fw_bi_{table}'")
-                has_triggers = cursor.fetchone() is not None
-            except Exception:
-                pass
-
-            results[table] = {
-                "has_tenant_col": True,
-                "has_secure_view": has_view,
-                "has_triggers": has_triggers,
-                "protected": has_view and has_triggers
-            }
-
-    elif engine == DBEngine.SQLSERVER:
-        cursor.execute("""
-            SELECT c.TABLE_NAME
-            FROM INFORMATION_SCHEMA.COLUMNS c
-            JOIN INFORMATION_SCHEMA.TABLES t
-                ON c.TABLE_SCHEMA = t.TABLE_SCHEMA AND c.TABLE_NAME = t.TABLE_NAME
-            WHERE c.COLUMN_NAME = ?
-                AND t.TABLE_TYPE = 'BASE TABLE'
-            ORDER BY c.TABLE_NAME
-        """, (tenant_col,))
-
-        for row in cursor.fetchall():
-            table = row[0]
-            if _is_excluded_table(table, excluded):
-                continue
-
-            has_policy = False
-            try:
-                cursor.execute(
-                    "SELECT 1 FROM sys.security_policies WHERE name = ?",
-                    (f"firewall_rls_{table}",)
-                )
-                has_policy = cursor.fetchone() is not None
-            except Exception:
-                pass
-
-            results[table] = {
-                "has_tenant_col": True,
-                "has_rls_policy": has_policy,
-                "protected": has_policy
-            }
-
-    elif engine == DBEngine.SQLITE:
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        for row in cursor.fetchall():
-            table = row[0]
-            if _is_excluded_table(table, excluded):
-                continue
-
-            cursor.execute(f"PRAGMA table_info({table})")
-            cols = [r[1] for r in cursor.fetchall()]
-            if tenant_col in cols:
-                results[table] = {
-                    "has_tenant_col": True,
-                    "protected": False,  # SQLite has no native RLS
-                    "note": "Requires middleware-only enforcement"
-                }
-
-    cursor.close()
-    return results
 
 
 def print_report(results: Dict[str, dict], engine: str):
@@ -223,16 +78,16 @@ def print_report(results: Dict[str, dict], engine: str):
     print(f"  ⚠️  UNPROTECTED:               {len(unprotected)}")
 
     if protected:
-        print(f"\n  ✅ Protected Tables:")
+        print("\n  ✅ Protected Tables:")
         for table in sorted(protected.keys()):
             print(f"     • {table}")
 
     if unprotected:
-        print(f"\n  ❌ UNPROTECTED Tables (AI agents can access all rows):")
+        print("\n  ❌ UNPROTECTED Tables (AI agents can access all rows):")
         for table, info in sorted(unprotected.items()):
             note = info.get("note", "")
             print(f"     • {table}  {note}")
-        print(f"\n  ⚠️  Run the migration to protect these tables.")
+        print("\n  ⚠️  Run the migration to protect these tables.")
 
     print(f"\n{'='*60}\n")
 

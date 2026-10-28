@@ -138,18 +138,30 @@ class _AsyncScopedStream:
                 pass
 
 
+def _take_over_close(response, raw) -> None:
+    """Django registered the raw body's close() when the view built the
+    response, and calls it outside our context. Drop that closer: our wrapper
+    closes the body itself, as the request's tenant."""
+    closers = getattr(response, "_resource_closers", None)    # private Django attribute
+    if isinstance(closers, list):
+        closers[:] = [c for c in closers if getattr(c, "__self__", None) is not raw]
+
+
 def _scope_streaming(response, tenant):
-    """Wrap a streaming body (sync or async) so it is read as the request's tenant."""
+    """Wrap a streaming body (sync or async) so it is read as the request's tenant.
+    The raw body is wrapped, not Django's make_bytes generator (which refers to
+    the response and would keep it alive in a cycle, and has no close()).
+    Django re-applies make_bytes to what we yield."""
     content = getattr(response, "streaming_content", None)
     if not getattr(response, "streaming", False) or content is None:
         return response
+    raw = getattr(response, "_iterator", None)
     if hasattr(content, "__aiter__"):
-        # Wrap the raw body, not Django's make_bytes generator (which refers to
-        # the response and would keep it alive in a cycle). Django re-applies
-        # make_bytes to what we yield.
-        raw = getattr(response, "_iterator", None)
-        response.streaming_content = _AsyncScopedStream(
-            tenant, raw if hasattr(raw, "__aiter__") else content)
+        body = raw if hasattr(raw, "__aiter__") else content
+        _take_over_close(response, body)
+        response.streaming_content = _AsyncScopedStream(tenant, body)
     else:
-        response.streaming_content = _ScopedStream(tenant, content)
+        body = raw if hasattr(raw, "__next__") else content
+        _take_over_close(response, body)
+        response.streaming_content = _ScopedStream(tenant, body)
     return response

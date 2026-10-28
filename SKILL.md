@@ -9,6 +9,10 @@ Enforces tenant isolation at the database level so AI agents, MCP servers, and L
 
 ## Before You Start
 
+Upgrading an existing integration? Read `CHANGELOG.md` first: the config path, the `X-Tenant-ID` header, `protect()` tenant inheritance and the CLI changed in the 2026-10-20 batch.
+
+Imports: there is no pip package. Add the checkout's `middleware/` folder to `PYTHONPATH` (then `from db_firewall import ...`), or import `middleware.db_firewall` from the repo root.
+
 Assess these before implementing — they determine which layers you need:
 
 | Question | If Yes | If No |
@@ -36,9 +40,10 @@ Copy `config/firewall.yaml` to `.db-firewall.yaml` in the project, then set `DB_
 
 | Field | Action |
 |-------|--------|
-| `tenant_column` | Match the project's actual column name (e.g. `org_id`, `company_id`) |
+| `tenant_column` | Match the project's actual column name (e.g. `org_id`, `company_id`). Pass the same name to the migration (README "Run the migration"; `run_migration(conn)` does it for PostgreSQL, MySQL and SQL Server) |
 | `excluded_tables` | Add migration/audit/config tables that are legitimately cross-tenant |
-| `excluded_users` | Leave empty unless a specific role (e.g. `_migrator`) must bypass; mirror it in `_firewall_bypass_roles` |
+| `excluded_users` | Leave empty unless a specific role (e.g. `_migrator`) must bypass the middleware; exact name as the database reports it (Oracle: upper case). Mirror it in `_firewall_bypass_roles` for the database layer |
+| `resolution`, `audit`, `engines` | Defaults keep the old behaviour. See `config/firewall.yaml` before changing them; `session_var` takes any tenant already on the connection, so enable it only if every return to the pool runs `release()` or `pool_checkin()`. A set but invalid `TENANT_ID` raises; it does not fall through |
 | `fail_mode` | **ALWAYS set to `closed` for production** — `open` is for local dev only |
 
 ## Step 2: Run the Database Migration
@@ -50,9 +55,9 @@ Select based on detected database engine:
 | Engine | Migration File | Notes |
 |--------|---------------|-------|
 | PostgreSQL | `migrations/001_postgresql.sql` | Native RLS — read entire file, contains policy + role setup |
-| MySQL / MariaDB | `migrations/002_mysql.sql` | Views + triggers — read entire file, order matters |
+| MySQL / MariaDB | `migrations/002_mysql.sql` | Views + triggers — read entire file. Use `run_migration(conn)` or the two client steps in the README (the triggers come from `CALL _firewall_apply_all()`). Agents must query the `v_` views, and only through the middleware: raw SQL can set `@_fw_tenant_id` |
 | SQL Server | `migrations/003_sqlserver.sql` | Native RLS — read entire file, contains security predicate functions |
-| Oracle | `migrations/004_oracle.sql` | VPD — read entire file, parameter order is exact and non-negotiable |
+| Oracle | `migrations/004_oracle.sql` | VPD — read entire file. Set `SCHEMA_OWNER` and `TENANT_COLUMN`, run as SYS with SQL*Plus/SQLcl. Every table in that schema with the column gets the policy; re-run after adding tables |
 | SQLite | No migration needed | Middleware-only enforcement — skip to Step 3 |
 
 **Do NOT load** migration files for database engines not present in the project.
@@ -78,6 +83,8 @@ TenantMiddleware = django_middleware_class()   # default: request.tenant_id or s
 # settings.py — after your auth middleware, so request.tenant_id is set
 MIDDLEWARE = [..., 'myapp.middleware.TenantMiddleware']
 ```
+
+Works under WSGI and ASGI (sync- and async-capable). Under ASGI a sync `tenant_id_source` runs via `sync_to_async`; an `async def` source needs async mode, or Django refuses to start. Streaming bodies run as the request's tenant. Place body-wrapping middleware such as `GZipMiddleware` **above** this one in `MIDDLEWARE`.
 
 **FastAPI:**
 ```python
@@ -115,6 +122,8 @@ sqlalchemy_event_hooks(engine)
 }
 ```
 
+Run it from the repo root. It scopes every SQL-looking string in a `tools/call` (any argument, any depth), answers SQL it cannot scope with a JSON-RPC error, and drops non-JSON lines. Detection is by first keyword, so still give the wrapped server a role without `BYPASSRLS` and run the migration: RLS is the backstop.
+
 ## Step 4: Add CI/CD Scanner
 
 **MANDATORY for production deployments.** Add to the deployment pipeline:
@@ -124,18 +133,13 @@ sqlalchemy_event_hooks(engine)
   run: python -m hooks.scanner --dsn $DATABASE_URL --strict
 ```
 
-The scanner detects tables without RLS policies applied. `--strict` fails the build on any unprotected table. Run `hooks/scanner.py` locally first to review output before adding to CI.
+Run it from the repo root. It reads the schema (empty tables included) and lists every non-excluded table with the tenant column, in `engines.<engine>.schema` (defaults: PostgreSQL `public`, MySQL the current database, Oracle the connecting user; SQL Server: all schemas). Oracle passes with an enabled `FN_TENANT_ISOLATION` policy covering all four statement types. On PostgreSQL a table passes only when RLS is enabled AND forced, all four firewall policies (`_sel`, `_ins`, `_upd`, `_del`) exist on that exact `<schema>.<table>`, and no other permissive policy exists. `--strict` fails the build on any unprotected table; `--json` shows `rls_forced`, `missing_policies` and `extra_permissive_policies`. Run it locally first to review the output before adding it to CI.
 
 ## Step 5: Seed Tenant Mappings
 
-The migration files create `_firewall_tenant_map` automatically. For greenfield projects without a migration run yet:
+The migration files create `_firewall_tenant_map` automatically: run the migration rather than creating it by hand. `protect()` only reads rows with `is_active` true, so a hand-made table without that column resolves no tenant. Seed it after the migration:
 
 ```sql
-CREATE TABLE IF NOT EXISTS _firewall_tenant_map (
-  db_user  TEXT PRIMARY KEY,
-  tenant_id TEXT NOT NULL
-);
-
 INSERT INTO _firewall_tenant_map (db_user, tenant_id) VALUES ('mcp_service', 'TENANT_A');
 INSERT INTO _firewall_tenant_map (db_user, tenant_id) VALUES ('ai_agent_svc', 'TENANT_B');
 ```
@@ -149,11 +153,13 @@ One row per DB user. Never share a DB user between tenants.
 | RLS not firing; all rows returned | DB user is a superuser or has `BYPASSRLS` attribute | Create an unprivileged role; never use superuser for agent connections |
 | RLS not firing; policy exists | `ENABLE ROW LEVEL SECURITY` was not run on the table | `ALTER TABLE your_table ENABLE ROW LEVEL SECURITY` |
 | Tenant context bleeds between requests | Using `SET` instead of `SET LOCAL` for context variable, or connection returned to pool without `release()` | Use `set_config(..., true)`/`SET LOCAL`; call `release()` on the wrapper; add `pool_checkin` as the pool reset hook |
-| `RuntimeError: ... autocommit` from `protect()` on Postgres | Transaction-local context needs an open transaction | `connection.autocommit = False`, or use `tenant_scope()` with middleware-only enforcement |
+| `RuntimeError: ... autocommit` from `protect()` on Postgres | Transaction-local context needs an open transaction | `connection.autocommit = False` (with `fail_mode: closed` there is no other way) |
 | All rows visible although policies exist | Role listed in `_firewall_bypass_roles`, or app connects as owner/superuser/`BYPASSRLS` | Remove the row; connect the app as an unprivileged role |
 | Middleware filtering but raw SQL queries bypass it | Raw SQL not routed through middleware connection wrapper | Add `protect()` to all connection acquisition paths; use DB-level RLS as primary layer |
 | INSERT rows have NULL tenant_id despite firewall | Policy only filters SELECT; INSERT policy is missing | Add a separate `WITH CHECK` policy or use a trigger to stamp tenant_id on INSERT |
-| CI scanner passes but new table leaks data | Scanner only checks tables with existing rows (empty tables skipped) | Run `--strict --include-empty` to check schema-only tables |
+| Scanner fails a table you protected by hand | RLS not forced, a firewall policy missing, or an extra permissive policy (PostgreSQL ORs them) | Run `--json`; fix what `rls_forced`, `missing_policies` or `extra_permissive_policies` shows, or re-run the migration |
+| PostgreSQL: a new table in another schema is not reported | The PostgreSQL scanner and migration cover one schema (`engines.postgresql.schema`, default `public`) | Set that schema, or run the migration and scanner once per schema |
+| Oracle: logins fail or tenants are never set after the migration | The logon trigger did not compile (script not run as SYS) and was disabled | Run as SYS, or grant EXECUTE on the package to your DBA user (section 6b) and recompile |
 
 ## NoSQL Stores (MongoDB, Redis, Firestore, Convex)
 
