@@ -475,6 +475,16 @@ GRANT SELECT ON {S}.cat_v TO {ROLE};
 -- @undo
 DROP VIEW {S}.cat_v;
 
+-- @attack an invoker view over an information_schema view (a system relation with a recorded dependency)
+-- @check -: strict: only tenant data readable
+-- @mode strict
+-- @min 15
+-- @setup
+CREATE VIEW {S}.is_v WITH (security_invoker = true) AS SELECT table_name FROM information_schema.tables;
+GRANT SELECT ON {S}.is_v TO {ROLE};
+-- @undo
+DROP VIEW {S}.is_v;
+
 -- @attack a readable standalone sequence
 -- @check -: strict: only tenant data readable
 -- @mode strict

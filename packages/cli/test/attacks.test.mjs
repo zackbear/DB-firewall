@@ -13,7 +13,7 @@ const ADMIN_URL = process.env.DBFW_PG_URL;
 if (!ADMIN_URL && process.env.DBFW_REQUIRE_LIVE) throw new Error("DBFW_REQUIRE_LIVE set but DBFW_PG_URL is not");
 const live = { skip: ADMIN_URL ? false : "DBFW_PG_URL not set" };
 // Pinned, so a case cannot disappear in silence: change it with the corpus.
-const ATTACKS = 90, PASSES = 6;
+const ATTACKS = 91, PASSES = 6;
 const S = "atk", ROLE = "dbfw_atk", PW = "DbfwAtk_2026x";
 const DB = ADMIN_URL ? new URL(ADMIN_URL).pathname.slice(1) : "";
 const KEY = "5a".repeat(32);
