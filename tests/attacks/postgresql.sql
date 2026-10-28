@@ -1,6 +1,8 @@
 -- Attacks on PostgreSQL tenant isolation, collected from the PR 13 to 15
 -- reviews. `db-firewall verify` must fail each one with the named check.
--- Add every new bypass here before fixing it.
+-- Add every new bypass here before fixing it, and raise the count pinned in
+-- packages/cli/test/attacks.test.mjs. Not covered yet (they need C code to
+-- set up): SECURITY DEFINER type I/O functions and selectivity estimators.
 --
 -- The fixture (packages/cli/test/attacks.test.mjs builds it): schema {S} with
 -- {S}.docs (id serial, tenant_id text, body text) and the rows
@@ -46,6 +48,46 @@ GRANT pg_read_server_files TO {ROLE};
 -- @undo
 REVOKE pg_read_server_files FROM {ROLE};
 
+-- @attack it can SET ROLE to a superuser without BYPASSRLS
+-- @check -: role
+-- @leak SET LOCAL ROLE {ROLE}_su; SELECT string_agg(body, ',') FROM {S}.docs
+-- @setup
+CREATE ROLE {ROLE}_su NOLOGIN SUPERUSER NOBYPASSRLS; GRANT {ROLE}_su TO {ROLE};
+-- @undo
+REVOKE {ROLE}_su FROM {ROLE}; DROP ROLE {ROLE}_su;
+
+-- @attack the app role is in the bypass list
+-- @check -: role
+-- @leak SELECT string_agg(body, ',') FROM {S}.docs
+-- @setup
+INSERT INTO public._firewall_bypass_roles (role_name) VALUES ('{ROLE}');
+-- @undo
+DELETE FROM public._firewall_bypass_roles WHERE role_name = '{ROLE}';
+
+-- @attack it can write server files
+-- @check -: role
+-- @setup
+GRANT pg_write_server_files TO {ROLE};
+-- @undo
+REVOKE pg_write_server_files FROM {ROLE};
+
+-- @attack it is in pg_write_all_data
+-- @check -: role
+-- @setup
+GRANT pg_write_all_data TO {ROLE};
+-- @undo
+REVOKE pg_write_all_data FROM {ROLE};
+
+-- @attack a role it can SET ROLE to but does not inherit can write the bypass list (NOINHERIT)
+-- @check -: cannot write firewall tables
+-- @leak SET LOCAL ROLE {ROLE}_w2; INSERT INTO public._firewall_bypass_roles (role_name) VALUES ('{ROLE}'); RESET ROLE; SELECT string_agg(body, ',') FROM {S}.docs
+-- @setup
+CREATE ROLE {ROLE}_w2 NOLOGIN; GRANT INSERT ON public._firewall_bypass_roles TO {ROLE}_w2;
+ALTER ROLE {ROLE} NOINHERIT; GRANT {ROLE}_w2 TO {ROLE};
+-- @undo
+ALTER ROLE {ROLE} INHERIT; REVOKE {ROLE}_w2 FROM {ROLE};
+REVOKE ALL ON public._firewall_bypass_roles FROM {ROLE}_w2; DROP ROLE {ROLE}_w2;
+
 -- ---------------------------------------------------------------- ownership
 -- @attack it owns the table (an owner can turn RLS off)
 -- @check {S}.docs: role does not own the table
@@ -59,6 +101,14 @@ GRANT USAGE ON SEQUENCE {S}.docs_id_seq TO {ROLE};
 
 -- @attack it owns the database
 -- @check -: owns no database objects
+-- @setup
+ALTER DATABASE {DB} OWNER TO {ROLE};
+-- @undo
+ALTER DATABASE {DB} OWNER TO CURRENT_USER;
+
+-- @attack it owns the database, so schema public (PostgreSQL 15+: pg_database_owner)
+-- @check -: does not own firewall objects
+-- @min 15
 -- @setup
 ALTER DATABASE {DB} OWNER TO {ROLE};
 -- @undo
@@ -111,6 +161,30 @@ CREATE ROLE {ROLE}_w NOLOGIN; GRANT INSERT ON public._firewall_bypass_roles TO {
 GRANT {ROLE}_w TO {ROLE} WITH INHERIT FALSE;
 -- @undo
 REVOKE {ROLE}_w FROM {ROLE}; REVOKE ALL ON public._firewall_bypass_roles FROM {ROLE}_w; DROP ROLE {ROLE}_w;
+
+-- @attack it can UPDATE a row of the bypass list
+-- @check -: cannot write firewall tables
+-- @leak UPDATE public._firewall_bypass_roles SET role_name = current_user; SELECT string_agg(body, ',') FROM {S}.docs
+-- @setup
+INSERT INTO public._firewall_bypass_roles (role_name) VALUES ('{ROLE}_mig'); GRANT UPDATE ON public._firewall_bypass_roles TO {ROLE};
+-- @undo
+REVOKE UPDATE ON public._firewall_bypass_roles FROM {ROLE}; DELETE FROM public._firewall_bypass_roles WHERE role_name IN ('{ROLE}_mig', '{ROLE}');
+
+-- @attack it can execute _firewall_set_tenant
+-- @check -: cannot read the key or sign
+-- @leak SELECT public._firewall_set_tenant('B'); SELECT string_agg(body, ',') FROM {S}.docs
+-- @setup
+GRANT EXECUTE ON FUNCTION public._firewall_set_tenant(text) TO {ROLE};
+-- @undo
+REVOKE EXECUTE ON FUNCTION public._firewall_set_tenant(text) FROM {ROLE};
+
+-- @attack it can write the tenant map
+-- @check -: cannot write firewall tables
+-- @leak INSERT INTO public._firewall_tenant_map (db_user, tenant_id) VALUES (session_user, 'B'); SELECT set_config('app.current_tenant', '', true); SELECT public._firewall_auto_resolve(); SELECT string_agg(body, ',') FROM {S}.docs
+-- @setup
+GRANT INSERT ON public._firewall_tenant_map TO {ROLE};
+-- @undo
+REVOKE INSERT ON public._firewall_tenant_map FROM {ROLE}; DELETE FROM public._firewall_tenant_map;
 
 -- @attack it can read the signing key
 -- @check -: cannot read the key or sign
@@ -265,6 +339,26 @@ GRANT USAGE ON SCHEMA {S}_other TO {ROLE}; GRANT SELECT ON {S}_other.all_docs TO
 -- @undo
 DROP SCHEMA {S}_other CASCADE;
 
+-- @attack a definer view owned by a non-bypassing role over a superuser's definer view the app cannot read
+-- @check -: no RLS-bypassing views or functions
+-- @leak SELECT string_agg(body, ',') FROM {S}.outer_x
+-- @setup
+CREATE ROLE {ROLE}_x NOLOGIN;
+CREATE VIEW {S}.inner_d AS SELECT * FROM {S}.docs; GRANT SELECT ON {S}.inner_d TO {ROLE}_x;
+CREATE VIEW {S}.outer_x AS SELECT * FROM {S}.inner_d; ALTER VIEW {S}.outer_x OWNER TO {ROLE}_x;
+GRANT SELECT ON {S}.outer_x TO {ROLE};
+-- @undo
+DROP VIEW {S}.outer_x; DROP VIEW {S}.inner_d; DROP ROLE {ROLE}_x;
+
+-- @attack a view owned by a superuser without BYPASSRLS
+-- @check -: no RLS-bypassing views or functions
+-- @leak SELECT string_agg(body, ',') FROM {S}.su_v
+-- @setup
+CREATE ROLE {ROLE}_su2 NOLOGIN SUPERUSER NOBYPASSRLS;
+CREATE VIEW {S}.su_v AS SELECT * FROM {S}.docs; ALTER VIEW {S}.su_v OWNER TO {ROLE}_su2; GRANT SELECT ON {S}.su_v TO {ROLE};
+-- @undo
+DROP VIEW {S}.su_v; DROP ROLE {ROLE}_su2;
+
 -- @attack a materialized view
 -- @check -: no RLS-bypassing views or functions
 -- @leak SELECT string_agg(body, ',') FROM {S}.m_docs
@@ -366,6 +460,17 @@ CREATE RULE leak AS ON INSERT TO {S}.notes DO ALSO SELECT who FROM {S}.audit;
 -- @undo
 DROP VIEW {S}.notes_w; DROP TABLE {S}.notes, {S}.audit;
 
+-- @attack --allow-global cannot clear a rule
+-- @check -: no RLS-bypassing views or functions
+-- @mode strict
+-- @args --allow-global {S}.*
+-- @leak INSERT INTO {S}.docs (tenant_id, body) VALUES ('A', 'x')
+-- @setup
+CREATE TABLE {S}.audit (who text); INSERT INTO {S}.audit VALUES ('b-secret');
+CREATE RULE leak AS ON INSERT TO {S}.docs DO ALSO SELECT who FROM {S}.audit;
+-- @undo
+DROP RULE leak ON {S}.docs; DROP TABLE {S}.audit;
+
 -- ---------------------------------------------------------------- functions that run as their owner
 -- @attack a SECURITY DEFINER function
 -- @check -: no RLS-bypassing views or functions
@@ -417,6 +522,27 @@ CREATE TRIGGER tg AFTER INSERT ON {S}.docs FOR EACH ROW EXECUTE FUNCTION {S}.tg(
 -- @undo
 DROP TRIGGER tg ON {S}.docs; DROP FUNCTION {S}.tg();
 
+-- @attack a SECURITY DEFINER trigger function with EXECUTE revoked, in strict mode
+-- @check -: strict: no SECURITY DEFINER functions
+-- @mode strict
+-- @setup
+CREATE FUNCTION {S}.tg() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER AS $f$ BEGIN RETURN NEW; END $f$;
+REVOKE EXECUTE ON FUNCTION {S}.tg() FROM PUBLIC;
+CREATE TRIGGER tg AFTER INSERT ON {S}.docs FOR EACH ROW EXECUTE FUNCTION {S}.tg();
+-- @undo
+DROP TRIGGER tg ON {S}.docs; DROP FUNCTION {S}.tg();
+
+-- @attack a SECURITY DEFINER event trigger function fires on the app's temp-table DDL
+-- @check -: no RLS-bypassing views or functions
+-- @leak CREATE TEMP TABLE t_evt (x int)
+-- @setup
+CREATE FUNCTION {S}.evt() RETURNS event_trigger LANGUAGE plpgsql SECURITY DEFINER AS $f$
+BEGIN RAISE NOTICE '%', (SELECT string_agg(body, ',') FROM {S}.docs); END $f$;
+REVOKE EXECUTE ON FUNCTION {S}.evt() FROM PUBLIC;
+CREATE EVENT TRIGGER {ROLE}_evt ON ddl_command_end EXECUTE FUNCTION {S}.evt();
+-- @undo
+DROP EVENT TRIGGER {ROLE}_evt; DROP FUNCTION {S}.evt();
+
 -- @attack an aggregate over a SECURITY DEFINER function with EXECUTE revoked
 -- @check -: no RLS-bypassing views or functions
 -- @leak SELECT {S}.agg('q')
@@ -461,7 +587,7 @@ CREATE OPERATOR {S}.= (LEFTARG = {S}.myint, RIGHTARG = {S}.myint, FUNCTION = {S}
 CREATE OPERATOR CLASS {S}.myint_ops DEFAULT FOR TYPE {S}.myint USING btree AS
     OPERATOR 1 {S}.<, OPERATOR 3 {S}.=, FUNCTION 1 {S}.mycmp({S}.myint, {S}.myint);
 -- @undo
-DROP TYPE {S}.myint CASCADE;
+DROP OPERATOR FAMILY {S}.myint_ops USING btree CASCADE; DROP TYPE {S}.myint CASCADE;
 
 -- @attack a foreign-data wrapper validator that is a SECURITY DEFINER function
 -- @check -: no RLS-bypassing views or functions
@@ -521,6 +647,35 @@ SELECT lo_from_bytea(424242, convert_to('b-secret', 'UTF8')); ALTER LARGE OBJECT
 -- @undo
 SELECT lo_unlink(424242);
 
+-- @attack --allow-global cannot clear a foreign table with the tenant column
+-- @check -: no RLS-bypassing views or functions
+-- @mode strict
+-- @args --allow-global {S}.docs_remote
+-- @setup
+CREATE FOREIGN DATA WRAPPER {ROLE}_fdw; CREATE SERVER {ROLE}_srv FOREIGN DATA WRAPPER {ROLE}_fdw;
+CREATE FOREIGN TABLE {S}.docs_remote (id int, tenant_id text) SERVER {ROLE}_srv;
+GRANT SELECT ON {S}.docs_remote TO {ROLE};
+-- @undo
+DROP FOREIGN TABLE {S}.docs_remote; DROP SERVER {ROLE}_srv; DROP FOREIGN DATA WRAPPER {ROLE}_fdw;
+
+-- @attack a large object granted to the app (not owned)
+-- @check -: strict: no readable large objects
+-- @mode strict
+-- @leak SELECT convert_from(lo_get(424243), 'UTF8')
+-- @setup
+SELECT lo_from_bytea(424243, convert_to('b-secret', 'UTF8')); GRANT SELECT ON LARGE OBJECT 424243 TO {ROLE};
+-- @undo
+SELECT lo_unlink(424243);
+
+-- @attack lo_compat_privileges makes every large object readable
+-- @check -: strict: no readable large objects
+-- @mode strict
+-- @leak SELECT convert_from(lo_get(424244), 'UTF8')
+-- @setup
+SELECT lo_from_bytea(424244, convert_to('b-secret', 'UTF8')); ALTER DATABASE {DB} SET lo_compat_privileges = on;
+-- @undo
+ALTER DATABASE {DB} RESET lo_compat_privileges; SELECT lo_unlink(424244);
+
 -- @attack other sessions' SQL in pg_stat_activity
 -- @check -: strict: cannot read other sessions' SQL
 -- @mode strict
@@ -528,6 +683,14 @@ SELECT lo_unlink(424242);
 GRANT SELECT ON pg_catalog.pg_stat_activity TO PUBLIC;
 -- @undo
 REVOKE SELECT ON pg_catalog.pg_stat_activity FROM PUBLIC;
+
+-- @attack other sessions' SQL through pg_stat_get_activity
+-- @check -: strict: cannot read other sessions' SQL
+-- @mode strict
+-- @setup
+GRANT EXECUTE ON FUNCTION pg_catalog.pg_stat_get_activity(integer) TO PUBLIC;
+-- @undo
+REVOKE EXECUTE ON FUNCTION pg_catalog.pg_stat_get_activity(integer) FROM PUBLIC;
 
 -- @attack other sessions' SQL in pg_stat_statements
 -- @check -: strict: cannot read other sessions' SQL

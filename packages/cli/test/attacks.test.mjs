@@ -10,7 +10,10 @@ import pg from "pg";
 import { sign } from "../dist/key.js";
 
 const ADMIN_URL = process.env.DBFW_PG_URL;
+if (!ADMIN_URL && process.env.DBFW_REQUIRE_LIVE) throw new Error("DBFW_REQUIRE_LIVE set but DBFW_PG_URL is not");
 const live = { skip: ADMIN_URL ? false : "DBFW_PG_URL not set" };
+// Pinned, so a case cannot disappear in silence: change it with the corpus.
+const ATTACKS = 73, PASSES = 5;
 const S = "atk", ROLE = "dbfw_atk", PW = "DbfwAtk_2026x";
 const DB = ADMIN_URL ? new URL(ADMIN_URL).pathname.slice(1) : "";
 const KEY = "5a".repeat(32);
@@ -18,30 +21,45 @@ const CLI = new URL("../dist/cli.js", import.meta.url).pathname;
 const CORPUS = new URL("../../../tests/attacks/postgresql.sql", import.meta.url);
 const SECRET = "b-secret";
 
-/** The cases in the corpus file, placeholders filled in. */
+/** The cases in the corpus file, placeholders filled in. A mistake in the
+ *  file (an unknown or repeated directive, a bad value) throws: a directive
+ *  dropped in silence would make a case test something else. */
 export function parseCorpus(text, vars) {
   const fill = (s) => s.replace(/\{(S|ROLE|DB)\}/g, (_, k) => vars[k]);
   const cases = [];
-  let cur = null, part = null;
-  for (const line of text.split("\n")) {
-    const head = line.match(/^-- @(attack|pass) (.+)$/);
+  let cur = null, part = null, n = 0;
+  for (const line of text.replace(/\r\n/g, "\n").split("\n")) {
+    n++;
+    const bad = (why) => { throw new Error(`corpus line ${n}: ${why}: ${line}`); };
+    if (/^\s+--\s*@/.test(line)) bad("an indented directive");
+    const head = line.match(/^-- @(attack|pass) (\S.*)$/);
     if (head) {
-      cur = { kind: head[1], name: head[2].trim(), mode: "plain", args: [], min: 0, setup: [], undo: [] };
+      cur = { kind: head[1], name: head[2].trim(), mode: "plain", args: [], min: 0, setup: [], undo: [], seen: new Set() };
       cases.push(cur); part = null; continue;
     }
-    if (!cur) continue;
-    const d = line.match(/^-- @(check|mode|args|min|leak|setup|undo)\b ?(.*)$/);
-    if (d) {
-      const [, key, value] = d;
-      if (key === "setup" || key === "undo") part = key;
-      else if (key === "args") cur.args = fill(value).split(/\s+/).filter(Boolean);
-      else if (key === "min") cur.min = Number(value);
-      else cur[key] = fill(value.trim());
+    if (!/^--\s*@/.test(line)) {
+      if (part && !/^-- -{4,}/.test(line)) cur[part].push(line);
       continue;
     }
-    if (part && !/^-- -{4,}/.test(line)) cur[part].push(line);
+    const d = line.match(/^-- @(check|mode|args|min|leak|setup|undo)(?: (\S.*))?$/);
+    if (!d) bad("an unknown directive");
+    if (!cur) bad("a directive before the first case");
+    const [, key, value = ""] = d;
+    if (cur.seen.has(key)) bad(`a second @${key}`);
+    cur.seen.add(key);
+    if (key === "setup" || key === "undo") { if (value) bad(`@${key} takes no value`); part = key; continue; }
+    if (part) bad(`@${key} after @setup`);
+    if (!value) bad(`@${key} needs a value`);
+    if (key === "mode" && !["plain", "strict"].includes(value)) bad("@mode is plain or strict");
+    if (key === "min" && !/^1\d$/.test(value)) bad("@min is a major version");
+    if (key === "check" && cur.kind === "pass") bad("a @pass case has no @check");
+    if (key === "args") cur.args = fill(value).split(/\s+/);
+    else if (key === "min") cur.min = Number(value);
+    else cur[key] = fill(value.trim());
   }
-  for (const c of cases) { c.setup = fill(c.setup.join("\n")).trim(); c.undo = fill(c.undo.join("\n")).trim(); }
+  for (const c of cases) {
+    c.setup = fill(c.setup.join("\n")).trim(); c.undo = fill(c.undo.join("\n")).trim(); delete c.seen;
+  }
   return cases;
 }
 
@@ -88,6 +106,22 @@ const NO_ACTIVITY = "REVOKE SELECT ON pg_catalog.pg_stat_activity FROM PUBLIC; R
 const RESTORE = "GRANT SELECT ON pg_catalog.pg_stat_activity TO PUBLIC; GRANT EXECUTE ON FUNCTION " +
   "pg_catalog.pg_stat_get_activity(integer), pg_catalog.pg_stat_get_backend_activity(integer) TO PUBLIC";
 
+describe("corpus parser", () => {
+  const v = { S: "s", ROLE: "r", DB: "d" };
+  const ok = "-- @attack x\n-- @check -: role\n-- @setup\nSELECT {S};\n-- @undo\nSELECT 2;\n";
+  it("reads a case, also with CRLF line ends", () => {
+    for (const text of [ok, ok.replace(/\n/g, "\r\n")]) {
+      const [c] = parseCorpus(text, v);
+      assert.deepEqual([c.check, c.setup, c.undo], ["-: role", "SELECT s;", "SELECT 2;"]);
+    }
+  });
+  for (const bad of ["-- @mod strict", "-- @min15", "  -- @mode strict", "-- @mode Strict", "-- @check -: x", "-- @min 1x"]) {
+    it(`rejects ${JSON.stringify(bad)}`, () => {
+      assert.throws(() => parseCorpus(ok.replace("-- @setup", `${bad}\n-- @setup`), v), /corpus line/);
+    });
+  }
+});
+
 describe("attack corpus", live, () => {
   const cases = parseCorpus(readFileSync(CORPUS, "utf8"), { S, ROLE, DB });
   let major = 0;
@@ -110,7 +144,8 @@ describe("attack corpus", live, () => {
   });
 
   it("the corpus parses: every case has a check (or passes), a setup and an undo", () => {
-    assert.ok(cases.length >= 40, `${cases.length} cases`);
+    assert.equal(cases.filter((c) => c.kind === "attack").length, ATTACKS, "attacks (update ATTACKS with the corpus)");
+    assert.equal(cases.filter((c) => c.kind === "pass").length, PASSES, "safe patterns (update PASSES)");
     for (const c of cases) {
       assert.ok(c.setup && c.undo, `${c.name}: setup and undo`);
       if (c.kind === "attack") assert.match(c.check ?? "", /^\S+: /, `${c.name}: @check table: check`);

@@ -613,13 +613,13 @@ The live tests create the `dbfw_app` role and their own tables, and apply
 as a superuser. CI does the same on PostgreSQL 14, 15, 16 and 17 and fails
 below 85% coverage.
 
-`tests/attacks/postgresql.sql` is the attack corpus: every known way to reach
-another tenant's rows on PostgreSQL, from the reviews (definer views and
+`tests/attacks/postgresql.sql` is the attack corpus: the ways to reach
+another tenant's rows on PostgreSQL that the reviews found (definer views and
 functions, rules, ownership, functions PostgreSQL runs without an `EXECUTE`
 check, shared stores), and safe patterns that must pass. CI runs it on every
 version: `db-firewall verify` must fail each attack with the named check, and
-each attack's leak query must really show the other tenant's row on that
-version. Add every new bypass there before fixing it.
+an attack's leak query, when it has one, must really show data tenant A must
+not see on that version. Add every new bypass there before fixing it.
 
 | Test file | Covers |
 | --- | --- |
