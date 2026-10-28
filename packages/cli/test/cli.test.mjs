@@ -47,6 +47,16 @@ describe("usage", () => {
     assert.equal(readFileSync(new URL("../sql/001_postgresql.sql", import.meta.url), "utf8"),
                  readFileSync(new URL("../../../migrations/001_postgresql.sql", import.meta.url), "utf8"));
   });
+  it("a file check passes only on ok = true; an error fails it, and an info line never fails", async () => {
+    const { fileCheck } = await import("../dist/verify.js");
+    const client = (row) => ({ query: async () => { if (row instanceof Error) throw row; return { rows: [row] }; } });
+    const c = { name: "x", info: false, sql: "SELECT 1" };
+    assert.equal((await fileCheck(client({ ok: true, detail: "d" }), c)).ok, true);
+    for (const row of [{ ok: null, detail: "d" }, { ok: false, detail: "d" }, { ok: "t", detail: "d" }, new Error("boom")]) {
+      assert.equal((await fileCheck(client(row), c)).ok, false, JSON.stringify(row));
+    }
+    assert.equal((await fileCheck(client(new Error("boom")), { ...c, info: true })).ok, true);
+  });
   it("ships the repository's shared checks unchanged, and they parse", async () => {
     assert.equal(readFileSync(new URL("../sql/checks_postgresql.sql", import.meta.url), "utf8"),
                  readFileSync(new URL("../../../checks/postgresql.sql", import.meta.url), "utf8"));

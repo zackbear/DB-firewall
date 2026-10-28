@@ -182,10 +182,10 @@ def _query_text(cur, strict):
 def _strict_checks(cur, protected, allow, allow_query_text):
     def readable():
         rows = pg_checks.query(cur, "strict_readable", json.dumps([[t["schema"], t["table"]] for t in protected]))
-        stats = re.compile(r"\.pg_stat_statements(_info)?$")
+        # --allow-query-text also accepts the views of the pg_stat_statements extension.
         bad = sorted(r["name"] for r in rows
                      if not _allowed_rel(allow, r["name"])
-                     and not (allow_query_text and stats.search(r["name"]))
+                     and not (allow_query_text and r["extension"] == "pg_stat_statements")
                      and not (r["safe"] or (r["invoker"] and not r["broken"]
                                             and all(_allowed_rel(allow, b) for b in r["blockers"]))))
         return (not bad, f"readable but not protected tenant data: {_listed(bad)} "
@@ -216,6 +216,10 @@ def verify(connection, tenant: str, key: bytes, schemas: Optional[List[str]] = N
            allow_global: Optional[List[str]] = None, allow_query_text: bool = False) -> dict:
     """{checks, tables, excluded}, as `db-firewall verify --json` prints them.
     connection: the app role's, in autocommit mode."""
+    # Autocommit: the row checks run in their own transactions, and the
+    # search_path pin below must outlive their ROLLBACK.
+    if not connection.autocommit:
+        connection.autocommit = True
     schemas = list(schemas or ["public"])
     exclude = pg_checks.CHECKS().excluded if exclude is None else list(exclude)
     allow = list(allow_global or [])
@@ -338,7 +342,15 @@ def main(argv=None) -> int:
         return 2
     try:
         from hooks.scanner import get_connection
-        conn = get_connection(a.dsn)
+        if "://" in a.dsn:
+            conn = get_connection(a.dsn)
+        else:                                       # the keyword form: host=... dbname=...
+            try:
+                import psycopg
+                conn = psycopg.connect(a.dsn)
+            except ImportError:
+                import psycopg2
+                conn = psycopg2.connect(a.dsn)
         conn.autocommit = True
     except Exception as e:
         print(f"verify: cannot connect: {_msg(e)}", file=sys.stderr)
@@ -346,6 +358,9 @@ def main(argv=None) -> int:
     try:
         result = verify(conn, a.tenant, key, a.schema, a.column, a.exclude, a.write_probe, a.strict,
                         a.allow_global, a.allow_query_text)
+    except Exception as e:                          # as the Node CLI: 2, never a pass
+        print(f"verify: {_msg(e)}", file=sys.stderr)
+        return 2
     finally:
         conn.close()
     code = exit_code(result)

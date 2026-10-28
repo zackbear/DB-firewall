@@ -249,6 +249,29 @@ GRANT TRUNCATE ON {S}.docs TO {ROLE};
 -- @undo
 REVOKE TRUNCATE ON {S}.docs FROM {ROLE};
 
+-- @attack it has TRUNCATE through a role it is a member of
+-- @check {S}.docs: no TRUNCATE
+-- @setup
+CREATE ROLE {ROLE}_trunc NOLOGIN; GRANT TRUNCATE ON {S}.docs TO {ROLE}_trunc; GRANT {ROLE}_trunc TO {ROLE};
+-- @undo
+REVOKE {ROLE}_trunc FROM {ROLE}; REVOKE ALL ON {S}.docs FROM {ROLE}_trunc; DROP ROLE {ROLE}_trunc;
+
+-- @attack it owns a table (an owner can create triggers on it)
+-- @check -: cannot create triggers
+-- @setup
+CREATE TABLE {S}.mine (x int); ALTER TABLE {S}.mine OWNER TO {ROLE};
+-- @undo
+DROP TABLE {S}.mine;
+
+-- @attack a planted function shadows a catalog function through the role's search_path
+-- @check {S}.docs: no TRUNCATE
+-- @setup
+CREATE FUNCTION {S}.has_table_privilege(oid, oid, text) RETURNS boolean LANGUAGE sql AS 'SELECT false';
+GRANT TRUNCATE ON {S}.docs TO {ROLE}; ALTER ROLE {ROLE} SET search_path = {S}, pg_catalog;
+-- @undo
+ALTER ROLE {ROLE} RESET search_path; REVOKE TRUNCATE ON {S}.docs FROM {ROLE};
+DROP FUNCTION {S}.has_table_privilege(oid, oid, text);
+
 -- @attack it has TRIGGER on a table
 -- @check -: cannot create triggers
 -- @setup
@@ -395,6 +418,78 @@ DROP MATERIALIZED VIEW {S}.bodies_mv; DROP FUNCTION {S}.all_bodies();
 CREATE VIEW {S}.ref_docs AS SELECT * FROM {S}.docs; GRANT SELECT ON {S}.ref_docs TO {ROLE};
 -- @undo
 DROP VIEW {S}.ref_docs;
+
+-- @attack a definer view owned by a non-bypassing role over a materialized view of a tenant table
+-- @check -: no RLS-bypassing views or functions
+-- @leak SELECT string_agg(body, ',') FROM {S}.over_mv
+-- @setup
+CREATE ROLE {ROLE}_mvo NOLOGIN;
+CREATE MATERIALIZED VIEW {S}.hidden_mv AS SELECT * FROM {S}.docs; GRANT SELECT ON {S}.hidden_mv TO {ROLE}_mvo;
+CREATE VIEW {S}.over_mv AS SELECT * FROM {S}.hidden_mv; ALTER VIEW {S}.over_mv OWNER TO {ROLE}_mvo;
+GRANT SELECT ON {S}.over_mv TO {ROLE};
+-- @undo
+DROP VIEW {S}.over_mv; DROP MATERIALIZED VIEW {S}.hidden_mv; DROP ROLE {ROLE}_mvo;
+
+-- @attack an invoker view over a table the app cannot read
+-- @check -: strict: only tenant data readable
+-- @mode strict
+-- @min 15
+-- @setup
+CREATE TABLE {S}.plain_t (note text);
+CREATE VIEW {S}.iv WITH (security_invoker = true) AS SELECT * FROM {S}.plain_t; GRANT SELECT ON {S}.iv TO {ROLE};
+-- @undo
+DROP VIEW {S}.iv; DROP TABLE {S}.plain_t;
+
+-- @attack an invoker view over an invoker view over a table that is not tenant data
+-- @check -: strict: only tenant data readable
+-- @mode strict
+-- @min 15
+-- @setup
+CREATE TABLE {S}.plain_t (note text);
+CREATE VIEW {S}.iv_low WITH (security_invoker = true) AS SELECT * FROM {S}.plain_t;
+CREATE VIEW {S}.iv_top WITH (security_invoker = true) AS SELECT * FROM {S}.iv_low;
+GRANT SELECT ON {S}.iv_top TO {ROLE};
+-- @undo
+DROP VIEW {S}.iv_top; DROP VIEW {S}.iv_low; DROP TABLE {S}.plain_t;
+
+-- @attack an invoker view over a definer view of a table that is not tenant data
+-- @check -: strict: only tenant data readable
+-- @mode strict
+-- @min 15
+-- @leak SELECT string_agg(note, ',') FROM {S}.iv_def
+-- @setup
+CREATE TABLE {S}.plain_t (note text); INSERT INTO {S}.plain_t VALUES ('b-secret');
+CREATE VIEW {S}.def_v AS SELECT * FROM {S}.plain_t; GRANT SELECT ON {S}.def_v TO {ROLE};
+CREATE VIEW {S}.iv_def WITH (security_invoker = true) AS SELECT * FROM {S}.def_v;
+GRANT SELECT ON {S}.iv_def TO {ROLE};
+-- @undo
+DROP VIEW {S}.iv_def; DROP VIEW {S}.def_v; DROP TABLE {S}.plain_t;
+
+-- @attack an invoker view over a system catalog
+-- @check -: strict: only tenant data readable
+-- @mode strict
+-- @min 15
+-- @setup
+CREATE VIEW {S}.cat_v WITH (security_invoker = true) AS SELECT relname FROM pg_catalog.pg_class;
+GRANT SELECT ON {S}.cat_v TO {ROLE};
+-- @undo
+DROP VIEW {S}.cat_v;
+
+-- @attack a readable standalone sequence
+-- @check -: strict: only tenant data readable
+-- @mode strict
+-- @setup
+CREATE SEQUENCE {S}.counter; GRANT USAGE ON SEQUENCE {S}.counter TO {ROLE};
+-- @undo
+DROP SEQUENCE {S}.counter;
+
+-- @attack a readable sequence owned by a table that is not tenant data
+-- @check -: strict: only tenant data readable
+-- @mode strict
+-- @setup
+CREATE TABLE {S}.log_t (id serial, note text); GRANT USAGE ON SEQUENCE {S}.log_t_id_seq TO {ROLE};
+-- @undo
+DROP TABLE {S}.log_t;
 
 -- @attack an invoker view of constants
 -- @check -: strict: only tenant data readable
@@ -589,6 +684,65 @@ CREATE OPERATOR CLASS {S}.myint_ops DEFAULT FOR TYPE {S}.myint USING btree AS
 -- @undo
 DROP OPERATOR FAMILY {S}.myint_ops USING btree CASCADE; DROP TYPE {S}.myint CASCADE;
 
+-- @attack a SECURITY DEFINER btree comparison function with EXECUTE revoked (index support)
+-- @check -: no RLS-bypassing views or functions
+-- @setup
+CREATE TYPE {S}.myint2;
+CREATE FUNCTION {S}.myin2(cstring) RETURNS {S}.myint2 LANGUAGE internal IMMUTABLE STRICT AS 'int4in';
+CREATE FUNCTION {S}.myout2({S}.myint2) RETURNS cstring LANGUAGE internal IMMUTABLE STRICT AS 'int4out';
+CREATE TYPE {S}.myint2 (INPUT = {S}.myin2, OUTPUT = {S}.myout2, LIKE = int4);
+CREATE FUNCTION {S}.mylt2({S}.myint2, {S}.myint2) RETURNS bool LANGUAGE internal IMMUTABLE STRICT AS 'int4lt';
+CREATE FUNCTION {S}.myeq2({S}.myint2, {S}.myint2) RETURNS bool LANGUAGE internal IMMUTABLE STRICT AS 'int4eq';
+CREATE FUNCTION {S}.mycmp2({S}.myint2, {S}.myint2) RETURNS int LANGUAGE plpgsql IMMUTABLE SECURITY DEFINER AS $f$
+BEGIN RETURN btint4cmp($1::text::int, $2::text::int); END $f$;
+REVOKE EXECUTE ON FUNCTION {S}.mycmp2({S}.myint2, {S}.myint2) FROM PUBLIC;
+CREATE OPERATOR {S}.< (LEFTARG = {S}.myint2, RIGHTARG = {S}.myint2, FUNCTION = {S}.mylt2);
+CREATE OPERATOR {S}.= (LEFTARG = {S}.myint2, RIGHTARG = {S}.myint2, FUNCTION = {S}.myeq2);
+CREATE OPERATOR CLASS {S}.myint2_ops DEFAULT FOR TYPE {S}.myint2 USING btree AS
+    OPERATOR 1 {S}.<, OPERATOR 3 {S}.=, FUNCTION 1 {S}.mycmp2({S}.myint2, {S}.myint2);
+-- @undo
+DROP OPERATOR FAMILY {S}.myint2_ops USING btree CASCADE; DROP TYPE {S}.myint2 CASCADE;
+
+-- @attack a type whose input function is SECURITY DEFINER with EXECUTE revoked (type I/O)
+-- @check -: no RLS-bypassing views or functions
+-- @setup
+CREATE TYPE {S}.myint3;
+CREATE FUNCTION {S}.myin3(cstring) RETURNS {S}.myint3 LANGUAGE internal IMMUTABLE STRICT SECURITY DEFINER AS 'int4in';
+CREATE FUNCTION {S}.myout3({S}.myint3) RETURNS cstring LANGUAGE internal IMMUTABLE STRICT AS 'int4out';
+CREATE TYPE {S}.myint3 (INPUT = {S}.myin3, OUTPUT = {S}.myout3, LIKE = int4);
+REVOKE EXECUTE ON FUNCTION {S}.myin3(cstring) FROM PUBLIC;
+-- @undo
+DROP TYPE {S}.myint3 CASCADE;
+
+-- @attack an operator whose selectivity estimator is SECURITY DEFINER with EXECUTE revoked
+-- @check -: no RLS-bypassing views or functions
+-- @setup
+CREATE FUNCTION {S}.sel(internal, oid, internal, integer) RETURNS float8 LANGUAGE internal STABLE STRICT SECURITY DEFINER AS 'eqsel';
+REVOKE EXECUTE ON FUNCTION {S}.sel(internal, oid, internal, integer) FROM PUBLIC;
+CREATE FUNCTION {S}.same(text, text) RETURNS bool LANGUAGE sql IMMUTABLE AS 'SELECT $1 = $2';
+CREATE OPERATOR {S}.=== (LEFTARG = text, RIGHTARG = text, FUNCTION = {S}.same, RESTRICT = {S}.sel);
+-- @undo
+DROP OPERATOR {S}.=== (text, text); DROP FUNCTION {S}.same(text, text); DROP FUNCTION {S}.sel(internal, oid, internal, integer);
+
+-- @attack a planner support function that is SECURITY DEFINER with EXECUTE revoked
+-- @check -: no RLS-bypassing views or functions
+-- @setup
+CREATE FUNCTION {S}.supp(internal) RETURNS internal LANGUAGE internal STABLE STRICT SECURITY DEFINER AS 'textlike_support';
+REVOKE EXECUTE ON FUNCTION {S}.supp(internal) FROM PUBLIC;
+CREATE FUNCTION {S}.likeish(text, text) RETURNS bool LANGUAGE internal IMMUTABLE STRICT SUPPORT {S}.supp AS 'textlike';
+-- @undo
+DROP FUNCTION {S}.likeish(text, text); DROP FUNCTION {S}.supp(internal);
+
+-- @attack a text search parser function that is SECURITY DEFINER with EXECUTE revoked
+-- @check -: no RLS-bypassing views or functions
+-- @setup
+CREATE FUNCTION {S}.prs_start(internal, integer) RETURNS internal LANGUAGE internal STRICT SECURITY DEFINER AS 'prsd_start';
+REVOKE EXECUTE ON FUNCTION {S}.prs_start(internal, integer) FROM PUBLIC;
+CREATE TEXT SEARCH PARSER {S}.prs (START = {S}.prs_start, GETTOKEN = prsd_nexttoken, END = prsd_end,
+                                   LEXTYPES = prsd_lextype, HEADLINE = prsd_headline);
+-- @undo
+DROP TEXT SEARCH PARSER {S}.prs; DROP FUNCTION {S}.prs_start(internal, integer);
+
 -- @attack a foreign-data wrapper validator that is a SECURITY DEFINER function
 -- @check -: no RLS-bypassing views or functions
 -- @leak CREATE USER MAPPING FOR CURRENT_USER SERVER {ROLE}_ws OPTIONS (a 'b')
@@ -700,6 +854,24 @@ CREATE EXTENSION pg_stat_statements SCHEMA public;
 -- @undo
 DROP EXTENSION pg_stat_statements;
 
+-- @attack other sessions' SQL through the pg_stat_statements function (its views revoked)
+-- @check -: strict: cannot read other sessions' SQL
+-- @mode strict
+-- @setup
+CREATE EXTENSION pg_stat_statements SCHEMA public;
+REVOKE SELECT ON public.pg_stat_statements, public.pg_stat_statements_info FROM PUBLIC;
+-- @undo
+DROP EXTENSION pg_stat_statements;
+
+-- @attack --allow-query-text does not clear a table named like pg_stat_statements
+-- @check -: strict: only tenant data readable
+-- @mode strict
+-- @args --allow-query-text
+-- @setup
+CREATE TABLE {S}."x.pg_stat_statements" (note text); GRANT SELECT ON {S}."x.pg_stat_statements" TO {ROLE};
+-- @undo
+DROP TABLE {S}."x.pg_stat_statements";
+
 -- ---------------------------------------------------------------- safe patterns
 -- @pass a security_invoker view over a protected table
 -- @min 15
@@ -738,3 +910,11 @@ DROP TRIGGER stamp ON {S}.docs; DROP FUNCTION {S}.stamp();
 CREATE EXTENSION IF NOT EXISTS pgcrypto; CREATE EXTENSION IF NOT EXISTS citext; CREATE EXTENSION IF NOT EXISTS pg_trgm;
 -- @undo
 DROP EXTENSION pgcrypto; DROP EXTENSION citext; DROP EXTENSION pg_trgm;
+
+-- @pass --allow-query-text with pg_stat_statements installed
+-- @mode strict
+-- @args --allow-query-text
+-- @setup
+CREATE EXTENSION pg_stat_statements SCHEMA public;
+-- @undo
+DROP EXTENSION pg_stat_statements;

@@ -23,11 +23,12 @@ from middleware.db_firewall import DBEngine, load_config, run_migration  # noqa:
 from middleware.db_firewall.db_context import sign_tenant  # noqa: E402
 
 CORPUS = ROOT / "tests" / "attacks" / "postgresql.sql"
+CLI = ROOT / "packages" / "cli" / "dist" / "cli.js"
 SECRET = "b-secret"
 KEY = bytes.fromhex("5a" * 32)
 S, ROLE = "atk_py", "dbfw_atk_py"
 # Pinned with packages/cli/test/attacks.test.mjs: change both with the corpus.
-ATTACKS, PASSES = 73, 5
+ATTACKS, PASSES = 90, 6
 NO_ACTIVITY = ("REVOKE SELECT ON pg_catalog.pg_stat_activity FROM PUBLIC; REVOKE EXECUTE ON FUNCTION "
                "pg_catalog.pg_stat_get_activity(integer), pg_catalog.pg_stat_get_backend_activity(integer) FROM PUBLIC")
 RESTORE = ("GRANT SELECT ON pg_catalog.pg_stat_activity TO PUBLIC; GRANT EXECUTE ON FUNCTION "
@@ -165,6 +166,24 @@ def fixture():
         c.execute(RESTORE)
 
 
+def _node(mode="plain", args=()):
+    """The same verify through the Node CLI: its checks, or None when it is not built."""
+    import json as _json
+    import shutil
+    import subprocess
+    if not (CLI.exists() and shutil.which("node")):
+        if os.environ.get("DBFW_REQUIRE_PARITY"):
+            pytest.fail("DBFW_REQUIRE_PARITY set but packages/cli is not built (npm ci && npm run build)")
+        return None
+    from psycopg.conninfo import conninfo_to_dict
+    d = conninfo_to_dict(DSN)
+    url = f"postgres://{ROLE}@{d.get('host', 'localhost')}:{d.get('port', 5432)}/{d['dbname']}"
+    r = subprocess.run(["node", str(CLI), "verify", "--url", url, "--schema", S, "--tenant", "A", "--json",
+                        *(["--strict"] if mode == "strict" else []), *args],
+                       capture_output=True, text=True, env={**os.environ, "DB_FIREWALL_TENANT_KEY": KEY.hex()})
+    return _json.loads(r.stdout)["checks"]
+
+
 def _verify(mode="plain", args=()):
     allow, query_text, rest = [], False, list(args)
     while rest:                         # the corpus uses only these two flags
@@ -179,6 +198,9 @@ def _verify(mode="plain", args=()):
         result = pyverify.verify(conn, "A", KEY, [S], strict=mode == "strict", allow_global=allow,
                                  allow_query_text=query_text)
     failed = [f"{c['table']}: {c['check']}" for c in result["checks"] if c["ok"] is False]
+    node = _node(mode, args)
+    if node is not None:                # both tools: the same checks, results and details
+        assert result["checks"] == node
     return pyverify.exit_code(result), failed
 
 
@@ -258,9 +280,6 @@ def test_cli_exit_codes(fixture, capsys, monkeypatch):
     assert pyverify.main(["--dsn", url, "--tenant", "A"]) == 2                            # no key
 
 
-CLI = ROOT / "packages" / "cli" / "dist" / "cli.js"
-
-
 @live
 @pytest.mark.parametrize("strict", [False, True], ids=["plain", "strict"])
 def test_same_answers_as_the_node_cli(fixture, strict):
@@ -292,3 +311,83 @@ def test_same_answers_as_the_node_cli(fixture, strict):
         assert py["excluded"] == node["excluded"]
     finally:
         _admin(f"DROP VIEW {S}.v; DROP TABLE {S}.late, {S}.notes")
+
+
+# ---------------------------------------------------------------- fail closed
+class _Cur:
+    """A cursor that returns one row, or raises."""
+    def __init__(self, row):
+        self.row, self.sql = row, []
+
+    def execute(self, sql, params=None):
+        self.sql.append(sql)
+        if isinstance(self.row, Exception):
+            raise self.row
+
+    def fetchone(self):
+        return self.row
+
+
+def test_checks_fail_closed():
+    c = pg_checks.GlobalCheck("x", False, "SELECT 1")
+    assert pyverify._file_check(_Cur((True, "d")), c)["ok"] is True
+    for row in [(None, "d"), (False, "d"), ("t", "d"), RuntimeError("boom")]:
+        assert pyverify._file_check(_Cur(row), c)["ok"] is False, row
+    assert pyverify._file_check(_Cur(RuntimeError("boom")), c._replace(info=True))["ok"] is True
+    assert pyverify._guard("x", lambda: 1 / 0)["ok"] is False
+    assert pyverify.exit_code({"checks": [{"ok": True}, {"ok": None}]}) == 3
+    assert pyverify.exit_code({"checks": [{"ok": None}, {"ok": False}]}) == 1
+    assert pyverify.exit_code({"checks": [{"ok": True}]}) == 0
+
+
+def test_allowlist_kinds():
+    assert pyverify._allowed_fn(["app.f(*)"], "app.f(text)")
+    assert not pyverify._allowed_fn(["app.*"], "app.f(text)")          # a relation entry never clears a function
+    assert not pyverify._allowed_rel(["app.f(*)"], "app.f")            # a function entry never clears a relation
+    assert pyverify._allowed_rel(["app.[!x]*"], "app.countries")
+    assert not pyverify._allowed_rel(["app.[z-a]"], "app.b")           # a reversed range matches nothing
+    with pytest.raises(ValueError, match="parameter"):
+        pg_checks._pyformat("SELECT 1", ("unused",))                    # a parameter the query does not take
+
+
+@live
+def test_inconclusive_results_are_not_a_pass(fixture):
+    """A row check that errors, a table readable only after SET ROLE, and a
+    write probe refused by something other than RLS: inconclusive (exit 3)."""
+    _admin(f"""CREATE POLICY boom ON {S}.docs AS RESTRICTIVE USING (1 / 0 = 1);""")
+    try:
+        with _app() as conn:
+            r = pyverify.verify(conn, "A", KEY, [S])
+        rows = [c for c in r["checks"] if c["check"] == "row checks"]
+        assert rows and rows[0]["ok"] is None and "division by zero" in rows[0]["detail"]
+        assert pyverify.exit_code(r) != 0              # inconclusive, and "tenant has rows" fails
+    finally:
+        _admin(f"DROP POLICY boom ON {S}.docs")
+    _admin(f"""CREATE FUNCTION {S}.no() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN RAISE EXCEPTION 'no'; END $f$;
+               CREATE TRIGGER no BEFORE INSERT ON {S}.docs FOR EACH ROW EXECUTE FUNCTION {S}.no();""")
+    try:
+        with _app() as conn:
+            r = pyverify.verify(conn, "A", KEY, [S], write_probe=True)
+        probe = [c for c in r["checks"] if c["check"] == "cross-tenant insert refused"]
+        assert probe and probe[0]["ok"] is None and pyverify.exit_code(r) == 3
+    finally:
+        _admin(f"DROP TRIGGER no ON {S}.docs; DROP FUNCTION {S}.no()")
+    _admin(f"""CREATE ROLE {ROLE}_rd NOLOGIN; GRANT SELECT ON {S}.docs TO {ROLE}_rd;
+               REVOKE SELECT ON {S}.docs FROM {ROLE}; ALTER ROLE {ROLE} NOINHERIT; GRANT {ROLE}_rd TO {ROLE};""")
+    try:
+        with _app() as conn:
+            r = pyverify.verify(conn, "A", KEY, [S])
+        rows = [c for c in r["checks"] if c["check"] == "row checks"]
+        assert rows and rows[0]["ok"] is None and "SET ROLE" in rows[0]["detail"]
+    finally:
+        _admin(f"""ALTER ROLE {ROLE} INHERIT; REVOKE {ROLE}_rd FROM {ROLE}; GRANT SELECT ON {S}.docs TO {ROLE};
+                   REVOKE ALL ON {S}.docs FROM {ROLE}_rd; DROP ROLE {ROLE}_rd;""")
+
+
+@live
+def test_verify_switches_the_connection_to_autocommit(fixture):
+    """The search_path pin must outlive the row checks' ROLLBACK."""
+    import psycopg
+    with psycopg.connect(f"{DSN} user={ROLE}") as conn:
+        assert pyverify.exit_code(pyverify.verify(conn, "A", KEY, [S])) == 0
+        assert conn.autocommit

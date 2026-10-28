@@ -25,7 +25,10 @@ export function parseChecks(text: string): Checks {
     if (cur.kind === "query") {
       if (out.queries[cur.name]) throw new Error(`checks: a second @query ${cur.name}`);
       out.queries[cur.name] = sql;
-    } else out.checks.push({ name: cur.name, info: cur.kind === "info", sql });
+    } else {
+      if (out.checks.some((c) => c.name === cur!.name)) throw new Error(`checks: a second check ${cur.name}`);
+      out.checks.push({ name: cur.name, info: cur.kind === "info", sql });
+    }
   };
   for (const line of text.replace(/\r\n/g, "\n").split("\n")) {
     // Comment lines stay out of the SQL: a "$1" in one is no parameter.

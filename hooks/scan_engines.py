@@ -156,10 +156,12 @@ def _pg_firewall_objects(cursor):
     if extra:
         diff.append("extra " + ", ".join(extra))
     owners = [(r["owner"], r["super"], r["objects"]) for r in pg_checks.query(cursor, "fw_owners")]
-    if len(owners) > 1 and not all(sup for _, sup, _ in owners):
+    mixed = len(owners) > 1 and not all(sup for _, sup, _ in owners)
+    if mixed:
         diff.append("more than one owner (" + "; ".join(f"{o}: {objs}" for o, _, objs in owners)
                     + "): objects another role planted? drop those and re-run the migration")
-    return ("differ from the migration: " + "; ".join(diff)) if diff else None
+    # The same text as scan.ts firewallObjects().
+    return ("differ from the migration: " + "; ".join(diff) + ("" if mixed else ": re-run the migration")) if diff else None
 
 
 def _scan_postgres(cursor, tenant_col, excluded, opts) -> Dict[str, dict]:

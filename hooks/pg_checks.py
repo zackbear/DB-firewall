@@ -42,6 +42,8 @@ def parse_checks(text: str) -> Checks:
                 raise ValueError(f"checks: a second @query {name}")
             queries[name] = sql
         else:
+            if any(c.name == name for c in checks):
+                raise ValueError(f"checks: a second check {name}")
             checks.append(GlobalCheck(name, kind == "info", sql))
 
     for line in text.replace("\r\n", "\n").split("\n"):
@@ -65,7 +67,7 @@ def parse_checks(text: str) -> Checks:
 
 @lru_cache(maxsize=1)
 def CHECKS() -> Checks:
-    return parse_checks(CHECKS_FILE.read_text())
+    return parse_checks(CHECKS_FILE.read_text(encoding="utf-8"))
 
 
 def _pyformat(sql: str, params) -> tuple:
@@ -77,6 +79,8 @@ def _pyformat(sql: str, params) -> tuple:
         order.append(int(m.group(1)) - 1)
         return "%s"
     text = re.sub(r"\$(\d+)", ref, sql.replace("%", "%%"))
+    if set(order) != set(range(len(params))):     # as PostgreSQL: a missing or unused parameter fails
+        raise ValueError(f"checks: the query takes ${sorted(set(order))} but got {len(params)} parameter(s)")
     return text, tuple(params[i] for i in order)
 
 

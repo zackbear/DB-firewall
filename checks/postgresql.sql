@@ -384,6 +384,7 @@ SELECT EXISTS (SELECT 1 FROM pg_roles m WHERE pg_has_role(current_user, m.oid, '
 -- Every relation a role the app can use can read, outside the system schemas,
 -- with what decides whether it is tenant data. $1: the protected tables, as
 -- jsonb [[schema, table], ...]. safe: a protected table, or a sequence one owns.
+-- extension: the extension the relation belongs to, if any.
 -- For a security_invoker view, the walk down its chain through invoker views:
 -- broken when a view on it reads no relation, calls a function outside
 -- pg_catalog, or it reaches a system relation; blockers: the relations it
@@ -402,6 +403,9 @@ rel AS (
                  JOIN pg_proc f ON f.oid = d.refobjid AND f.pronamespace <> 'pg_catalog'::regnamespace
                  WHERE rw.ev_class = c.oid) AS calls_fn,
          c.oid IN (SELECT oid FROM prot) AS prot,
+         (SELECT e.extname FROM pg_depend d JOIN pg_extension e ON e.oid = d.refobjid
+          WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.refclassid = 'pg_extension'::regclass
+            AND d.deptype = 'e' LIMIT 1) AS extension,
          c.relkind = 'S' AND EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass
                                        AND d.objid = c.oid AND d.refclassid = 'pg_class'::regclass
                                        AND d.deptype IN ('a', 'i') AND d.refobjid IN (SELECT oid FROM prot)) AS prot_seq,
@@ -419,7 +423,7 @@ walk(top, cur) AS (
   SELECT r.oid, r.oid FROM rel r WHERE r.readable AND r.invoker
   UNION
   SELECT w.top, e.t FROM walk w JOIN rel x ON x.oid = w.cur AND x.invoker JOIN edge e ON e.v = w.cur)
-SELECT r.name, r.kind, r.invoker, r.prot OR r.prot_seq AS safe,
+SELECT r.name, r.kind, r.invoker, r.extension, r.prot OR r.prot_seq AS safe,
        r.invoker AND EXISTS (SELECT 1 FROM walk w LEFT JOIN rel x ON x.oid = w.cur WHERE w.top = r.oid
                                AND (x.oid IS NULL
                                     OR (x.invoker AND (x.calls_fn OR NOT EXISTS (SELECT 1 FROM edge e WHERE e.v = x.oid)))))

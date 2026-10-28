@@ -62,14 +62,16 @@ export function globMatch(pattern: string, name: string): boolean {
       if (pattern[j] === "]") j++;
       const end = pattern.indexOf("]", j);
       if (end < 0) { re += "\\["; continue; }
-      let body = pattern.slice(i + 1, end).replace(/\\/g, "\\\\");
+      // fnmatch drops a reversed range ([z-a]) instead of failing.
+      let body = pattern.slice(i + 1, end).replace(/(.)-(.)/g, (m, a, b) => (a > b ? "" : m)).replace(/\\/g, "\\\\");
       if (body.startsWith("!")) body = "^" + body.slice(1).replace(/[[\]]/g, "\\$&");
       else body = (body.startsWith("^") ? "\\" : "") + body.replace(/[[\]]/g, "\\$&");  // "^": a literal, as fnmatch reads it
       re += `[${body}]`;
       i = end;
     } else re += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
   }
-  try { return new RegExp(`^${re}$`).test(name); } catch { return false; }   // a reversed range ([z-a]): no match, as fnmatch
+  // "s": * and ? match a newline too, as in fnmatch.
+  try { return new RegExp(`^${re}$`, "s").test(name); } catch { return false; }
 }
 
 /**
@@ -133,10 +135,10 @@ export async function firewallObjects(client: pg.ClientBase): Promise<{ ok: bool
   const mixed = owners.length > 1 && owners.some((o) => !o.super);
   if (mixed) {
     diff.push(`more than one owner (${owners.map((o) => `${o.owner}: ${o.objects}`).join("; ")}): ` +
-              "objects another role planted? drop those and re-run migrate");
+              "objects another role planted? drop those and re-run the migration");
   }
   return { ok: diff.length === 0, detail: diff.length
-    ? `differ from the migration: ${diff.join("; ")}${mixed ? "" : ": re-run migrate"}`
+    ? `differ from the migration: ${diff.join("; ")}${mixed ? "" : ": re-run the migration"}`
     : "match the migration, one owner" };
 }
 

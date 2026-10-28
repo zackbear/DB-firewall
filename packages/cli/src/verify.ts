@@ -25,7 +25,8 @@ export async function roleChecks(client: pg.ClientBase): Promise<Check[]> {
   return out;
 }
 
-async function fileCheck(client: pg.ClientBase, c: GlobalCheck): Promise<Check> {
+/** One @check or @info block: ok only when the row says true (NULL fails). */
+export async function fileCheck(client: pg.ClientBase, c: GlobalCheck): Promise<Check> {
   const run = async () => {
     const { rows: [r] } = await client.query(c.sql);
     return { ok: r.ok === true, detail: String(r.detail) };
@@ -234,9 +235,8 @@ async function strictChecks(client: pg.ClientBase, protectedTables: TableReport[
   const readable = () => guard("strict: only tenant data readable", async () => {
     const { rows } = await client.query(q("strict_readable"),
                                         [JSON.stringify(protectedTables.map((t) => [t.schema, t.table]))]);
-    // --allow-query-text also accepts pg_stat_statements' own views.
-    const stats = (name: string) => allowQueryText && /\.pg_stat_statements(_info)?$/.test(name);
-    const bad = rows.filter((r) => !allowedRel(allow, r.name) && !stats(r.name) && !(
+    // --allow-query-text also accepts the views of the pg_stat_statements extension.
+    const bad = rows.filter((r) => !allowedRel(allow, r.name) && !(allowQueryText && r.extension === "pg_stat_statements") && !(
       r.safe || (r.invoker && !r.broken && (r.blockers as string[]).every((b) => allowedRel(allow, b)))))
       .map((r) => r.name as string).sort();
     return { ok: bad.length === 0, detail: bad.length
