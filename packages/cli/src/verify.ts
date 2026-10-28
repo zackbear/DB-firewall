@@ -94,7 +94,7 @@ export async function roleChecks(client: pg.ClientBase): Promise<Check[]> {
     // _firewall_* objects and pins search_path; nothing else should rely on that.
     // Information, never a failure: what one shared role allows that no
     // tenant check can see.
-    () => guard("signals other sessions (info)", async () => {
+    () => info("signals other sessions (info)", async () => {
       const { rows: [r] } = await client.query(
         `SELECT ${anyRole(`EXISTS (SELECT 1 FROM pg_proc p WHERE p.pronamespace = 'pg_catalog'::regnamespace
            AND p.proname IN ('pg_terminate_backend', 'pg_cancel_backend')
@@ -103,7 +103,7 @@ export async function roleChecks(client: pg.ClientBase): Promise<Check[]> {
         ? "yes: SQL one tenant runs can end or cancel another tenant's requests (availability only); " +
           "migrate --harden-signals revokes it" : "no (pg_terminate_backend / pg_cancel_backend revoked)" };
     }),
-    () => guard("role defaults (info)", async () => {
+    () => info("role defaults (info)", async () => {
       const { rows: [r] } = await client.query(
         `SELECT string_agg(ro.rolname || COALESCE(' in ' || d.datname, '') || ': ' || array_to_string(s.setconfig, ', '),
                            '; ' ORDER BY ro.rolname) AS set
@@ -153,6 +153,16 @@ export async function roleChecks(client: pg.ClientBase): Promise<Check[]> {
   const out: Check[] = [];
   for (const check of checks) out.push(await check());
   return out;
+}
+
+/** An information line: always ok, also when its query fails (say, an
+ *  unreadable catalog), so it can never change verify's result. */
+async function info(check: string, fn: () => Promise<{ ok: boolean; detail: string }>): Promise<Check> {
+  try {
+    return { table: "-", check, ...await fn(), ok: true };
+  } catch (err) {
+    return { table: "-", check, ok: true, detail: `could not read: ${msg(err)}` };
+  }
 }
 
 /** A global check; a query error fails it (a precondition that cannot be checked is not met). */
