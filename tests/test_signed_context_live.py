@@ -662,3 +662,34 @@ def test_ddl_guard_in_restrictive_mode():
         with psycopg.connect(DSN, autocommit=True) as c:
             c.execute(f"DROP TABLE IF EXISTS {SCHEMA}.rt")
         _migrate()
+
+
+def test_ddl_guard_with_many_tables():
+    """GRANT ALL ON ALL TABLES with 500 protected tables: the guard revokes
+    TRUNCATE and TRIGGER again without nesting a guard per REVOKE, and an
+    unrelated command stays cheap."""
+    import time
+    cfg = _cfg()
+    cfg["engines"]["postgresql"].update(ddl_guard=True)
+    try:
+        with psycopg.connect(DSN) as c:
+            run_migration(c, DBEngine.POSTGRESQL, cfg)
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"DO $$ BEGIN FOR i IN 1..500 LOOP "
+                      f"EXECUTE format('CREATE TABLE {SCHEMA}.m%s (id int, tenant_id text)', i); END LOOP; END $$")
+            c.execute(f"GRANT ALL ON ALL TABLES IN SCHEMA {SCHEMA} TO {ROLE}")
+            assert c.execute(f"SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                             f"WHERE n.nspname = '{SCHEMA}' AND c.relname ~ '^m[0-9]+$' "
+                             f"AND (has_table_privilege('{ROLE}', c.oid, 'TRUNCATE') "
+                             f"OR has_table_privilege('{ROLE}', c.oid, 'TRIGGER') "
+                             f"OR NOT has_table_privilege('{ROLE}', c.oid, 'SELECT'))").fetchone()[0] == 0
+            start = time.monotonic()
+            c.execute("CREATE TEMP TABLE sg_tmp (x int)")
+            assert time.monotonic() - start < 1.0          # generous: a set query, not a loop per table
+    finally:
+        _drop_guard()
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"DO $$ BEGIN FOR i IN 1..500 LOOP "
+                      f"EXECUTE format('DROP TABLE IF EXISTS {SCHEMA}.m%s', i); END LOOP; END $$")
+        _migrate()
+

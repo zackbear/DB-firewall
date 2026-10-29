@@ -196,12 +196,15 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
   (RLS off or not forced, a firewall policy dropped or altered, another
   permissive policy in permissive mode, a rule, the table moved, renamed out
   of scope, or given a parent, child or partition that is not protected).
-  After each command it checks every table in the protected schemas, so a
-  partition, a child, or a typed table that gets the column through
-  `ALTER TYPE ... CASCADE` is protected too. It binds every role but a
-  superuser and the migration's own role. Needs a superuser to install. It
-  does not stop a table owner's own trigger, which sees every tenant's
-  writes to that table.
+  It checks the tables each command names and their descendants, and after
+  a command that can change other tables (`ALTER TYPE ... CASCADE`, `CREATE
+  SCHEMA`, `GRANT ... ON ALL TABLES`) every table in the protected schemas,
+  so a partition, a child, or a typed table that gets the column is
+  protected too. It binds every role but a superuser and the migration's own
+  role. Needs a superuser to install. It does not stop code the table's
+  owner attaches to the table (a trigger, a CHECK constraint, a default, a
+  generated column, an index expression, a domain constraint): that code
+  runs on every tenant's writes, and can copy them out.
 * **Tenant column type.** The migration refuses a tenant column whose type
   belongs to a role that is not a superuser, or whose collation is not
   deterministic. The policies call that type's cast and equality, so the

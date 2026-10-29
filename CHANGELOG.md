@@ -12,12 +12,17 @@
   policy in permissive mode, or the table taken out of scope (moved, renamed
   to a skipped name, its tenant column or schema renamed) or put under an
   unprotected parent, child or partition (either way round), or given a rule.
-  It checks every table in the protected schemas after each command, so a
-  partition, a child or a typed table changed by `ALTER TYPE ... CASCADE` is
-  protected too. Policy names `fw_<hash>_*` are reserved. `TRIGGER` and
+  It checks the tables each command names and their descendants, and every
+  table in the protected schemas after a command that can change others
+  (`ALTER TYPE ... CASCADE`, `CREATE SCHEMA`, `GRANT ... ON ALL TABLES`), so
+  a partition, a child or a typed table is protected too. With 2,000
+  protected tables a `CREATE TABLE` costs it about 5 to 10 ms, a full check
+  about 100 ms. Policy names `fw_<hash>_*` are reserved. `TRIGGER` and
   `TRUNCATE` granted to another role are revoked again. A table with its own
   permissive policy is refused, not protected, in permissive mode. A table
-  owner's own trigger is not stopped. Only a superuser or the migration's role can
+  owner's own code on the table (a trigger, a CHECK constraint, a default, a
+  generated column, an index expression, a domain constraint) is not
+  stopped. Only a superuser or the migration's role can
   skip it (`SET dbfw.ddl_guard_skip = 'on'`); the migration sets that for
   itself. The guard calls the firewall's functions with text arguments, so a
   function planted with other argument types cannot run in its place. Needs

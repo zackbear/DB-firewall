@@ -387,7 +387,7 @@ BEGIN
         SELECT a.grantee, a.privilege_type FROM pg_class c, aclexplode(c.relacl) a
         WHERE c.oid = rel AND a.grantee <> c.relowner AND a.privilege_type IN ('TRIGGER', 'TRUNCATE')
     LOOP
-        EXECUTE format('REVOKE %s ON %s FROM %s', g.privilege_type, rel,
+        EXECUTE format('REVOKE %s ON %s FROM %s CASCADE', g.privilege_type, rel,
                        CASE g.grantee WHEN 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(g.grantee)) END);
     END LOOP;
 
@@ -433,10 +433,11 @@ $$ LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp;
 
 -- The DDL guard, at the end of every DDL command (section 11). A table counts
 -- as protected when it has firewall policies. After each command it checks
--- every table in the schemas this script protects (and every table the
--- command names), not only what the command names: ALTER TYPE ... CASCADE, a
--- new partition or child, or a column renamed on a parent change tables the
--- command does not report. A schema migrated by a version without
+-- the tables the command names and their descendants (a column added to or
+-- renamed on a parent changes its children too) and, after a command that
+-- can change tables it does not name (ALTER TYPE ... CASCADE, CREATE SCHEMA,
+-- GRANT ... ON ALL TABLES, any command not listed below), every table in
+-- the schemas this script protects. A schema migrated by a version without
 -- _firewall_protected_schemas is guarded once it is migrated again.
 --   * A table with the tenant column and no firewall policies is protected at
 --     once, the way this script would, so there is no window until the next
@@ -453,7 +454,9 @@ $$ LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp;
 --   * Inheritance and partitions: a protected table with a parent or a child
 --     that is not protected fails, either way round. Reading the parent shows
 --     the child's rows; a partition gets the rows written to the parent.
--- Not covered: a trigger the table's owner adds sees every tenant's writes.
+-- Not covered: code the table's owner attaches to it (a trigger, a CHECK
+-- constraint, a default, a generated column, an index expression, a domain
+-- constraint) runs on every tenant's writes, and can copy them out.
 -- It binds every role but a superuser and the role that owns this script's
 -- objects: only they can skip it (SET dbfw.ddl_guard_skip = 'on'), as this
 -- script does for itself. SECURITY DEFINER (its owner is a superuser, who
@@ -476,6 +479,8 @@ DECLARE
     rls BOOLEAN;
     forced BOOLEAN;
     reported OID[];
+    scope OID[];
+    whole BOOLEAN;
 BEGIN
     IF current_setting('dbfw.ddl_guard_skip', true) = 'on'
        AND ((SELECT rolsuper FROM pg_roles WHERE rolname = session_user)
@@ -484,11 +489,26 @@ BEGIN
                            'MEMBER')) THEN
         RETURN;
     END IF;
-    -- The tables the command names (a policy's table for a policy).
-    reported := ARRAY(SELECT CASE WHEN d.classid = 'pg_catalog.pg_policy'::regclass
-                                  THEN (SELECT polrelid FROM pg_policy WHERE oid = d.objid) ELSE d.objid END
+    -- The tables the command names (the table of a policy or a rule).
+    reported := ARRAY(SELECT CASE d.classid
+                                  WHEN 'pg_catalog.pg_policy'::regclass THEN (SELECT polrelid FROM pg_policy WHERE oid = d.objid)
+                                  WHEN 'pg_catalog.pg_rewrite'::regclass THEN (SELECT ev_class FROM pg_rewrite WHERE oid = d.objid)
+                                  ELSE d.objid END
                       FROM pg_event_trigger_ddl_commands() d
-                      WHERE d.classid IN ('pg_catalog.pg_class'::regclass, 'pg_catalog.pg_policy'::regclass));
+                      WHERE d.classid IN ('pg_catalog.pg_class'::regclass, 'pg_catalog.pg_policy'::regclass,
+                                          'pg_catalog.pg_rewrite'::regclass));
+    -- What to check. These commands change only the tables they name and,
+    -- through inheritance, their descendants: check those. Any other
+    -- command (ALTER TYPE ... CASCADE, CREATE SCHEMA, GRANT ... ON ALL
+    -- TABLES, an extension) checks every table in the protected schemas.
+    whole := TG_TAG NOT IN ('CREATE TABLE', 'CREATE TABLE AS', 'SELECT INTO', 'ALTER TABLE', 'CREATE FOREIGN TABLE',
+                            'ALTER FOREIGN TABLE', 'ALTER INDEX', 'ALTER VIEW', 'ALTER MATERIALIZED VIEW',
+                            'ALTER SEQUENCE', 'CREATE POLICY', 'ALTER POLICY', 'CREATE RULE', 'CREATE INDEX',
+                            'REINDEX', 'CREATE VIEW', 'CREATE SEQUENCE', 'CREATE FUNCTION', 'ALTER FUNCTION',
+                            'CREATE PROCEDURE', 'ALTER PROCEDURE', 'CREATE TRIGGER', 'ALTER TRIGGER', 'COMMENT');
+    scope := ARRAY(WITH RECURSIVE d(oid) AS (SELECT unnest(reported)
+                                             UNION SELECT i.inhrelid FROM pg_inherits i JOIN d ON i.inhparent = d.oid)
+                   SELECT oid FROM d);
     -- A renamed schema takes its protected tables out of what this script protects.
     FOR t IN
         SELECT n.oid, n.nspname::text AS nspname FROM pg_event_trigger_ddl_commands() d
@@ -508,15 +528,41 @@ BEGIN
         FROM pg_event_trigger_ddl_commands() d JOIN pg_policy p ON p.oid = d.objid
         JOIN pg_class c ON c.oid = p.polrelid JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE d.classid = 'pg_catalog.pg_policy'::regclass AND p.polname ~ '^fw_[0-9a-f]{12}_'
+          AND TG_TAG IN ('CREATE POLICY', 'ALTER POLICY')
     LOOP
         RAISE EXCEPTION 'DB Firewall: % on the policy % of %.%: policy names fw_<hash>_* are the firewall''s', TG_TAG, t.polname, t.nspname, t.relname
             USING HINT = 'Pick another name. Re-run the migration to change the firewall policies.';
     END LOOP;
+    -- One set query picks the tables that need work (normally none); the
+    -- loop then acts on each, so a command costs little with many tables.
     FOR t IN
-        SELECT c.oid, n.nspname::text AS nspname, c.relname::text AS relname
-        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE c.relkind IN ('r', 'p') AND c.relpersistence <> 't'
-          AND (n.nspname IN (SELECT schema_name FROM public._firewall_protected_schemas) OR c.oid = ANY (reported))
+        WITH c AS (
+            SELECT c.oid, n.nspname::text AS nspname, c.relname::text AS relname, c.relrowsecurity AS rls,
+                   c.relforcerowsecurity AS forced, c.relacl, c.relowner, ps.policy_mode,
+                   'fw_' || left(md5(n.nspname || '.' || c.relname), 12) AS st,
+                   ps.schema_name IS NOT NULL
+                   AND c.relname NOT LIKE '#_firewall#_%' ESCAPE '#'
+                   AND c.relname NOT IN ('schema_migrations', 'alembic_version', 'knex_migrations', 'prisma_migrations',
+                                         '__diesel_schema_migrations', 'flyway_schema_history')
+                   AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attname = ps.tenant_column
+                                 AND a.attnum > 0 AND NOT a.attisdropped) AS eligible
+            FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+            LEFT JOIN public._firewall_protected_schemas ps ON ps.schema_name = n.nspname
+            WHERE c.relkind IN ('r', 'p') AND c.relpersistence <> 't'
+              AND ((whole AND ps.schema_name IS NOT NULL) OR c.oid = ANY (scope)))
+        SELECT c.oid, c.nspname, c.relname FROM c
+        CROSS JOIN LATERAL (
+            SELECT count(*) FILTER (WHERE polname IN (c.st || '_sel', c.st || '_ins', c.st || '_upd', c.st || '_del')) AS n_have,
+                   count(*) FILTER (WHERE polname ~ fwpat) AS n_fw,
+                   count(*) FILTER (WHERE polpermissive AND polname NOT IN (c.st || '_sel', c.st || '_ins',
+                                                                            c.st || '_upd', c.st || '_del')) AS n_other
+            FROM pg_policy WHERE polrelid = c.oid) p
+        WHERE (c.eligible AND p.n_fw = 0)
+           OR (p.n_fw > 0 AND (NOT c.eligible OR p.n_have < 4 OR NOT c.rls OR NOT c.forced
+                               OR (c.policy_mode = 'permissive' AND p.n_other > 0)
+                               OR EXISTS (SELECT 1 FROM pg_rewrite r WHERE r.ev_class = c.oid AND r.rulename <> '_RETURN')
+                               OR EXISTS (SELECT 1 FROM aclexplode(c.relacl) a WHERE a.grantee <> c.relowner
+                                            AND a.privilege_type IN ('TRIGGER', 'TRUNCATE'))))
         ORDER BY c.oid
     LOOP
         SELECT * INTO s FROM public._firewall_protected_schemas WHERE schema_name = t.nspname;
@@ -569,14 +615,18 @@ BEGIN
             RAISE EXCEPTION 'DB Firewall: % leaves a rule on %.%: a rule runs on every tenant''s rows', TG_TAG, t.nspname, t.relname
                 USING HINT = 'Drop the rule. Use a view or a restrictive policy instead.';
         END IF;
+        -- The triggers pause here too: REVOKE is DDL, and a guard per REVOKE
+        -- would nest once per table (GRANT ... ON ALL TABLES).
+        ALTER EVENT TRIGGER _firewall_ddl_guard DISABLE;
         FOR g IN
-            SELECT a.grantee, a.privilege_type FROM pg_class c, aclexplode(c.relacl) a
+            SELECT DISTINCT a.grantee, a.privilege_type FROM pg_class c, aclexplode(c.relacl) a
             WHERE c.oid = t.oid AND a.grantee <> c.relowner AND a.privilege_type IN ('TRIGGER', 'TRUNCATE')
         LOOP
-            EXECUTE format('REVOKE %s ON %s FROM %s', g.privilege_type, t.oid::regclass,
+            EXECUTE format('REVOKE %s ON %s FROM %s CASCADE', g.privilege_type, t.oid::regclass,
                            CASE g.grantee WHEN 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(g.grantee)) END);
             RAISE NOTICE 'DB Firewall: % on %.% revoked again: only the owner keeps it (DDL guard)', g.privilege_type, t.nspname, t.relname;
         END LOOP;
+        ALTER EVENT TRIGGER _firewall_ddl_guard ENABLE ALWAYS;
     END LOOP;
     -- A protected table and a parent or child that is not protected.
     FOR t IN
@@ -584,9 +634,9 @@ BEGIN
                EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = i.inhparent AND p.polname ~ fwpat) AS parent_protected
         FROM pg_inherits i JOIN pg_class ch ON ch.oid = i.inhrelid JOIN pg_class pa ON pa.oid = i.inhparent
         WHERE ch.relpersistence <> 't'
-          AND (i.inhparent = ANY (reported) OR i.inhrelid = ANY (reported)
-               OR EXISTS (SELECT 1 FROM pg_namespace n JOIN public._firewall_protected_schemas ps ON ps.schema_name = n.nspname
-                          WHERE n.oid IN (ch.relnamespace, pa.relnamespace)))
+          AND (i.inhparent = ANY (scope) OR i.inhrelid = ANY (scope)
+               OR (whole AND EXISTS (SELECT 1 FROM pg_namespace n JOIN public._firewall_protected_schemas ps ON ps.schema_name = n.nspname
+                                     WHERE n.oid IN (ch.relnamespace, pa.relnamespace))))
           AND EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = i.inhparent AND p.polname ~ fwpat)
               <> EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = i.inhrelid AND p.polname ~ fwpat)
         LIMIT 1
