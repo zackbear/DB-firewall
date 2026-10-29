@@ -584,6 +584,20 @@ def test_ddl_guard_resists_a_table_owner():
             f"CREATE TABLE {SCHEMA}.t3 (id int, tenant_id sg_other.tid)",
             f"CREATE COLLATION sg_other.ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false); "
             f"CREATE TABLE {SCHEMA}.t4 (id int, tenant_id text COLLATE sg_other.ci)",
+            # A rule that comes along when the table is protected for the first time.
+            f"CREATE TABLE sg_other.orders (id int, tenant_id text); CREATE TABLE sg_other.sink2 (id int, t text); "
+            f"CREATE RULE r2 AS ON INSERT TO sg_other.orders DO ALSO INSERT INTO sg_other.sink2 VALUES (NEW.id, NEW.tenant_id); "
+            f"ALTER TABLE sg_other.orders SET SCHEMA {SCHEMA}",
+            f"CREATE TABLE {SCHEMA}.r3 (id int); CREATE TABLE sg_other.sink3 (id int); "
+            f"CREATE RULE r3 AS ON INSERT TO {SCHEMA}.r3 DO ALSO INSERT INTO sg_other.sink3 VALUES (NEW.id); "
+            f"ALTER TABLE {SCHEMA}.r3 ADD COLUMN tenant_id text",
+            # Commands that rename a table or a column under another tag.
+            f"ALTER INDEX {SCHEMA}.bait RENAME TO schema_migrations",
+            f"ALTER VIEW {SCHEMA}.bait RENAME COLUMN tenant_id TO tid",
+            f"ALTER MATERIALIZED VIEW {SCHEMA}.bait RENAME COLUMN tenant_id TO tid",
+            f"CREATE TABLE {SCHEMA}.schema_migrations (id int, tenant_id text); "
+            f"CREATE POLICY open ON {SCHEMA}.schema_migrations USING (true); "
+            f"ALTER INDEX {SCHEMA}.schema_migrations RENAME TO invoices",
             f"ALTER POLICY {stem}_sel ON {SCHEMA}.bait RENAME TO mine",
             f"CREATE POLICY {stem}_x ON {SCHEMA}.bait USING (true)",                  # named like the stem
             f"ALTER TABLE {SCHEMA}.bait RENAME COLUMN tenant_id TO tid",

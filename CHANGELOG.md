@@ -3,7 +3,8 @@
 ## 2026-10-29: DDL guard and key checks (PR #18)
 
 - **`migrate --ddl-guard`** (`dbfw.ddl_guard`, `engines.postgresql.ddl_guard`):
-  two event triggers. In a schema the migration protects, a table with the
+  two event triggers, on every DDL command (`ALTER INDEX` and `ALTER VIEW`
+  can also rename a table or its columns). In a schema the migration protects, a table with the
   tenant column and no firewall policies (created, renamed, or given the
   column) is protected at the end of the command. A command that weakens a
   protected table fails: RLS off or not forced, a firewall policy dropped or
@@ -33,10 +34,10 @@
 - **`verify`: keys include the tenant.** Unique keys and foreign keys to
   protected tables that leave out the tenant column are listed (an
   information line; `--strict` fails), in both tools, exclusion constraints
-  included (the tenant column counts there only with `=`). A foreign key passes only when the referencing table's tenant
-  column fills the referenced one. A single-column key on an identity, a
+  included (the tenant column counts there only with `=`). A foreign key passes only when the referencing table is
+  protected and its tenant column fills the referenced one. A single-column key on an identity, a
   sequence or a uuid default is not listed. A new information line reports the DDL guard.
-- **Corpus:** 100 attacks and 7 safe patterns.
+- **Corpus:** 101 attacks and 7 safe patterns.
 - **`scan`:** the Python predicate message matches the Node one (parity).
 
 ## 2026-10-28: one set of PostgreSQL checks, and `python -m hooks.verify` (PR #17)

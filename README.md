@@ -205,8 +205,8 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
 * **Tenant column type.** The migration refuses a tenant column whose type
   belongs to a role that is not a superuser, or whose collation is not
   deterministic. The policies call that type's cast and equality, so the
-  type's owner would decide which tenant's rows a session sees. Use text,
-  varchar, uuid or an integer type.
+  type's owner would decide which tenant's rows a session sees. Use text or
+  varchar.
 * **Keys that tell on other tenants.** A unique key, or a foreign key to a
   protected table, that leaves out the tenant column still sees every
   tenant's rows: a duplicate error, or a missing parent, shows the app that

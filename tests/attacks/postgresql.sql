@@ -934,6 +934,16 @@ ALTER TABLE {S}.docs ADD COLUMN span int4range, ADD CONSTRAINT docs_span EXCLUDE
 -- @undo
 ALTER TABLE {S}.docs DROP COLUMN span;
 
+-- @attack a foreign key from a table that is not protected (its tenant column takes any value)
+-- @check -: strict: keys include the tenant
+-- @mode strict
+-- @setup
+ALTER TABLE {S}.docs ADD CONSTRAINT docs_tenant_id UNIQUE (tenant_id, id);
+CREATE SCHEMA {S}_other;
+CREATE TABLE {S}_other.probe (pid int, tenant_id text, FOREIGN KEY (tenant_id, pid) REFERENCES {S}.docs (tenant_id, id));
+-- @undo
+DROP SCHEMA {S}_other CASCADE; ALTER TABLE {S}.docs DROP CONSTRAINT docs_tenant_id;
+
 -- @attack an exclusion constraint on the tenant column with an operator other than =
 -- @check -: strict: keys include the tenant
 -- @mode strict

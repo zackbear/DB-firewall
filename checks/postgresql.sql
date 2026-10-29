@@ -393,9 +393,9 @@ ORDER BY 1
 --   identity column, or a default from a sequence or a uuid function) is not
 --   counted: a duplicate then shows only that an id is taken (an app that
 --   sends its own ids can still learn which ids exist).
--- * A foreign key from any table to a protected one whose referenced tenant
---   column is not filled by a column of that name in the referencing table
---   (else the app can probe another tenant's rows with its own value there).
+-- * A foreign key to a protected table, unless the referencing table is
+--   protected too and its tenant column fills the referenced one (else the
+--   app can probe another tenant's rows with that tenant's value there).
 WITH prot AS (
   SELECT c.oid, n.nspname || '.' || c.relname AS name, a.attnum AS att
   FROM jsonb_array_elements($1::jsonb) e
@@ -417,7 +417,8 @@ WHERE NOT EXISTS (SELECT 1 FROM generate_series(0, x.indnkeyatts - 1) k WHERE x.
 UNION ALL
 SELECT 'foreign key ' || con.conname || ' on ' || con.conrelid::regclass::text || ' to ' || p.name
 FROM prot p JOIN pg_constraint con ON con.confrelid = p.oid AND con.contype = 'f'
-WHERE NOT EXISTS (SELECT 1 FROM generate_subscripts(con.confkey, 1) k
+WHERE con.conrelid NOT IN (SELECT oid FROM prot)    -- else its policies do not pin that column
+   OR NOT EXISTS (SELECT 1 FROM generate_subscripts(con.confkey, 1) k
                   JOIN pg_attribute ca ON ca.attrelid = con.conrelid AND ca.attnum = con.conkey[k]
                   WHERE con.confkey[k] = p.att AND ca.attname = $2)
 ORDER BY 1

@@ -365,7 +365,7 @@ BEGIN
        OR NOT coalesce((SELECT collisdeterministic FROM pg_collation WHERE oid = coll), true) THEN
         RAISE EXCEPTION 'DB Firewall: the tenant column %.%.% has the type % and the collation %: it needs a built-in or extension type and a deterministic collation',
             p_schema, p_table, p_column, typ::regtype, coalesce(coll::regcollation::text, '-')
-            USING HINT = 'Use text, varchar, uuid or an integer type for the tenant column.';
+            USING HINT = 'Use text or varchar for the tenant column.';
     END IF;
 
     -- (SELECT f()) runs once per query (an InitPlan), not once per row.
@@ -431,8 +431,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp;
 
--- The DDL guard, at the end of every command that can create, change or move
--- a table, a policy, a grant or a rule (section 11 lists them). A table counts
+-- The DDL guard, at the end of every DDL command (section 11). A table counts
 -- as protected when it has firewall policies. After each command it checks
 -- every table in the schemas this script protects (and every table the
 -- command names), not only what the command names: ALTER TYPE ... CASCADE, a
@@ -545,7 +544,7 @@ BEGIN
             ALTER EVENT TRIGGER _firewall_ddl_guard ENABLE ALWAYS;
             ALTER EVENT TRIGGER _firewall_ddl_drop_guard ENABLE ALWAYS;
             RAISE NOTICE 'DB Firewall: RLS applied to %.% (DDL guard)', t.nspname, t.relname;
-            CONTINUE;
+            -- On to the checks below: a table protected just now can bring a rule along.
         ELSIF NOT eligible THEN
             RAISE EXCEPTION 'DB Firewall: % takes the protected table %.% out of what the migration protects (its schema, a name it skips, or its tenant column changed)', TG_TAG, t.nspname, t.relname
                 USING HINT = 'Undo the change, or drop the firewall policies with the migration''s role first.';
@@ -937,10 +936,9 @@ BEGIN
     END IF;
     DROP EVENT TRIGGER IF EXISTS _firewall_ddl_guard;       -- created again: its tags may have changed
     IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_event_trigger WHERE evtname = '_firewall_ddl_guard') THEN
+        -- Every command, no tag list: ALTER INDEX and ALTER VIEW also rename
+        -- a table or its columns, and a list would miss the next such path.
         CREATE EVENT TRIGGER _firewall_ddl_guard ON ddl_command_end
-            WHEN TAG IN ('CREATE TABLE', 'CREATE TABLE AS', 'SELECT INTO', 'ALTER TABLE', 'CREATE FOREIGN TABLE',
-                         'ALTER FOREIGN TABLE', 'CREATE SCHEMA', 'ALTER SCHEMA', 'ALTER TYPE', 'CREATE POLICY',
-                         'ALTER POLICY', 'CREATE RULE', 'GRANT')
             EXECUTE FUNCTION public._firewall_ddl_guard();
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_event_trigger WHERE evtname = '_firewall_ddl_drop_guard') THEN
