@@ -188,6 +188,47 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
   backend signals. It refuses when the app role owns the database or any
   object in it, or keeps one of these through a role it is a member of. Both cover the whole database;
   `--harden` needs a superuser.
+* **DDL guard.** `npx db-firewall migrate --ddl-guard` (or
+  `engines.postgresql.ddl_guard: true`) installs two event triggers: a new
+  table with the tenant column in a protected schema is protected at the end
+  of the `CREATE TABLE` (or `ALTER TABLE ... ADD COLUMN`, or a rename), not at
+  the next migration run, and a change that weakens a protected table fails
+  (RLS off or not forced, a firewall policy dropped or altered, another
+  permissive policy in permissive mode, a rule, the table moved, renamed out
+  of scope, or given a parent, child or partition that is not protected).
+  It checks the tables each command names and their descendants, and after
+  a command that can change other tables (`ALTER TYPE ... CASCADE`, `CREATE
+  SCHEMA`, `GRANT ... ON ALL TABLES`) every table in the protected schemas,
+  so a partition, a child, or a typed table that gets the column is
+  protected too. It binds every role but a superuser and the migration's own
+  role. Needs a superuser to install. It does not stop code the table's
+  owner attaches to the table (a trigger, a CHECK constraint, a default, a
+  generated column, an index expression, a domain constraint): that code
+  runs on every tenant's writes, and can copy them out. PostgreSQL fires no
+  event trigger for `EXPLAIN ANALYZE CREATE TABLE AS` (or `SELECT INTO`): a
+  table made that way stays open until the next DDL command in the
+  database, which protects it, and `verify` fails on it until then. With
+  default privileges that grant the app role access to new tables, the app
+  can read and write such a table until then. So the guard is a safety net
+  for migrations, not a boundary against a role that holds `CREATE` on a
+  protected schema and means harm: keep `CREATE` there to the roles that run
+  migrations. The
+  guard also refuses a `public._firewall_*` object of another role (an
+  overload of a firewall function makes its calls ambiguous).
+* **Tenant column type.** The migration refuses a tenant column whose type
+  belongs to a role that is not a superuser, or whose collation is not
+  deterministic. The policies call that type's cast and equality, so the
+  type's owner would decide which tenant's rows a session sees. Use text or
+  varchar.
+* **Keys that tell on other tenants.** A unique key, or a foreign key to a
+  protected table, that leaves out the tenant column still sees every
+  tenant's rows: a duplicate error, or a missing parent, shows the app that
+  another tenant has the value. `verify` lists them, exclusion constraints
+  included (the tenant column counts there only with `=`), and `--strict`
+  fails on them. A one-column key on a sequence, identity or uuid default is
+  not listed, but an app that sends its own ids can still learn which ids
+  exist. Put the tenant column in the key, and
+  reference `(tenant_id, id)`, not `id`.
 * **One role for all tenants.** Sessions of the same role can read each
   other's current query text in `pg_stat_activity`, and can end or cancel each
   other's backends (`pg_terminate_backend`). An app role can also change its

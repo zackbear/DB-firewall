@@ -34,6 +34,10 @@ Options:
                      any grantor (what verify fails on); needs a superuser.
                      Refuses if --app-role owns the database, a schema or a table
   --app-role <name>  migrate --harden: the app's role, revoked from as well
+  --ddl-guard        migrate: install event triggers that protect a new table
+                     with the tenant column at once, and refuse a change that
+                     weakens a protected table (RLS off, a firewall policy
+                     dropped or altered); needs a superuser
   --tenant <id>      verify: a tenant id that has rows in your data
   --write-probe      verify: also try a cross-tenant insert (rolled back, but it
                      fires BEFORE INSERT triggers and uses up a sequence value)
@@ -64,7 +68,7 @@ async function main(argv: string[]): Promise<number> {
     options: {
       url: { type: "string" }, column: { type: "string" }, schema: { type: "string", multiple: true },
       "write-probe": { type: "boolean" }, "harden-signals": { type: "boolean" },
-      harden: { type: "boolean" }, "app-role": { type: "string" },
+      harden: { type: "boolean" }, "app-role": { type: "string" }, "ddl-guard": { type: "boolean" },
       "allow-global": { type: "string", multiple: true }, "allow-query-text": { type: "boolean" },
       mode: { type: "string" }, context: { type: "string" }, tenant: { type: "string" },
       exclude: { type: "string", multiple: true },
@@ -95,7 +99,7 @@ async function main(argv: string[]): Promise<number> {
       for (const schema of values.schema?.length ? values.schema : ["public"]) {
         await migrate(client, { schema, column: values.column, mode: values.mode, context,
                                 hardenSignals: values["harden-signals"], harden: values.harden,
-                                appRole: values["app-role"] });
+                                appRole: values["app-role"], ddlGuard: values["ddl-guard"] });
       }
       const result = await scan(client, common);
       print(values.json, { migrated: true, ...result }, () => `Migration applied. ` +

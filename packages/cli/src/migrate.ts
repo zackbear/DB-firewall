@@ -7,7 +7,7 @@ export const MIGRATION = new URL("../sql/001_postgresql.sql", import.meta.url);
 
 export async function migrate(client: pg.ClientBase, opts: {
   schema?: string; column?: string; mode?: string; context?: string; hardenSignals?: boolean;
-  harden?: boolean; appRole?: string;
+  harden?: boolean; appRole?: string; ddlGuard?: boolean;
 } = {}): Promise<void> {
   const mode = (opts.mode ?? "permissive").toLowerCase();
   if (mode !== "permissive" && mode !== "restrictive") {
@@ -33,9 +33,10 @@ export async function migrate(client: pg.ClientBase, opts: {
     "SELECT set_config('dbfw.tenant_column', $1, false), set_config('dbfw.schema', $2, false), " +
     "set_config('dbfw.policy_mode', $3, false), set_config('dbfw.context', $4, false), " +
     "set_config('dbfw.tenant_key', $5, false), set_config('dbfw.harden_signals', $6, false), " +
-    "set_config('dbfw.harden', $7, false), set_config('dbfw.app_role', $8, false)",
+    "set_config('dbfw.harden', $7, false), set_config('dbfw.app_role', $8, false), " +
+    "set_config('dbfw.ddl_guard', $9, false)",
     [opts.column ?? "tenant_id", opts.schema ?? "public", mode, context, key?.toString("hex") ?? "",
-     opts.hardenSignals ? "on" : "off", opts.harden ? "on" : "off", opts.appRole ?? ""]);
+     opts.hardenSignals ? "on" : "off", opts.harden ? "on" : "off", opts.appRole ?? "", opts.ddlGuard ? "on" : "off"]);
   try {
     await client.query(readFileSync(MIGRATION, "utf8"));
   } catch (err) {

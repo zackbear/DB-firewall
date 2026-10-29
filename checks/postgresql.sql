@@ -107,9 +107,11 @@ SELECT count(*) = 0 AS ok,
 FROM bad
 
 -- @check cannot write firewall tables
--- The app could add itself as a bypass role, or map itself to a tenant.
+-- The app could add itself as a bypass role, map itself to a tenant, or take
+-- a schema out of the DDL guard.
 WITH bad AS (
-  SELECT t AS name FROM unnest(ARRAY['public._firewall_bypass_roles', 'public._firewall_tenant_map']) t
+  SELECT t AS name FROM unnest(ARRAY['public._firewall_bypass_roles', 'public._firewall_tenant_map',
+                                     'public._firewall_protected_schemas', 'public._firewall_guard_calls']) t
   WHERE to_regclass(t) IS NOT NULL
     AND EXISTS (SELECT 1 FROM pg_roles m WHERE pg_has_role(current_user, m.oid, 'MEMBER')
                   AND (has_any_column_privilege(m.oid, t, 'INSERT') OR has_any_column_privilege(m.oid, t, 'UPDATE')
@@ -191,6 +193,17 @@ SELECT true AS ok,
 FROM pg_db_role_setting s JOIN pg_roles ro ON ro.oid = s.setrole
 LEFT JOIN pg_database d ON d.oid = s.setdatabase
 WHERE pg_has_role(current_user, s.setrole, 'MEMBER') AND (s.setdatabase = 0 OR d.datname = current_database())
+
+-- @info DDL guard (info)
+-- migrate --ddl-guard: two event triggers protect a new table at once and
+-- refuse a change that weakens a protected one.
+SELECT true AS ok,
+       CASE WHEN (SELECT count(*) FROM pg_event_trigger
+                  WHERE evtname IN ('_firewall_ddl_guard', '_firewall_ddl_drop_guard') AND evtenabled <> 'D') = 2
+            THEN 'on: a new table with the tenant column is protected at once, and a change that weakens a '
+                 || 'protected table fails, for every role but a superuser and the migration''s'
+            ELSE 'off (migrate --ddl-guard installs it: a new table is then protected at once, not at the next '
+                 || 'migration run)' END AS detail
 
 -- @check cannot create triggers
 -- TRIGGER on a table lets the app attach a deferred trigger: it fires at
@@ -365,6 +378,49 @@ WHERE c.relkind IN ('r', 'p') AND NOT (n.nspname = ANY($1))
                 AND has_any_column_privilege(m.oid, c.oid, 'SELECT'))
   AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attname = $2
                 AND a.attnum > 0 AND NOT a.attisdropped)
+ORDER BY 1
+
+-- @query keys_without_tenant
+-- Keys that are not scoped to the tenant: RLS hides other tenants' rows, but
+-- a unique key or an exclusion constraint still refuses a duplicate of their
+-- value, and a foreign key still finds (or misses) their parent row, so the
+-- error tells the app that another tenant has the value. $1: the protected
+-- tables, as jsonb [[schema, table], ...]; $2: the tenant column.
+-- * A unique index (primary keys included) or exclusion constraint on the
+--   table whose key columns leave out the tenant column (a tenant column only
+--   in INCLUDE, or in an exclusion constraint with an operator other than =,
+--   does not count). A single-column key on a generated value (an
+--   identity column, or a default from a sequence or a uuid function) is not
+--   counted: a duplicate then shows only that an id is taken (an app that
+--   sends its own ids can still learn which ids exist).
+-- * A foreign key to a protected table, unless the referencing table is
+--   protected too and its tenant column fills the referenced one (else the
+--   app can probe another tenant's rows with that tenant's value there).
+WITH prot AS (
+  SELECT c.oid, n.nspname || '.' || c.relname AS name, a.attnum AS att
+  FROM jsonb_array_elements($1::jsonb) e
+  JOIN pg_namespace n ON n.nspname = e->>0 JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = e->>1
+  JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = $2 AND a.attnum > 0 AND NOT a.attisdropped)
+SELECT CASE WHEN x.indisexclusion THEN 'exclusion constraint ' ELSE 'unique key ' END
+       || i.relname || ' on ' || p.name AS item
+FROM prot p JOIN pg_index x ON x.indrelid = p.oid AND (x.indisunique OR x.indisexclusion)
+JOIN pg_class i ON i.oid = x.indexrelid
+WHERE NOT EXISTS (SELECT 1 FROM generate_series(0, x.indnkeyatts - 1) k WHERE x.indkey[k] = p.att
+                    AND (NOT x.indisexclusion   -- an exclusion constraint counts it only with =
+                         OR EXISTS (SELECT 1 FROM pg_constraint xc JOIN pg_operator o ON o.oid = xc.conexclop[k + 1]
+                                    WHERE xc.conindid = x.indexrelid AND o.oprname = '=')))
+  AND NOT (x.indnkeyatts = 1 AND x.indkey[0] <> 0 AND NOT x.indisexclusion
+           AND EXISTS (SELECT 1 FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+                       WHERE a.attrelid = p.oid AND a.attnum = x.indkey[0]
+                         AND (a.attidentity <> ''
+                              OR pg_get_expr(d.adbin, d.adrelid) ~ '^((public|extensions)\.)?(nextval|gen_random_uuid|uuid_generate_v[14])\(')))
+UNION ALL
+SELECT 'foreign key ' || con.conname || ' on ' || con.conrelid::regclass::text || ' to ' || p.name
+FROM prot p JOIN pg_constraint con ON con.confrelid = p.oid AND con.contype = 'f'
+WHERE con.conrelid NOT IN (SELECT oid FROM prot)    -- else its policies do not pin that column
+   OR NOT EXISTS (SELECT 1 FROM generate_subscripts(con.confkey, 1) k
+                  JOIN pg_attribute ca ON ca.attrelid = con.conrelid AND ca.attnum = con.conkey[k]
+                  WHERE con.confkey[k] = p.att AND ca.attname = $2)
 ORDER BY 1
 
 -- @query query_text

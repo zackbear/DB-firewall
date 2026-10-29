@@ -178,6 +178,11 @@ engines:
     # Database-wide; needs a superuser.
     harden: false
     app_role: null
+    # true: install the DDL guard (event triggers): a new table with the
+    # tenant column is protected at once, and a change that weakens a
+    # protected table (RLS off, a firewall policy dropped or altered, another
+    # permissive policy) fails. Needs a superuser.
+    ddl_guard: false
   mysql:
     use_views: true
     schema: null

@@ -458,3 +458,263 @@ def test_harden_options_are_checked(pg, match):
     from middleware.db_firewall.config import validate_config
     with pytest.raises(ValueError, match=match):
         validate_config({"engines": {"postgresql": pg}})
+
+
+def _drop_guard():
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute("DROP EVENT TRIGGER IF EXISTS _firewall_ddl_guard")
+        c.execute("DROP EVENT TRIGGER IF EXISTS _firewall_ddl_drop_guard")
+
+
+def _npol(c, rel):
+    return c.execute(f"SELECT count(*) FROM pg_policy WHERE polrelid = '{rel}'::regclass").fetchone()[0]
+
+
+def test_ddl_guard_protects_new_tables_and_refuses_weakening():
+    """Event triggers are database-wide: the test removes them at the end."""
+    cfg = _cfg()
+    cfg["engines"]["postgresql"].update(ddl_guard=True)
+    try:
+        with psycopg.connect(DSN) as c:
+            run_migration(c, DBEngine.POSTGRESQL, cfg)
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"CREATE TABLE {SCHEMA}.later (id int, tenant_id text)")
+            c.execute(f"INSERT INTO {SCHEMA}.later VALUES (1, 'A'), (2, 'B')")
+            c.execute(f"GRANT SELECT ON {SCHEMA}.later TO {ROLE}")
+        assert scan_tables(psycopg.connect(DSN), DBEngine.POSTGRESQL, _cfg())["later"]["protected"]
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"CREATE TABLE {SCHEMA}.cta AS SELECT 1 AS id, 'A'::text AS tenant_id")
+            assert _npol(c, f"{SCHEMA}.cta") == 4
+            c.execute(f"DROP TABLE {SCHEMA}.cta")
+        stem = psycopg.connect(DSN).execute(f"SELECT 'fw_' || left(md5('{SCHEMA}.later'), 12)").fetchone()[0]
+        refused = [f"ALTER TABLE {SCHEMA}.later DISABLE ROW LEVEL SECURITY",
+                   f"ALTER TABLE {SCHEMA}.later NO FORCE ROW LEVEL SECURITY",
+                   f"DROP POLICY {stem}_sel ON {SCHEMA}.later",
+                   f"ALTER POLICY {stem}_sel ON {SCHEMA}.later USING (true)",
+                   f"CREATE POLICY open_all ON {SCHEMA}.later USING (true)",             # permissive mode: ORs
+                   f"ALTER TABLE {SCHEMA}.later DROP COLUMN tenant_id CASCADE"]
+        for sql in refused:
+            with psycopg.connect(DSN, autocommit=True) as c, pytest.raises(psycopg.Error, match="DB Firewall"):
+                c.execute(sql)
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"CREATE POLICY narrow ON {SCHEMA}.later AS RESTRICTIVE USING (id > 0)")   # narrows: fine
+            c.execute(f"DROP POLICY narrow ON {SCHEMA}.later")
+            c.execute(f"ALTER TABLE {SCHEMA}.later RENAME TO later2")                       # protected again
+        assert scan_tables(psycopg.connect(DSN), DBEngine.POSTGRESQL, _cfg())["later2"]["protected"]
+        with psycopg.connect(DSN) as c:                                                     # a re-run passes the guard
+            run_migration(c, DBEngine.POSTGRESQL, cfg)
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"DROP TABLE {SCHEMA}.later2")                                       # dropping the table is fine
+    finally:
+        _drop_guard()
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"DROP TABLE IF EXISTS {SCHEMA}.later, {SCHEMA}.later2")
+
+
+def test_ddl_guard_is_a_boolean():
+    from middleware.db_firewall.config import validate_config
+    with pytest.raises(ValueError, match="ddl_guard"):
+        validate_config({"engines": {"postgresql": {"ddl_guard": "yes"}}})
+
+
+def test_ddl_guard_resists_a_table_owner():
+    """Review findings for PR 18: a role that owns a table in a protected
+    schema, and can CREATE in public, cannot use the guard to become a
+    superuser, skip it, or take its table out of protection."""
+    cfg = _cfg()
+    cfg["engines"]["postgresql"].update(ddl_guard=True)
+    atk = "sg_atk"
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute(f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{atk}') "
+                  f"THEN CREATE ROLE {atk} LOGIN; END IF; END $$")
+        c.execute(f"GRANT CREATE, USAGE ON SCHEMA public, {SCHEMA} TO {atk}")
+        c.execute("DROP SCHEMA IF EXISTS sg_other CASCADE; CREATE SCHEMA sg_other")
+        c.execute(f"GRANT CREATE, USAGE ON SCHEMA sg_other TO {atk}")
+    try:
+        with psycopg.connect(DSN) as c:
+            run_migration(c, DBEngine.POSTGRESQL, cfg)
+        with psycopg.connect(f"{DSN} user={atk}", autocommit=True) as c:
+            # A planted overload with name arguments, an exact match for the old
+            # call: refused when created (the guard also calls with text casts).
+            with pytest.raises(psycopg.Error, match="a name the firewall keeps"):
+                c.execute("CREATE FUNCTION public._firewall_protect(a name, b name, x text, y text, z text) RETURNS void "
+                          f"LANGUAGE plpgsql AS $f$ BEGIN EXECUTE 'ALTER ROLE {atk} SUPERUSER'; END $f$")
+            c.execute(f"CREATE TABLE {SCHEMA}.bait (id int, tenant_id text)")
+        with psycopg.connect(DSN, autocommit=True) as c:
+            assert c.execute(f"SELECT rolsuper FROM pg_roles WHERE rolname = '{atk}'").fetchone()[0] is False
+            assert c.execute(f"SELECT count(*) FROM pg_policy WHERE polrelid = '{SCHEMA}.bait'::regclass").fetchone()[0] == 4
+        stem = psycopg.connect(DSN).execute(f"SELECT 'fw_' || left(md5('{SCHEMA}.bait'), 12)").fetchone()[0]
+        with psycopg.connect(f"{DSN} user={atk}", autocommit=True) as c:
+            # Tables the command does not name get the tenant column: each is
+            # protected by the end of that command, not by a later one.
+            for sql, tables in [
+                (f"CREATE TABLE {SCHEMA}.pp (id int, tenant_id text) PARTITION BY LIST (tenant_id)", ["pp"]),
+                (f"CREATE TABLE {SCHEMA}.pp_d PARTITION OF {SCHEMA}.pp DEFAULT", ["pp_d"]),
+                (f"CREATE TABLE {SCHEMA}.par (id int); CREATE TABLE {SCHEMA}.kid () INHERITS ({SCHEMA}.par); "
+                 f"ALTER TABLE {SCHEMA}.par ADD COLUMN tenant_id text", ["par", "kid"]),
+                (f"CREATE TYPE {SCHEMA}.ct AS (id int); CREATE TABLE {SCHEMA}.typed OF {SCHEMA}.ct; "
+                 f"ALTER TYPE {SCHEMA}.ct ADD ATTRIBUTE tenant_id text CASCADE", ["typed"]),
+                (f"CREATE TABLE {SCHEMA}.lp (id int, tid text) PARTITION BY LIST (id); "
+                 f"CREATE TABLE {SCHEMA}.lp1 PARTITION OF {SCHEMA}.lp FOR VALUES IN (1); "
+                 f"ALTER TABLE {SCHEMA}.lp RENAME COLUMN tid TO tenant_id", ["lp", "lp1"]),
+            ]:
+                c.execute(sql)
+                for t in tables:
+                    assert _npol(c, f"{SCHEMA}.{t}") == 4, t
+            c.execute(f"GRANT TRUNCATE, TRIGGER ON {SCHEMA}.bait TO {ROLE}")              # revoked again
+            assert c.execute(f"SELECT has_table_privilege('{ROLE}', '{SCHEMA}.bait', 'TRUNCATE') "
+                             f"OR has_table_privilege('{ROLE}', '{SCHEMA}.bait', 'TRIGGER')").fetchone()[0] is False
+        for sql in [f"CREATE TABLE sg_other.leak PARTITION OF {SCHEMA}.pp FOR VALUES IN ('B')",   # gets B's inserts
+                    f"CREATE TABLE {SCHEMA}._firewall_leak PARTITION OF {SCHEMA}.pp FOR VALUES IN ('B')",
+                    f"CREATE TABLE sg_other.leak (id int, tenant_id text); "
+                    f"ALTER TABLE {SCHEMA}.pp ATTACH PARTITION sg_other.leak FOR VALUES IN ('B')",
+                    # neither table named: ALTER TYPE ... CASCADE gives both the column
+                    f"CREATE TYPE {SCHEMA}.ct2 AS (id int); CREATE TABLE {SCHEMA}.typed2 OF {SCHEMA}.ct2; "
+                    f"CREATE TABLE sg_other.kid2 () INHERITS ({SCHEMA}.typed2); "
+                    f"ALTER TYPE {SCHEMA}.ct2 ADD ATTRIBUTE tenant_id text CASCADE"]:
+            with psycopg.connect(f"{DSN} user={atk}", autocommit=True) as c, \
+                    pytest.raises(psycopg.Error, match="gets the rows written to it"):
+                c.execute(sql)
+        refused = [
+            f"SET dbfw.ddl_guard_skip = 'on'; ALTER TABLE {SCHEMA}.bait DISABLE ROW LEVEL SECURITY",   # not theirs to skip
+            f"SET dbfw.guard_call = ''; ALTER TABLE {SCHEMA}.bait DISABLE ROW LEVEL SECURITY",   # no call of the guard's
+            f"CREATE POLICY {stem}_base ON {SCHEMA}.bait AS PERMISSIVE USING (true)",   # the firewall's name
+            f"CREATE TABLE sg_other.up (id int, tenant_id text) PARTITION BY LIST (tenant_id); "
+            f"ALTER TABLE sg_other.up ATTACH PARTITION {SCHEMA}.bait FOR VALUES IN ('A')",
+            f"CREATE TABLE sg_other.sink (id int, t text); CREATE RULE r_leak AS ON INSERT TO {SCHEMA}.bait "
+            f"DO ALSO INSERT INTO sg_other.sink VALUES (NEW.id, NEW.tenant_id)",
+            f"CREATE TYPE sg_other.tid AS ENUM ('A', 'B'); "                             # its cast would decide
+            f"CREATE TABLE {SCHEMA}.t3 (id int, tenant_id sg_other.tid)",
+            # An overload with a default argument makes the firewall's own calls ambiguous.
+            "CREATE FUNCTION public._firewall_tenant(x int DEFAULT 0) RETURNS text LANGUAGE sql AS $$ SELECT 'A' $$",
+            "CREATE FUNCTION public.fw_x() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$; "
+            "ALTER FUNCTION public.fw_x() RENAME TO _firewall_x",
+            f"CREATE COLLATION sg_other.ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false); "
+            f"CREATE TABLE {SCHEMA}.t4 (id int, tenant_id text COLLATE sg_other.ci)",
+            # A rule that comes along when the table is protected for the first time.
+            f"CREATE TABLE sg_other.orders (id int, tenant_id text); CREATE TABLE sg_other.sink2 (id int, t text); "
+            f"CREATE RULE r2 AS ON INSERT TO sg_other.orders DO ALSO INSERT INTO sg_other.sink2 VALUES (NEW.id, NEW.tenant_id); "
+            f"ALTER TABLE sg_other.orders SET SCHEMA {SCHEMA}",
+            f"CREATE TABLE {SCHEMA}.r3 (id int); CREATE TABLE sg_other.sink3 (id int); "
+            f"CREATE RULE r3 AS ON INSERT TO {SCHEMA}.r3 DO ALSO INSERT INTO sg_other.sink3 VALUES (NEW.id); "
+            f"ALTER TABLE {SCHEMA}.r3 ADD COLUMN tenant_id text",
+            # Commands that rename a table or a column under another tag.
+            f"ALTER INDEX {SCHEMA}.bait RENAME TO schema_migrations",
+            f"ALTER VIEW {SCHEMA}.bait RENAME COLUMN tenant_id TO tid",
+            f"ALTER MATERIALIZED VIEW {SCHEMA}.bait RENAME COLUMN tenant_id TO tid",
+            f"CREATE TABLE {SCHEMA}.schema_migrations (id int, tenant_id text); "
+            f"CREATE POLICY open ON {SCHEMA}.schema_migrations USING (true); "
+            f"ALTER INDEX {SCHEMA}.schema_migrations RENAME TO invoices",
+            f"ALTER POLICY {stem}_sel ON {SCHEMA}.bait RENAME TO mine",
+            f"CREATE POLICY {stem}_x ON {SCHEMA}.bait USING (true)",                  # named like the stem
+            f"ALTER TABLE {SCHEMA}.bait RENAME COLUMN tenant_id TO tid",
+            f"ALTER TABLE {SCHEMA}.bait RENAME TO schema_migrations",
+            f"ALTER TABLE {SCHEMA}.bait SET SCHEMA sg_other",
+            f"CREATE TABLE {SCHEMA}._firewall_p (id int, tenant_id text); ALTER TABLE {SCHEMA}.bait INHERIT {SCHEMA}._firewall_p",
+        ]
+        for sql in refused:
+            with psycopg.connect(f"{DSN} user={atk}", autocommit=True) as c, pytest.raises(psycopg.Error, match="DB Firewall"):
+                c.execute(sql)
+        with psycopg.connect(f"{DSN} user={atk}", autocommit=True) as c:
+            c.execute(f"CREATE TABLE {SCHEMA}.own (x int); CREATE POLICY everyone ON {SCHEMA}.own USING (true)")
+            with pytest.raises(psycopg.Error, match="permissive policy of its own"):
+                c.execute(f"ALTER TABLE {SCHEMA}.own ADD COLUMN tenant_id text")
+        for sql in [f"ALTER SCHEMA {SCHEMA} RENAME TO {SCHEMA}_x",                # a superuser, without the skip
+                    f"SET session_replication_role = replica; ALTER TABLE {SCHEMA}.bait DISABLE ROW LEVEL SECURITY",
+                    "CREATE FOREIGN DATA WRAPPER sg_fdw; CREATE SERVER sg_srv FOREIGN DATA WRAPPER sg_fdw; "
+                    f"CREATE FOREIGN TABLE sg_other.ft PARTITION OF {SCHEMA}.pp FOR VALUES IN ('Z') SERVER sg_srv"]:
+            with psycopg.connect(DSN, autocommit=True) as c, pytest.raises(psycopg.Error, match="DB Firewall"):
+                c.execute(sql)
+        with psycopg.connect(f"{DSN} user={atk}", autocommit=True) as c, \
+                pytest.raises(psycopg.Error, match="permission denied"):           # only the owner writes it
+            c.execute("INSERT INTO public._firewall_guard_calls VALUES (pg_backend_pid(), 'x')")
+        # EXPLAIN ANALYZE CREATE TABLE AS fires no event trigger (PostgreSQL):
+        # the next command, whatever it is, protects the table.
+        with psycopg.connect(f"{DSN} user={atk}", autocommit=True) as c:
+            c.execute(f"EXPLAIN (ANALYZE) CREATE TABLE {SCHEMA}.ex AS SELECT 1 AS id, 'A'::text AS tenant_id")
+            assert _npol(c, f"{SCHEMA}.ex") == 0
+            c.execute("CREATE FUNCTION sg_other.any_cmd() RETURNS int LANGUAGE sql AS 'SELECT 1'")   # any command
+            assert _npol(c, f"{SCHEMA}.ex") == 4
+        # An open transaction that ran the guard does not hold up another role's DDL.
+        with psycopg.connect(f"{DSN} user={atk}") as hold, psycopg.connect(DSN, autocommit=True) as other:
+            hold.execute(f"GRANT TRUNCATE ON {SCHEMA}.bait TO {ROLE}")                 # revoked again, still open
+            hold.execute(f"CREATE TABLE {SCHEMA}.held (id int, tenant_id text)")       # protected, still open
+            other.execute("SET lock_timeout = '2s'")
+            other.execute(f"CREATE TABLE {SCHEMA}.free (id int, tenant_id text)")
+            assert _npol(other, f"{SCHEMA}.free") == 4
+            hold.rollback()
+        with psycopg.connect(DSN, autocommit=True) as c:                          # a schema the migration lists
+            c.execute("INSERT INTO public._firewall_protected_schemas (schema_name, tenant_column, policy_mode, context) "
+                      "VALUES ('sg_ghost', 'tenant_id', 'permissive', 'signed')")
+            c.execute("CREATE SCHEMA sg_ghost CREATE TABLE g (id int, tenant_id text)")
+            assert _npol(c, "sg_ghost.g") == 4
+    finally:
+        _drop_guard()
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"DROP TABLE IF EXISTS {SCHEMA}.bait, {SCHEMA}.own, {SCHEMA}._firewall_p, {SCHEMA}.pp, {SCHEMA}.free, {SCHEMA}.ex, "
+                      f"{SCHEMA}.kid, {SCHEMA}.par, {SCHEMA}.typed, {SCHEMA}.lp")
+            c.execute(f"DROP TYPE IF EXISTS {SCHEMA}.ct")
+            c.execute("DROP SCHEMA IF EXISTS sg_ghost CASCADE; "
+                      "DELETE FROM public._firewall_protected_schemas WHERE schema_name = 'sg_ghost'")
+            c.execute("DROP FUNCTION IF EXISTS public._firewall_protect(name, name, text, text, text)")
+            c.execute("DROP SCHEMA IF EXISTS sg_other CASCADE")
+            c.execute("DROP FOREIGN DATA WRAPPER IF EXISTS sg_fdw CASCADE")
+            c.execute(f"REVOKE CREATE, USAGE ON SCHEMA public, {SCHEMA} FROM {atk}")
+            c.execute(f"DROP OWNED BY {atk}; DROP ROLE {atk}")
+
+
+def test_ddl_guard_in_restrictive_mode():
+    """Restrictive mode: a new table gets the four policies and "<stem>_base";
+    the app may add a permissive policy (the tenant policies still bound it),
+    but not one with the firewall's names."""
+    cfg = _cfg()
+    cfg["engines"]["postgresql"].update(ddl_guard=True, policy_mode="restrictive")
+    try:
+        with psycopg.connect(DSN) as c:
+            run_migration(c, DBEngine.POSTGRESQL, cfg)
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"CREATE TABLE {SCHEMA}.rt (id int, tenant_id text)")
+            stem = c.execute(f"SELECT 'fw_' || left(md5('{SCHEMA}.rt'), 12)").fetchone()[0]
+            assert _npol(c, f"{SCHEMA}.rt") == 5
+            c.execute(f"CREATE POLICY mine ON {SCHEMA}.rt AS PERMISSIVE USING (id > 0)")
+            for sql in [f"CREATE POLICY {stem}_base2 ON {SCHEMA}.rt USING (true)",
+                        f"ALTER POLICY {stem}_base ON {SCHEMA}.rt USING (id > 1)",
+                        f"ALTER TABLE {SCHEMA}.rt NO FORCE ROW LEVEL SECURITY"]:
+                with pytest.raises(psycopg.Error, match="DB Firewall"):
+                    c.execute(sql)
+    finally:
+        _drop_guard()
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"DROP TABLE IF EXISTS {SCHEMA}.rt")
+        _migrate()
+
+
+def test_ddl_guard_with_many_tables():
+    """GRANT ALL ON ALL TABLES with 500 protected tables: the guard revokes
+    TRUNCATE and TRIGGER again without nesting a guard per REVOKE, and an
+    unrelated command stays cheap."""
+    import time
+    cfg = _cfg()
+    cfg["engines"]["postgresql"].update(ddl_guard=True)
+    try:
+        with psycopg.connect(DSN) as c:
+            run_migration(c, DBEngine.POSTGRESQL, cfg)
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"DO $$ BEGIN FOR i IN 1..500 LOOP "
+                      f"EXECUTE format('CREATE TABLE {SCHEMA}.m%s (id int, tenant_id text)', i); END LOOP; END $$")
+            c.execute(f"GRANT ALL ON ALL TABLES IN SCHEMA {SCHEMA} TO {ROLE}")
+            assert c.execute(f"SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                             f"WHERE n.nspname = '{SCHEMA}' AND c.relname ~ '^m[0-9]+$' "
+                             f"AND (has_table_privilege('{ROLE}', c.oid, 'TRUNCATE') "
+                             f"OR has_table_privilege('{ROLE}', c.oid, 'TRIGGER') "
+                             f"OR NOT has_table_privilege('{ROLE}', c.oid, 'SELECT'))").fetchone()[0] == 0
+            start = time.monotonic()
+            c.execute("CREATE TEMP TABLE sg_tmp (x int)")
+            assert time.monotonic() - start < 1.0          # generous: a set query, not a loop per table
+    finally:
+        _drop_guard()
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"DO $$ BEGIN FOR i IN 1..500 LOOP "
+                      f"EXECUTE format('DROP TABLE IF EXISTS {SCHEMA}.m%s', i); END LOOP; END $$")
+        _migrate()
+

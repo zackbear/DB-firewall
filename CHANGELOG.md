@@ -1,5 +1,58 @@
 # Changelog
 
+## 2026-10-29: DDL guard and key checks (PR #18)
+
+- **`migrate --ddl-guard`** (`dbfw.ddl_guard`, `engines.postgresql.ddl_guard`):
+  two event triggers, on every DDL command (`ALTER INDEX` and `ALTER VIEW`
+  can also rename a table or its columns). In a schema the migration protects, a table with the
+  tenant column and no firewall policies (created, renamed, or given the
+  column) is protected at the end of the command. A command that weakens a
+  protected table fails: RLS off or not forced, a firewall policy dropped or
+  altered (also through `DROP COLUMN ... CASCADE`), or another permissive
+  policy in permissive mode, or the table taken out of scope (moved, renamed
+  to a skipped name, its tenant column or schema renamed) or put under an
+  unprotected parent, child or partition (either way round), or given a rule.
+  It checks the tables each command names and their descendants, and every
+  table in the protected schemas after a command that can change others
+  (`ALTER TYPE ... CASCADE`, `CREATE SCHEMA`, `GRANT ... ON ALL TABLES`), so
+  a partition, a child or a typed table is protected too. With 2,000
+  protected tables a `CREATE TABLE` costs it about 5 to 10 ms, a full check
+  about 100 ms. It writes no catalog row while it works, so an open
+  transaction in one session does not hold up DDL in another. Policy names `fw_<hash>_*` are reserved. `TRIGGER` and
+  `TRUNCATE` granted to another role are revoked again. A table with its own
+  permissive policy is refused, not protected, in permissive mode. A table
+  owner's own code on the table (a trigger, a CHECK constraint, a default, a
+  generated column, an index expression, a domain constraint) is not
+  stopped. PostgreSQL fires no event trigger for `EXPLAIN ANALYZE CREATE
+  TABLE AS` or `SELECT INTO`: such a table is protected by the next DDL
+  command in the database, and is open until then. The guard is a safety
+  net for migrations, not a boundary against a role with `CREATE` on a
+  protected schema. A `public._firewall_*` object of another role is
+  refused (an overload with a default argument made the firewall's calls
+  ambiguous). Only a superuser or the migration's role can
+  skip it (`SET dbfw.ddl_guard_skip = 'on'`); the migration sets that for
+  itself. The guard calls the firewall's functions with text arguments, so a
+  function planted with other argument types cannot run in its place. Needs
+  a superuser. Off by default.
+- **Migration:** protecting one table is now a function,
+  `public._firewall_protect(schema, table, column, mode, context)`, which
+  section 6 and the guard call. It also drops the firewall policies of an
+  earlier name of the table (a rename changes the policy stem). A new table,
+  `public._firewall_protected_schemas`, records the schemas the migration
+  protects and how (and `public._firewall_guard_calls` marks the guard's own
+  calls); only its owner reads or writes them, and `verify` fails when
+  the app can write either. The migration refuses a tenant column whose type
+  (through any domain) does not belong to a superuser, or whose collation is
+  not deterministic: the policies call the type's cast and equality.
+- **`verify`: keys include the tenant.** Unique keys and foreign keys to
+  protected tables that leave out the tenant column are listed (an
+  information line; `--strict` fails), in both tools, exclusion constraints
+  included (the tenant column counts there only with `=`). A foreign key passes only when the referencing table is
+  protected and its tenant column fills the referenced one. A single-column key on an identity, a
+  sequence or a uuid default is not listed. A new information line reports the DDL guard.
+- **Corpus:** 101 attacks and 7 safe patterns.
+- **`scan`:** the Python predicate message matches the Node one (parity).
+
 ## 2026-10-28: one set of PostgreSQL checks, and `python -m hooks.verify` (PR #17)
 
 - **`checks/postgresql.sql`:** every query of `scan` and `verify` on

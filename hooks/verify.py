@@ -204,6 +204,17 @@ def _strict_checks(cur, protected, allow, allow_query_text):
     return out
 
 
+def _keys_check(cur, protected, column, strict):
+    """@query keys_without_tenant: a side channel, so --strict fails on it; else an information line."""
+    def run():
+        items = [r["item"] for r in pg_checks.query(cur, "keys_without_tenant",
+                                                     json.dumps([[t["schema"], t["table"]] for t in protected]), column)]
+        return (not items, f"without the tenant column: {_listed(items)} (a duplicate, or a missing parent, tells the app "
+                           f"that another tenant has the value: put {column} in the key)" if items
+                else f"every key includes {column}")
+    return _guard("strict: keys include the tenant", run) if strict else _info("keys include the tenant (info)", run)
+
+
 def _other_schemas(cur, schemas, column):
     def run():
         names = [r["name"] for r in pg_checks.query(cur, "other_schemas", list(schemas), column)]
@@ -288,6 +299,7 @@ def verify(connection, tenant: str, key: bytes, schemas: Optional[List[str]] = N
                                  f"that has data, and check that {TENANT_KEY_ENV} is the database's key (db-firewall key)"))
         checks.append(_bypass_objects(cur, column, allow))
         checks.append(_other_schemas(cur, schemas, column))
+        checks.append(_keys_check(cur, [t for t in tables if t["protected"]], column, strict))
         if strict:
             checks += _strict_checks(cur, [t for t in tables if t["protected"]], allow, allow_query_text)
         else:
