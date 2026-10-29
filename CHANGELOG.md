@@ -10,8 +10,13 @@
   altered (also through `DROP COLUMN ... CASCADE`), or another permissive
   policy in permissive mode, or the table taken out of scope (moved, renamed
   to a skipped name, its tenant column or schema renamed) or put under an
-  unprotected parent. A table with its own permissive policy is refused, not
-  protected, in permissive mode. Only a superuser or the migration's role can
+  unprotected parent, child or partition (either way round), or given a rule.
+  It checks every table in the protected schemas after each command, so a
+  partition, a child or a typed table changed by `ALTER TYPE ... CASCADE` is
+  protected too. Policy names `fw_<hash>_*` are reserved. `TRIGGER` and
+  `TRUNCATE` granted to another role are revoked again. A table with its own
+  permissive policy is refused, not protected, in permissive mode. A table
+  owner's own trigger is not stopped. Only a superuser or the migration's role can
   skip it (`SET dbfw.ddl_guard_skip = 'on'`); the migration sets that for
   itself. The guard calls the firewall's functions with text arguments, so a
   function planted with other argument types cannot run in its place. Needs
@@ -22,14 +27,16 @@
   earlier name of the table (a rename changes the policy stem). A new table,
   `public._firewall_protected_schemas`, records the schemas the migration
   protects and how; only its owner reads or writes it, and `verify` fails when
-  the app can write it.
+  the app can write it. The migration refuses a tenant column whose type
+  (through any domain) does not belong to a superuser, or whose collation is
+  not deterministic: the policies call the type's cast and equality.
 - **`verify`: keys include the tenant.** Unique keys and foreign keys to
   protected tables that leave out the tenant column are listed (an
   information line; `--strict` fails), in both tools, exclusion constraints
-  included. A foreign key passes only when the referencing table's tenant
+  included (the tenant column counts there only with `=`). A foreign key passes only when the referencing table's tenant
   column fills the referenced one. A single-column key on an identity, a
   sequence or a uuid default is not listed. A new information line reports the DDL guard.
-- **Corpus:** 99 attacks and 7 safe patterns.
+- **Corpus:** 100 attacks and 7 safe patterns.
 - **`scan`:** the Python predicate message matches the Node one (parity).
 
 ## 2026-10-28: one set of PostgreSQL checks, and `python -m hooks.verify` (PR #17)

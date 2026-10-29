@@ -388,9 +388,11 @@ ORDER BY 1
 -- tables, as jsonb [[schema, table], ...]; $2: the tenant column.
 -- * A unique index (primary keys included) or exclusion constraint on the
 --   table whose key columns leave out the tenant column (a tenant column only
---   in INCLUDE does not count). A single-column key on a generated value (an
+--   in INCLUDE, or in an exclusion constraint with an operator other than =,
+--   does not count). A single-column key on a generated value (an
 --   identity column, or a default from a sequence or a uuid function) is not
---   counted: a duplicate then shows only that an id is taken.
+--   counted: a duplicate then shows only that an id is taken (an app that
+--   sends its own ids can still learn which ids exist).
 -- * A foreign key from any table to a protected one whose referenced tenant
 --   column is not filled by a column of that name in the referencing table
 --   (else the app can probe another tenant's rows with its own value there).
@@ -403,12 +405,15 @@ SELECT CASE WHEN x.indisexclusion THEN 'exclusion constraint ' ELSE 'unique key 
        || i.relname || ' on ' || p.name AS item
 FROM prot p JOIN pg_index x ON x.indrelid = p.oid AND (x.indisunique OR x.indisexclusion)
 JOIN pg_class i ON i.oid = x.indexrelid
-WHERE NOT EXISTS (SELECT 1 FROM generate_series(0, x.indnkeyatts - 1) k WHERE x.indkey[k] = p.att)
+WHERE NOT EXISTS (SELECT 1 FROM generate_series(0, x.indnkeyatts - 1) k WHERE x.indkey[k] = p.att
+                    AND (NOT x.indisexclusion   -- an exclusion constraint counts it only with =
+                         OR EXISTS (SELECT 1 FROM pg_constraint xc JOIN pg_operator o ON o.oid = xc.conexclop[k + 1]
+                                    WHERE xc.conindid = x.indexrelid AND o.oprname = '=')))
   AND NOT (x.indnkeyatts = 1 AND x.indkey[0] <> 0 AND NOT x.indisexclusion
            AND EXISTS (SELECT 1 FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
                        WHERE a.attrelid = p.oid AND a.attnum = x.indkey[0]
                          AND (a.attidentity <> ''
-                              OR pg_get_expr(d.adbin, d.adrelid) ~ '^(nextval|gen_random_uuid|uuid_generate_v[14])\(')))
+                              OR pg_get_expr(d.adbin, d.adrelid) ~ '^((public|extensions)\.)?(nextval|gen_random_uuid|uuid_generate_v[14])\(')))
 UNION ALL
 SELECT 'foreign key ' || con.conname || ' on ' || con.conrelid::regclass::text || ' to ' || p.name
 FROM prot p JOIN pg_constraint con ON con.confrelid = p.oid AND con.contype = 'f'

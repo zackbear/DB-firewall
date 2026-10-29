@@ -934,6 +934,16 @@ ALTER TABLE {S}.docs ADD COLUMN span int4range, ADD CONSTRAINT docs_span EXCLUDE
 -- @undo
 ALTER TABLE {S}.docs DROP COLUMN span;
 
+-- @attack an exclusion constraint on the tenant column with an operator other than =
+-- @check -: strict: keys include the tenant
+-- @mode strict
+-- @setup
+CREATE EXTENSION btree_gist SCHEMA public;
+ALTER TABLE {S}.docs ADD COLUMN span int4range,
+  ADD CONSTRAINT docs_tspan EXCLUDE USING gist (tenant_id WITH <>, span WITH &&);
+-- @undo
+ALTER TABLE {S}.docs DROP COLUMN span; DROP EXTENSION btree_gist;
+
 -- @attack a one-column unique key with a constant default (not a generated value)
 -- @check -: strict: keys include the tenant
 -- @mode strict
