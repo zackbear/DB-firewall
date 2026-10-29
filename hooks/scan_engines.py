@@ -76,9 +76,9 @@ def _pg_predicate(tenant_col: str, context: str) -> str:
     col = _pg_ident(tenant_col)
     if context == "plain":
         return (f"{col} = NULLIF(current_setting('app.current_tenant', true), '') "
-                "OR public._firewall_is_bypass_role(current_user::text)")
-    return (f"{col} = (SELECT public._firewall_tenant()) "
-            "OR (SELECT public._firewall_is_bypass_role(current_user::text))")
+                "OR db_firewall._firewall_is_bypass_role(current_user::text)")
+    return (f"{col} = (SELECT db_firewall._firewall_tenant()) "
+            "OR (SELECT db_firewall._firewall_is_bypass_role(current_user::text))")
 
 
 def _pg_reference(cursor, ref_rel: str, tenant_col: str, context: str = "signed"):
@@ -118,14 +118,14 @@ def _pg_altered(policies, reference) -> list:
     return sorted(altered)
 
 
-_PG_FUNCTION_RE = re.compile(r"CREATE OR REPLACE FUNCTION public\.(_firewall_\w+)\(([^)]*)\)\s*RETURNS (\w+) "
+_PG_FUNCTION_RE = re.compile(r"CREATE OR REPLACE FUNCTION db_firewall\.(_firewall_\w+)\(([^)]*)\)\s*RETURNS (\w+) "
                              r"AS \$\$(.*?)\$\$ LANGUAGE (\w+)([^;]*);", re.S)
 
 
 def _pg_firewall_objects(cursor):
     """None when every function the migration creates matches it (body,
     SECURITY DEFINER, settings, volatility, language, return type), no extra
-    public._firewall_* function exists, and the public._firewall_* objects have
+    db_firewall._firewall_* function exists, and the db_firewall._firewall_* objects have
     one owner (or only superusers); else the reason. The policies call some of
     these functions and others sign, so a changed body opens every table while
     the policies still look exact. Same rules as packages/cli/src/scan.ts."""
@@ -136,7 +136,7 @@ def _pg_firewall_objects(cursor):
     for name, args, ret, body, lang, tail in _PG_FUNCTION_RE.findall(sql):
         sig = ", ".join(a.split()[1].lower() for a in args.split(",") if len(a.split()) > 1)
         sigs.append(f"{name}({sig})")
-        rows = pg_checks.query(cursor, "fw_function", f"public.{name}({sig})")
+        rows = pg_checks.query(cursor, "fw_function", f"db_firewall.{name}({sig})")
         if not rows:
             diff.append(f"{name} (missing)")
             continue

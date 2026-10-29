@@ -1,5 +1,32 @@
 # Changelog
 
+## 2026-10-29: the firewall's own schema, db_firewall (PR #19)
+
+- **Breaking (PostgreSQL):** the firewall's tables and functions move from
+  `public` to schema `db_firewall`: `db_firewall._firewall_set_tenant(...)`,
+  `db_firewall._firewall_keys`, `db_firewall._firewall_bypass_roles`, and so
+  on. Code that calls `public._firewall_*` by name must use the new schema.
+  The middleware, the CLI and `@db-firewall/pg` already do; the default
+  PostgreSQL audit and tenant-map tables are `db_firewall._firewall_audit_log`
+  and `db_firewall._firewall_tenant_map`. MySQL, SQL Server and Oracle do
+  not change.
+- **Why:** the policies call the firewall's functions by name. A role that
+  could `CREATE` in `public` could add an overload with a default argument
+  and make every call ambiguous: every read of a protected table, and every
+  protection, failed. Only the migration's role creates in `db_firewall`;
+  the migration revokes `CREATE` there from every other role and grants
+  `USAGE` to all.
+- **Upgrade:** the migration moves the objects of an earlier version out of
+  `public` with `SET SCHEMA`, which keeps each object: the key, the rows,
+  the event triggers and the policies of every schema stay (they now show
+  `db_firewall._firewall_tenant()`). It refuses when both copies of an
+  object exist, and when `dbfw.schema` is `db_firewall`.
+- **Checks:** schema `db_firewall`, every object in it, and any
+  `public._firewall_*` object must belong to the migration's role or a
+  superuser (the migration, `verify`, `scan` and the DDL guard). `verify`
+  fails when the app owns schema `db_firewall`; owning schema `public` no
+  longer counts as owning firewall objects.
+
 ## 2026-10-29: DDL guard and key checks (PR #18)
 
 - **`migrate --ddl-guard`** (`dbfw.ddl_guard`, `engines.postgresql.ddl_guard`):

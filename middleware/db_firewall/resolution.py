@@ -60,7 +60,8 @@ _MAP_USER_EXPR = {
     DBEngine.ORACLE: ("USER", "'Y'"),
 }
 # The Oracle migration names its map TENANT_USER_MAP (is_active 'Y'/'N').
-_DEFAULT_MAP_TABLE = {DBEngine.ORACLE: "TENANT_USER_MAP"}
+_DEFAULT_MAP_TABLE = {DBEngine.ORACLE: "TENANT_USER_MAP",
+                      DBEngine.POSTGRESQL: "db_firewall._firewall_tenant_map"}
 
 # Where each engine keeps a DB-side tenant set by the migration's procedures.
 _SESSION_VAR_SQL = {
@@ -103,7 +104,7 @@ def _from_session_var(connection, engine: str, entry: dict, config: dict) -> Opt
         if entry.get("variable", "app.current_tenant") != "app.current_tenant":
             raise ValueError("DB Firewall: session_var with tenant_context: signed reads "
                              "app.current_tenant only")
-        return probe(connection, "SELECT public._firewall_tenant()")
+        return probe(connection, "SELECT db_firewall._firewall_tenant()")
     if engine == DBEngine.POSTGRESQL:
         ph = placeholder(connection)
         return probe(connection, sql.format(ph=ph), (entry.get("variable", "app.current_tenant"),))

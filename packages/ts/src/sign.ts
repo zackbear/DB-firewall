@@ -22,7 +22,7 @@ export function tenantKey(): Buffer | undefined {
   return Buffer.from(raw, "hex");
 }
 
-/** hex(HMAC-SHA256(key, nonce:tenant)), as public._firewall_sign() computes it. */
+/** hex(HMAC-SHA256(key, nonce:tenant)), as db_firewall._firewall_sign() computes it. */
 export function signTenant(key: Buffer, nonce: string, tenant: string): string {
   return createHmac("sha256", key).update(`${nonce}:${tenant}`, "utf8").digest("hex");
 }
@@ -36,7 +36,7 @@ export interface Entered { keep: string; drivers: string[] }
 // Snapshot taken in the transaction, before fn: the session-level settings
 // and role (_firewall_session_settings()) and the protocol-level prepared
 // statements the driver made.
-const SNAPSHOT = "public._firewall_session_settings() AS keep, " +
+const SNAPSHOT = "db_firewall._firewall_session_settings() AS keep, " +
   "(SELECT coalesce(pg_catalog.array_agg(name), '{}') FROM pg_catalog.pg_prepared_statements WHERE NOT from_sql) AS drivers";
 
 /**
@@ -55,7 +55,7 @@ export async function enter(run: Run, tenant: string): Promise<Entered> {
     }
     [row] = await run(`SELECT set_config('${TENANT_SETTING}', $1, true), ${SNAPSHOT}`, [tenant]);
   } else {
-    [row] = await run(`SELECT public._firewall_nonce() AS nonce, ${SNAPSHOT}`);
+    [row] = await run(`SELECT db_firewall._firewall_nonce() AS nonce, ${SNAPSHOT}`);
     await run(`SELECT set_config('${TENANT_SETTING}', $1, true), set_config('${SIG_SETTING}', $2, true)`,
               [tenant, signTenant(key, String(row.nonce), tenant)]);
   }
@@ -73,7 +73,7 @@ const RESET = "WITH c AS MATERIALIZED (SELECT " +
   "(SELECT count(*) FROM pg_catalog.pg_prepared_statements WHERE from_sql) " +
   "OPERATOR(pg_catalog.+) (SELECT count(*) FROM pg_catalog.unnest($2::pg_catalog.text[]) d WHERE NOT EXISTS " +
   "(SELECT 1 FROM pg_catalog.pg_prepared_statements p WHERE NOT p.from_sql AND p.name OPERATOR(pg_catalog.=) d)) AS n) " +
-  "SELECT c.n::int AS suspect, public._firewall_reset_session($1::pg_catalog.text::pg_catalog.jsonb) FROM c";
+  "SELECT c.n::int AS suspect, db_firewall._firewall_reset_session($1::pg_catalog.text::pg_catalog.jsonb) FROM c";
 
 /** fn left the transaction or the session unusable; it was rolled back and the
  *  session reset. The connection should still be discarded where the driver allows it. */
@@ -81,7 +81,7 @@ export class SessionResetError extends Error {}
 
 /**
  * After COMMIT or ROLLBACK, outside any transaction: undo the session state fn
- * left (public._firewall_reset_session: temp objects, SQL-level prepared
+ * left (db_firewall._firewall_reset_session: temp objects, SQL-level prepared
  * statements, custom settings, cursors, LISTEN, advisory locks), so the
  * connection's next user (another tenant) cannot run into it. After the
  * transaction ended, so a deferred trigger firing at COMMIT cannot undo it.

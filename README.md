@@ -108,7 +108,7 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
 * `signed` (default): the app sets `app.current_tenant` and
   `app.tenant_sig = hex(HMAC-SHA256(key, _firewall_nonce() || ':' || tenant))`.
   The key is `DB_FIREWALL_TENANT_KEY` (hex, 32 to 64 bytes) in the app, and
-  `public._firewall_keys` in the database, which no app role can read. The
+  `db_firewall._firewall_keys` in the database, which no app role can read. The
   nonce is the backend and the transaction's start time, so a signature holds
   for one transaction only. SQL the app or an AI agent runs inside the
   transaction can still set `app.current_tenant`, but cannot sign it, so the
@@ -117,7 +117,7 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
   (warned once), which a signed database answers with no rows. The migration
   installs `dbfw.tenant_key` when set (this also rotates it). Otherwise it keeps
   the key, or generates one on the first run: read it with
-  `SELECT encode(key, 'hex') FROM public._firewall_keys` or `npx db-firewall key`.
+  `SELECT encode(key, 'hex') FROM db_firewall._firewall_keys` or `npx db-firewall key`.
   The policies check the signature once per query, not once per row (an
   InitPlan). Tested on PostgreSQL 14 to 17.
 * **Session reset.** SQL run in one tenant's transaction could leave session
@@ -125,7 +125,7 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
   SQL-level prepared statement under a driver's statement name, or a custom
   setting used as a drop box. `withTenant` (TypeScript) holds one connection
   for the call (a pg client, or a reserved postgres.js connection) and runs
-  `public._firewall_reset_session` on it after COMMIT or ROLLBACK, also when
+  `db_firewall._firewall_reset_session` on it after COMMIT or ROLLBACK, also when
   the function throws. After the transaction, so a deferred trigger that fires
   at COMMIT cannot undo it. Python's `release()` and `pool_checkin` run it on
   return. It drops
@@ -152,16 +152,25 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
   table. Re-run the migration after granting privileges (`GRANT ALL` includes
   both).
   The reset costs about 1 ms per call. [Inference] It was measured on localhost.
-* **The migration protects itself.** It binds every name and operator in
-  `pg_catalog`, so a planted operator such as `public.=` for `varchar, text`
-  cannot bind into a policy. It refuses to run when a `public._firewall_*`
-  object belongs to a role that is neither the one running it nor a superuser,
-  because another role may have planted it to read the key. It checks this
+* **The migration protects itself.** Its tables and functions live in their
+  own schema, `db_firewall`. Only the migration's role creates in it (the
+  migration revokes `CREATE` there from every other role), and every role
+  may use it. The policies call its functions by name, so a role that could
+  add an overload there (one with a default argument, say) could make every
+  call ambiguous. A run on an install from before this schema moves the
+  objects out of `public` with `SET SCHEMA`, which keeps each object: the
+  key, the rows and the policies of every schema stay. The migration binds
+  every name and operator in `pg_catalog`, so a planted operator such as
+  `public.=` for `varchar, text` cannot bind into a policy. It refuses to
+  run when schema `db_firewall`, an object in it, or a `public._firewall_*`
+  object belongs to a role that is neither the one running it nor a
+  superuser, because another role may have planted it to read the key. It checks this
   first and again as its last statement, in case an object was planted while
   it waited on a lock. The scanners read the policies the same way. They fail
   when any function the migration creates differs from it, when an extra
-  `public._firewall_*` function exists, or when the firewall objects have more
-  than one owner that is not a superuser. Do not let app roles `CREATE` in any
+  function exists in `db_firewall` (or any `public._firewall_*` function),
+  or when the firewall objects have more than one owner that is not a
+  superuser. Do not let app roles `CREATE` in any
   schema (`REVOKE CREATE ON SCHEMA public FROM PUBLIC` is the default since
   PostgreSQL 15). An app role can set its own defaults (`ALTER ROLE ... SET
   search_path`), which no reset undoes. Without `CREATE` it cannot plant
@@ -213,8 +222,8 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
   for migrations, not a boundary against a role that holds `CREATE` on a
   protected schema and means harm: keep `CREATE` there to the roles that run
   migrations. The
-  guard also refuses a `public._firewall_*` object of another role (an
-  overload of a firewall function makes its calls ambiguous).
+  guard also refuses an object of another role in `db_firewall`, or named
+  `public._firewall_*` (old app code may still call those names).
 * **Tenant column type.** The migration refuses a tenant column whose type
   belongs to a role that is not a superuser, or whose collation is not
   deterministic. The policies call that type's cast and equality, so the

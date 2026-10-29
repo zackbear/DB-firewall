@@ -88,7 +88,7 @@ async function leak(text) {
   await c.connect();
   try {
     await c.query("BEGIN");
-    const { rows: [{ n }] } = await c.query("SELECT public._firewall_nonce() AS n");
+    const { rows: [{ n }] } = await c.query("SELECT db_firewall._firewall_nonce() AS n");
     await c.query("SELECT set_config('app.current_tenant', 'A', true), set_config('app.tenant_sig', $1, true)",
                   [sign(Buffer.from(KEY, "hex"), n, "A")]);
     const res = await c.query(text);

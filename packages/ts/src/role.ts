@@ -12,7 +12,7 @@ export async function assertSafeRole(db: unknown): Promise<void> {
   try {
     rows = await queryRows(db,
       "SELECT r.rolname, r.rolsuper, r.rolbypassrls, " +
-      "public._firewall_is_bypass_role(current_user::text) AS fw_bypass " +
+      "db_firewall._firewall_is_bypass_role(current_user::text) AS fw_bypass " +
       "FROM pg_roles r WHERE r.rolname = current_user");
   } catch (err) {
     if (err instanceof TypeError) throw err;        // unsupported client: say so, not "migration"

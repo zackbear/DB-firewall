@@ -212,7 +212,7 @@ def _leak(sql):
         cur = conn.cursor()
         cur.execute("BEGIN")
         try:
-            nonce = cur.execute("SELECT public._firewall_nonce()").fetchone()[0]
+            nonce = cur.execute("SELECT db_firewall._firewall_nonce()").fetchone()[0]
             cur.execute("SELECT set_config('app.current_tenant', 'A', true), set_config('app.tenant_sig', %s, true)",
                         (sign_tenant(KEY, nonce, "A"),))
             rows = []

@@ -38,8 +38,8 @@ OPS = {"sel": "SELECT", "ins": "INSERT", "upd": "UPDATE", "del": "DELETE"}
 def _policies(c, schema, table, ops, legacy=False):
     stem = (f"firewall_rls_{table}" if legacy else
             c.execute("SELECT 'fw_' || left(md5(%s || '.' || %s), 12)", (schema, table)).fetchone()[0])
-    pred = ("tenant_id = (SELECT public._firewall_tenant()) "   # the migration's (signed context)
-            "OR (SELECT public._firewall_is_bypass_role(current_user::text))")
+    pred = ("tenant_id = (SELECT db_firewall._firewall_tenant()) "   # the migration's (signed context)
+            "OR (SELECT db_firewall._firewall_is_bypass_role(current_user::text))")
     for suffix in ops:
         clause = {"ins": f"WITH CHECK ({pred})",
                   "upd": f"USING ({pred}) WITH CHECK ({pred})"}.get(suffix, f"USING ({pred})")

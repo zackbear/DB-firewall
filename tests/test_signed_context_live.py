@@ -96,8 +96,8 @@ def test_unsigned_forged_and_replayed_contexts_see_nothing():
 
 def test_signature_is_standard_hmac():
     with psycopg.connect(DSN) as c:
-        key, nonce, sig = c.execute("SELECT encode(key, 'hex'), public._firewall_nonce(), "
-                                    "public._firewall_sign('Acme:ü') FROM public._firewall_keys").fetchone()
+        key, nonce, sig = c.execute("SELECT encode(key, 'hex'), db_firewall._firewall_nonce(), "
+                                    "db_firewall._firewall_sign('Acme:ü') FROM db_firewall._firewall_keys").fetchone()
     assert key == os.environ["DB_FIREWALL_TENANT_KEY"]            # installed from the environment
     assert sig == sign_tenant(bytes.fromhex(key), nonce, "Acme:ü")
 
@@ -112,10 +112,10 @@ def test_cross_tenant_insert_after_a_switch_is_refused():
 
 
 @pytest.mark.parametrize("sql", [
-    "SELECT public._firewall_sign('B')",
-    "SELECT public._firewall_set_tenant('B')",
-    "SELECT key FROM public._firewall_keys",
-    "INSERT INTO public._firewall_bypass_roles VALUES ('sg_app_user')",
+    "SELECT db_firewall._firewall_sign('B')",
+    "SELECT db_firewall._firewall_set_tenant('B')",
+    "SELECT key FROM db_firewall._firewall_keys",
+    "INSERT INTO db_firewall._firewall_bypass_roles VALUES ('sg_app_user')",
 ])
 def test_app_role_cannot_sign_read_the_key_or_bypass(sql):
     with psycopg.connect(DSN) as c:
@@ -127,15 +127,15 @@ def test_app_role_cannot_sign_read_the_key_or_bypass(sql):
 def test_grants_from_default_privileges_are_revoked():
     # Supabase-style: the platform grants every new object to its roles directly.
     with psycopg.connect(DSN, autocommit=True) as c:
-        c.execute(f"GRANT SELECT ON public._firewall_keys TO {ROLE}")
-        c.execute(f"GRANT EXECUTE ON FUNCTION public._firewall_sign(text) TO {ROLE}")
-        c.execute(f"GRANT INSERT ON public._firewall_bypass_roles TO {ROLE}")
+        c.execute(f"GRANT SELECT ON db_firewall._firewall_keys TO {ROLE}")
+        c.execute(f"GRANT EXECUTE ON FUNCTION db_firewall._firewall_sign(text) TO {ROLE}")
+        c.execute(f"GRANT INSERT ON db_firewall._firewall_bypass_roles TO {ROLE}")
     _migrate()
     with psycopg.connect(DSN) as c:
         rows = c.execute(
             "SELECT count(*) FROM (SELECT relacl AS acl FROM pg_class WHERE oid IN "
-            "('public._firewall_keys'::regclass, 'public._firewall_bypass_roles'::regclass) "
-            "UNION ALL SELECT proacl FROM pg_proc WHERE oid = 'public._firewall_sign(text)'::regprocedure) a, "
+            "('db_firewall._firewall_keys'::regclass, 'db_firewall._firewall_bypass_roles'::regclass) "
+            "UNION ALL SELECT proacl FROM pg_proc WHERE oid = 'db_firewall._firewall_sign(text)'::regprocedure) a, "
             "aclexplode(a.acl) x WHERE x.grantee = %s::regrole", (ROLE,)).fetchone()[0]
     assert rows == 0
 
@@ -237,8 +237,8 @@ def test_planted_operator_cannot_open_the_policies():
         with psycopg.connect(DSN, autocommit=True) as c:
             stem = c.execute("SELECT 'fw_' || left(md5(%s), 12)", (f"{SCHEMA}.vdocs",)).fetchone()[0]
             c.execute("SET search_path = public")                         # binds "=" to the planted operator
-            c.execute(f"ALTER POLICY {stem}_sel ON {SCHEMA}.vdocs USING (tenant_id = (SELECT public._firewall_tenant()) "
-                      "OR (SELECT public._firewall_is_bypass_role(current_user::text)))")
+            c.execute(f"ALTER POLICY {stem}_sel ON {SCHEMA}.vdocs USING (tenant_id = (SELECT db_firewall._firewall_tenant()) "
+                      "OR (SELECT db_firewall._firewall_is_bypass_role(current_user::text)))")
             report = scan_tables(c, DBEngine.POSTGRESQL, _cfg())["vdocs"]
             assert report["protected"] is False and f"{stem}_sel" in report["altered_policies"]
             assert c.execute("SHOW search_path").fetchone()[0] == "public"      # the scanner put it back
@@ -252,22 +252,22 @@ def test_planted_operator_cannot_open_the_policies():
 
 def test_reading_the_tenant_map_stays_allowed_writing_does_not():
     with psycopg.connect(DSN, autocommit=True) as c:
-        c.execute(f"GRANT SELECT, INSERT ON public._firewall_tenant_map TO {ROLE}")
-        c.execute(f"GRANT SELECT (key) ON public._firewall_keys TO {ROLE}")          # a column grant
+        c.execute(f"GRANT SELECT, INSERT ON db_firewall._firewall_tenant_map TO {ROLE}")
+        c.execute(f"GRANT SELECT (key) ON db_firewall._firewall_keys TO {ROLE}")          # a column grant
     _migrate()
     with psycopg.connect(DSN) as c:
         privs = c.execute(
-            "SELECT has_table_privilege(%s, 'public._firewall_tenant_map', 'SELECT'), "
-            "has_table_privilege(%s, 'public._firewall_tenant_map', 'INSERT'), "
-            "has_any_column_privilege(%s, 'public._firewall_keys', 'SELECT')", (ROLE, ROLE, ROLE)).fetchone()
+            "SELECT has_table_privilege(%s, 'db_firewall._firewall_tenant_map', 'SELECT'), "
+            "has_table_privilege(%s, 'db_firewall._firewall_tenant_map', 'INSERT'), "
+            "has_any_column_privilege(%s, 'db_firewall._firewall_keys', 'SELECT')", (ROLE, ROLE, ROLE)).fetchone()
     with psycopg.connect(DSN, autocommit=True) as c:
-        c.execute(f"REVOKE ALL ON public._firewall_tenant_map FROM {ROLE}")
+        c.execute(f"REVOKE ALL ON db_firewall._firewall_tenant_map FROM {ROLE}")
     assert privs == (True, False, False)
 
 
 def test_scanner_fails_when_a_firewall_function_was_changed():
     with psycopg.connect(DSN, autocommit=True) as c:
-        c.execute("CREATE OR REPLACE FUNCTION public._firewall_tenant() RETURNS TEXT AS $f$ "
+        c.execute("CREATE OR REPLACE FUNCTION db_firewall._firewall_tenant() RETURNS TEXT AS $f$ "
                   "SELECT NULLIF(current_setting('app.current_tenant', true), ''); "
                   "$f$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp")
         try:
@@ -536,7 +536,7 @@ def test_ddl_guard_resists_a_table_owner():
         with psycopg.connect(f"{DSN} user={atk}", autocommit=True) as c:
             # A planted overload with name arguments, an exact match for the old
             # call: refused when created (the guard also calls with text casts).
-            with pytest.raises(psycopg.Error, match="a name the firewall keeps"):
+            with pytest.raises(psycopg.Error, match="where the firewall keeps its own objects"):
                 c.execute("CREATE FUNCTION public._firewall_protect(a name, b name, x text, y text, z text) RETURNS void "
                           f"LANGUAGE plpgsql AS $f$ BEGIN EXECUTE 'ALTER ROLE {atk} SUPERUSER'; END $f$")
             c.execute(f"CREATE TABLE {SCHEMA}.bait (id int, tenant_id text)")
@@ -627,7 +627,7 @@ def test_ddl_guard_resists_a_table_owner():
                 c.execute(sql)
         with psycopg.connect(f"{DSN} user={atk}", autocommit=True) as c, \
                 pytest.raises(psycopg.Error, match="permission denied"):           # only the owner writes it
-            c.execute("INSERT INTO public._firewall_guard_calls VALUES (pg_backend_pid(), 'x')")
+            c.execute("INSERT INTO db_firewall._firewall_guard_calls VALUES (pg_backend_pid(), 'x')")
         # EXPLAIN ANALYZE CREATE TABLE AS fires no event trigger (PostgreSQL):
         # the next command, whatever it is, protects the table.
         with psycopg.connect(f"{DSN} user={atk}", autocommit=True) as c:
@@ -644,7 +644,7 @@ def test_ddl_guard_resists_a_table_owner():
             assert _npol(other, f"{SCHEMA}.free") == 4
             hold.rollback()
         with psycopg.connect(DSN, autocommit=True) as c:                          # a schema the migration lists
-            c.execute("INSERT INTO public._firewall_protected_schemas (schema_name, tenant_column, policy_mode, context) "
+            c.execute("INSERT INTO db_firewall._firewall_protected_schemas (schema_name, tenant_column, policy_mode, context) "
                       "VALUES ('sg_ghost', 'tenant_id', 'permissive', 'signed')")
             c.execute("CREATE SCHEMA sg_ghost CREATE TABLE g (id int, tenant_id text)")
             assert _npol(c, "sg_ghost.g") == 4
@@ -655,7 +655,7 @@ def test_ddl_guard_resists_a_table_owner():
                       f"{SCHEMA}.kid, {SCHEMA}.par, {SCHEMA}.typed, {SCHEMA}.lp")
             c.execute(f"DROP TYPE IF EXISTS {SCHEMA}.ct")
             c.execute("DROP SCHEMA IF EXISTS sg_ghost CASCADE; "
-                      "DELETE FROM public._firewall_protected_schemas WHERE schema_name = 'sg_ghost'")
+                      "DELETE FROM db_firewall._firewall_protected_schemas WHERE schema_name = 'sg_ghost'")
             c.execute("DROP FUNCTION IF EXISTS public._firewall_protect(name, name, text, text, text)")
             c.execute("DROP SCHEMA IF EXISTS sg_other CASCADE")
             c.execute("DROP FOREIGN DATA WRAPPER IF EXISTS sg_fdw CASCADE")
@@ -718,3 +718,71 @@ def test_ddl_guard_with_many_tables():
                       f"EXECUTE format('DROP TABLE IF EXISTS {SCHEMA}.m%s', i); END LOOP; END $$")
         _migrate()
 
+
+
+def test_migration_moves_firewall_objects_out_of_public():
+    """An install from before schema db_firewall: the objects are in public.
+    The migration moves them (SET SCHEMA keeps each object), so the key, the
+    policies of every schema and the rows stay."""
+    with psycopg.connect(DSN, autocommit=True) as c:
+        key = c.execute("SELECT key FROM db_firewall._firewall_keys").fetchone()[0]
+        for (sig,) in c.execute("SELECT oid::regprocedure::text FROM pg_proc "
+                                "WHERE pronamespace = 'db_firewall'::regnamespace").fetchall():
+            c.execute(f"ALTER ROUTINE {sig} SET SCHEMA public")
+        for (rel,) in c.execute("SELECT relname FROM pg_class WHERE relnamespace = 'db_firewall'::regnamespace "
+                                "AND relkind = 'r'").fetchall():
+            c.execute(f"ALTER TABLE db_firewall.{rel} SET SCHEMA public")
+    _migrate()
+    with psycopg.connect(DSN, autocommit=True) as c:
+        assert c.execute("SELECT count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace "
+                         "AND proname LIKE '\\_firewall\\_%'").fetchone()[0] == 0
+        assert c.execute("SELECT count(*) FROM pg_class WHERE relnamespace = 'public'::regnamespace "
+                         "AND relname LIKE '\\_firewall\\_%'").fetchone()[0] == 0
+        assert c.execute("SELECT key FROM db_firewall._firewall_keys").fetchone()[0] == key
+    assert _as_app(lambda c: _set_context_postgres(c, "A")) == [1]
+
+
+def test_only_the_owner_creates_in_the_firewall_schema():
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute(f"GRANT CREATE ON SCHEMA db_firewall TO {ROLE}")
+    _migrate()                                                       # revokes it
+    with psycopg.connect(DSN, autocommit=True) as c:
+        assert c.execute(f"SELECT has_schema_privilege('{ROLE}', 'db_firewall', 'CREATE')").fetchone()[0] is False
+        c.execute(f"GRANT CREATE ON SCHEMA db_firewall TO {ROLE}")
+        c.execute(f"SET ROLE {ROLE}")
+        c.execute("CREATE FUNCTION db_firewall._firewall_tenant(x int DEFAULT 0) RETURNS text "
+                  "LANGUAGE sql AS $$ SELECT 'A' $$")
+        c.execute("RESET ROLE")
+    try:
+        with pytest.raises(psycopg.errors.RaiseException, match="planted"):
+            _migrate()
+    finally:
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute("DROP FUNCTION db_firewall._firewall_tenant(int)")
+            c.execute(f"REVOKE CREATE ON SCHEMA db_firewall FROM {ROLE}")
+    cfg = _cfg()
+    cfg["engines"]["postgresql"].update(schema="db_firewall")
+    with psycopg.connect(DSN) as c, pytest.raises(Exception, match="db_firewall"):
+        run_migration(c, DBEngine.POSTGRESQL, cfg)
+
+
+def test_an_overload_planted_in_public_breaks_nothing():
+    """The policies and the firewall's functions call db_firewall: a role that
+    can CREATE in public can no longer make those calls ambiguous."""
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute(f"GRANT CREATE ON SCHEMA public TO {ROLE}")
+        c.execute(f"SET ROLE {ROLE}")
+        c.execute("CREATE FUNCTION public._firewall_tenant(x int DEFAULT 0) RETURNS text LANGUAGE sql AS $$ SELECT 'B' $$")
+        c.execute("CREATE FUNCTION public._firewall_sign(p text, x int DEFAULT 0) RETURNS text LANGUAGE sql AS $$ SELECT 'x' $$")
+        c.execute("RESET ROLE")
+    try:
+        assert _as_app(lambda c: _set_context_postgres(c, "A")) == [1]
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"CREATE TABLE {SCHEMA}.later3 (id int, tenant_id text)")
+            c.execute(f"SELECT db_firewall._firewall_protect('{SCHEMA}', 'later3', 'tenant_id', 'permissive', 'signed')")
+            assert _npol(c, f"{SCHEMA}.later3") == 4
+    finally:
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"DROP TABLE IF EXISTS {SCHEMA}.later3")
+            c.execute("DROP FUNCTION IF EXISTS public._firewall_tenant(int), public._firewall_sign(text, int)")
+            c.execute(f"REVOKE CREATE ON SCHEMA public FROM {ROLE}")

@@ -108,7 +108,7 @@ async function main(argv: string[]): Promise<number> {
       return 0;
     }
     if (command === "key") {
-      const { rows } = await client.query("SELECT encode(key, 'hex') AS key FROM public._firewall_keys");
+      const { rows } = await client.query("SELECT encode(key, 'hex') AS key FROM db_firewall._firewall_keys");
       if (!rows.length) { process.stderr.write("db-firewall: no key: run migrate first\n"); return 1; }
       process.stdout.write(`${rows[0].key}\n`);
       return 0;
