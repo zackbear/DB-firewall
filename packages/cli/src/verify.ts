@@ -151,6 +151,7 @@ async function verifyTables(client: pg.ClientBase, opts: VerifyOpts): Promise<Ve
   }
   checks.push(await bypassObjects(client, column, opts.allowGlobal ?? []));
   checks.push(await otherSchemas(client, schemas, column));
+  checks.push(await keysCheck(client, tables.filter((t) => t.protected), column, !!opts.strict));
   if (opts.strict) {
     checks.push(...await strictChecks(client, tables.filter((t) => t.protected), opts.allowGlobal ?? [], !!opts.allowQueryText));
   }
@@ -254,6 +255,20 @@ async function strictChecks(client: pg.ClientBase, protectedTables: TableReport[
   for (const c of CHECKS().checks.filter((x) => x.name.startsWith("strict:"))) out.push(await fileCheck(client, c));
   out.push(await definer(), await queryText(client, !allowQueryText));
   return out;
+}
+
+/** @query keys_without_tenant: a side channel, so --strict fails on it; else an information line. */
+function keysCheck(client: pg.ClientBase, protectedTables: TableReport[], column: string, strict: boolean): Promise<Check> {
+  const check = async () => {
+    const { rows } = await client.query(q("keys_without_tenant"),
+                                        [JSON.stringify(protectedTables.map((t) => [t.schema, t.table])), column]);
+    const items = rows.map((r) => r.item as string);
+    return { ok: items.length === 0, detail: items.length
+      ? `without the tenant column: ${listed(items)} (a duplicate, or a missing parent, tells the app that another ` +
+        `tenant has the value: put ${column} in the key)`
+      : `every key includes ${column}` };
+  };
+  return strict ? guard("strict: keys include the tenant", check) : info("keys include the tenant (info)", check);
 }
 
 /** Tables with the tenant column outside the scanned schemas that the role can read. */

@@ -427,6 +427,26 @@ describe("migrate, scan, verify", live, () => {
     });
   });
 
+  it("migrate --ddl-guard protects a new table at once, refuses weakening one, and verify reports it", async () => {
+    const drop = "DROP EVENT TRIGGER IF EXISTS _firewall_ddl_guard; DROP EVENT TRIGGER IF EXISTS _firewall_ddl_drop_guard";
+    try {
+      const m = await run(["migrate", "--url", ADMIN_URL, ...scope, "--mode", "restrictive", "--ddl-guard"]);
+      assert.equal(m.code, 0, m.stderr);
+      await sql(`CREATE TABLE ${S}.guarded (id int, tenant_id text)`);
+      const t = byTable((await json(["scan", "--url", ADMIN_URL, ...scope])).data.tables);
+      assert.ok(t.guarded.protected, JSON.stringify(t.guarded));
+      await assert.rejects(sql(`ALTER TABLE ${S}.guarded DISABLE ROW LEVEL SECURITY`), /DB Firewall/);
+      const [{ stem }] = await sql(`SELECT 'fw_' || left(md5('${S}.guarded'), 12) AS stem`);
+      await assert.rejects(sql(`DROP POLICY ${stem}_sel ON ${S}.guarded`), /DB Firewall/);
+      const v = await json(["verify", ...APP(), "--tenant", "A", ...clean, "--exclude", "guarded"]);
+      assert.match(v.data.checks.find((c) => c.check === "DDL guard (info)").detail, /^on/);
+    } finally {
+      await sql(`${drop}; DROP TABLE IF EXISTS ${S}.guarded`);
+    }
+    const v = await json(["verify", ...APP(), "--tenant", "A", ...clean]);
+    assert.match(v.data.checks.find((c) => c.check === "DDL guard (info)").detail, /^off/);
+  });
+
   it("key prints the database's key", async () => {
     const r = await run(["key", "--url", ADMIN_URL]);
     assert.equal(r.code, 0);

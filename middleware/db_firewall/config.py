@@ -56,7 +56,7 @@ DEFAULT_CONFIG = {
     "engines": {
         "postgresql": {"use_rls": True, "schema": "public", "policy_mode": "permissive",
                        "tenant_context": "signed", "harden_signals": False, "harden": False,
-                       "app_role": None},
+                       "app_role": None, "ddl_guard": False},
         "mysql": {"use_views": True, "schema": None},
         "sqlserver": {"use_rls": True, "schema": "dbo"},
         "oracle": {"use_vpd": True, "schema": None, "audit_table": "VPD_AUDIT_LOG"},
@@ -124,7 +124,7 @@ def validate_config(config: dict) -> None:
         raise ValueError(f"DB Firewall: engines.postgresql.tenant_context must be signed "
                          f"or plain, got {ctx!r}")
     pg = (config.get("engines") or {}).get("postgresql") or {}
-    for flag in ("harden_signals", "harden"):
+    for flag in ("harden_signals", "harden", "ddl_guard"):
         if not isinstance(pg.get(flag, False), bool):
             raise ValueError(f"DB Firewall: engines.postgresql.{flag} must be true or false, got {pg.get(flag)!r}")
     if pg.get("app_role") is not None and (not isinstance(pg["app_role"], str) or not pg["app_role"]):

@@ -1,5 +1,28 @@
 # Changelog
 
+## 2026-10-29: DDL guard and key checks (PR #18)
+
+- **`migrate --ddl-guard`** (`dbfw.ddl_guard`, `engines.postgresql.ddl_guard`):
+  two event triggers. In a schema the migration protects, a table with the
+  tenant column and no firewall policies (created, renamed, or given the
+  column) is protected at the end of the command. A command that weakens a
+  protected table fails: RLS off or not forced, a firewall policy dropped or
+  altered (also through `DROP COLUMN ... CASCADE`), or another permissive
+  policy in permissive mode. `SET dbfw.ddl_guard_skip = 'on'` skips it; the
+  migration sets that for itself. Needs a superuser. Off by default.
+- **Migration:** protecting one table is now a function,
+  `public._firewall_protect(schema, table, column, mode, context)`, which
+  section 6 and the guard call. It also drops the firewall policies of an
+  earlier name of the table (a rename changes the policy stem). A new table,
+  `public._firewall_protected_schemas`, records the schemas the migration
+  protects and how; only its owner reads or writes it, and `verify` fails when
+  the app can write it.
+- **`verify`: keys include the tenant.** Unique keys and foreign keys to
+  protected tables that leave out the tenant column are listed (an
+  information line; `--strict` fails), in both tools. A single-column key on
+  a generated value is not. A new information line reports the DDL guard.
+- **Corpus:** 96 attacks and 7 safe patterns.
+
 ## 2026-10-28: one set of PostgreSQL checks, and `python -m hooks.verify` (PR #17)
 
 - **`checks/postgresql.sql`:** every query of `scan` and `verify` on

@@ -458,3 +458,52 @@ def test_harden_options_are_checked(pg, match):
     from middleware.db_firewall.config import validate_config
     with pytest.raises(ValueError, match=match):
         validate_config({"engines": {"postgresql": pg}})
+
+
+def _drop_guard():
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute("DROP EVENT TRIGGER IF EXISTS _firewall_ddl_guard")
+        c.execute("DROP EVENT TRIGGER IF EXISTS _firewall_ddl_drop_guard")
+
+
+def test_ddl_guard_protects_new_tables_and_refuses_weakening():
+    """Event triggers are database-wide: the test removes them at the end."""
+    cfg = _cfg()
+    cfg["engines"]["postgresql"].update(ddl_guard=True)
+    try:
+        with psycopg.connect(DSN) as c:
+            run_migration(c, DBEngine.POSTGRESQL, cfg)
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"CREATE TABLE {SCHEMA}.later (id int, tenant_id text)")
+            c.execute(f"INSERT INTO {SCHEMA}.later VALUES (1, 'A'), (2, 'B')")
+            c.execute(f"GRANT SELECT ON {SCHEMA}.later TO {ROLE}")
+        assert scan_tables(psycopg.connect(DSN), DBEngine.POSTGRESQL, _cfg())["later"]["protected"]
+        stem = psycopg.connect(DSN).execute(f"SELECT 'fw_' || left(md5('{SCHEMA}.later'), 12)").fetchone()[0]
+        refused = [f"ALTER TABLE {SCHEMA}.later DISABLE ROW LEVEL SECURITY",
+                   f"ALTER TABLE {SCHEMA}.later NO FORCE ROW LEVEL SECURITY",
+                   f"DROP POLICY {stem}_sel ON {SCHEMA}.later",
+                   f"ALTER POLICY {stem}_sel ON {SCHEMA}.later USING (true)",
+                   f"CREATE POLICY open_all ON {SCHEMA}.later USING (true)",             # permissive mode: ORs
+                   f"ALTER TABLE {SCHEMA}.later DROP COLUMN tenant_id CASCADE"]
+        for sql in refused:
+            with psycopg.connect(DSN, autocommit=True) as c, pytest.raises(psycopg.Error, match="DB Firewall"):
+                c.execute(sql)
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"CREATE POLICY narrow ON {SCHEMA}.later AS RESTRICTIVE USING (id > 0)")   # narrows: fine
+            c.execute(f"DROP POLICY narrow ON {SCHEMA}.later")
+            c.execute(f"ALTER TABLE {SCHEMA}.later RENAME TO later2")                       # protected again
+        assert scan_tables(psycopg.connect(DSN), DBEngine.POSTGRESQL, _cfg())["later2"]["protected"]
+        with psycopg.connect(DSN) as c:                                                     # a re-run passes the guard
+            run_migration(c, DBEngine.POSTGRESQL, cfg)
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"DROP TABLE {SCHEMA}.later2")                                       # dropping the table is fine
+    finally:
+        _drop_guard()
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"DROP TABLE IF EXISTS {SCHEMA}.later, {SCHEMA}.later2")
+
+
+def test_ddl_guard_is_a_boolean():
+    from middleware.db_firewall.config import validate_config
+    with pytest.raises(ValueError, match="ddl_guard"):
+        validate_config({"engines": {"postgresql": {"ddl_guard": "yes"}}})

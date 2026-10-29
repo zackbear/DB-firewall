@@ -188,6 +188,19 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
   backend signals. It refuses when the app role owns the database or any
   object in it, or keeps one of these through a role it is a member of. Both cover the whole database;
   `--harden` needs a superuser.
+* **DDL guard.** `npx db-firewall migrate --ddl-guard` (or
+  `engines.postgresql.ddl_guard: true`) installs two event triggers: a new
+  table with the tenant column in a protected schema is protected at the end
+  of the `CREATE TABLE` (or `ALTER TABLE ... ADD COLUMN`, or a rename), not at
+  the next migration run, and a change that weakens a protected table fails
+  (RLS off or not forced, a firewall policy dropped or altered, another
+  permissive policy in permissive mode). It is a safety net for later
+  migrations, not a boundary against a superuser. Needs a superuser.
+* **Keys that tell on other tenants.** A unique key, or a foreign key to a
+  protected table, that leaves out the tenant column still sees every
+  tenant's rows: a duplicate error, or a missing parent, shows the app that
+  another tenant has the value. `verify` lists them (`--strict` fails on
+  them). Put the tenant column in the key.
 * **One role for all tenants.** Sessions of the same role can read each
   other's current query text in `pg_stat_activity`, and can end or cancel each
   other's backends (`pg_terminate_backend`). An app role can also change its

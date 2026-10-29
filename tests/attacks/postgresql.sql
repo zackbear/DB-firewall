@@ -892,6 +892,40 @@ CREATE TABLE {S}."x.pg_stat_statements" (note text); GRANT SELECT ON {S}."x.pg_s
 -- @undo
 DROP TABLE {S}."x.pg_stat_statements";
 
+-- ---------------------------------------------------------------- keys that tell on other tenants
+-- @attack a unique key without the tenant column (a duplicate shows another tenant has the value)
+-- @check -: strict: keys include the tenant
+-- @mode strict
+-- @setup
+ALTER TABLE {S}.docs ADD COLUMN email text UNIQUE;
+-- @undo
+ALTER TABLE {S}.docs DROP COLUMN email;
+
+-- @attack a unique expression index without the tenant column
+-- @check -: strict: keys include the tenant
+-- @mode strict
+-- @setup
+CREATE UNIQUE INDEX docs_body_lower ON {S}.docs (lower(body));
+-- @undo
+DROP INDEX {S}.docs_body_lower;
+
+-- @attack a unique key with the tenant column only in INCLUDE
+-- @check -: strict: keys include the tenant
+-- @mode strict
+-- @setup
+CREATE UNIQUE INDEX docs_body_inc ON {S}.docs (body) INCLUDE (tenant_id);
+-- @undo
+DROP INDEX {S}.docs_body_inc;
+
+-- @attack a foreign key to a protected table without the tenant column (a missing parent shows)
+-- @check -: strict: keys include the tenant
+-- @mode strict
+-- @setup
+ALTER TABLE {S}.docs ADD CONSTRAINT docs_id_key UNIQUE (id);
+CREATE TABLE {S}.child (doc_id int REFERENCES {S}.docs (id));
+-- @undo
+DROP TABLE {S}.child; ALTER TABLE {S}.docs DROP CONSTRAINT docs_id_key;
+
 -- ---------------------------------------------------------------- safe patterns
 -- @pass a security_invoker view over a protected table
 -- @min 15
@@ -938,3 +972,13 @@ DROP EXTENSION pgcrypto; DROP EXTENSION citext; DROP EXTENSION pg_trgm;
 CREATE EXTENSION pg_stat_statements SCHEMA public;
 -- @undo
 DROP EXTENSION pg_stat_statements;
+
+-- @pass keys that include the tenant, and a serial primary key, in strict mode
+-- @mode strict
+-- @setup
+ALTER TABLE {S}.docs ADD PRIMARY KEY (id); ALTER TABLE {S}.docs ADD CONSTRAINT docs_tenant_body UNIQUE (tenant_id, body);
+ALTER TABLE {S}.docs ADD CONSTRAINT docs_tenant_id UNIQUE (tenant_id, id);
+CREATE TABLE {S}.child (doc_tenant text, doc_id int, FOREIGN KEY (doc_tenant, doc_id) REFERENCES {S}.docs (tenant_id, id));
+-- @undo
+DROP TABLE {S}.child; ALTER TABLE {S}.docs DROP CONSTRAINT docs_tenant_id, DROP CONSTRAINT docs_tenant_body,
+DROP CONSTRAINT docs_pkey;
