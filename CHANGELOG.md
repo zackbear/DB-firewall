@@ -25,7 +25,9 @@
   generated column, an index expression, a domain constraint) is not
   stopped. PostgreSQL fires no event trigger for `EXPLAIN ANALYZE CREATE
   TABLE AS` or `SELECT INTO`: such a table is protected by the next DDL
-  command in the database. A `public._firewall_*` object of another role is
+  command in the database, and is open until then. The guard is a safety
+  net for migrations, not a boundary against a role with `CREATE` on a
+  protected schema. A `public._firewall_*` object of another role is
   refused (an overload with a default argument made the firewall's calls
   ambiguous). Only a superuser or the migration's role can
   skip it (`SET dbfw.ddl_guard_skip = 'on'`); the migration sets that for

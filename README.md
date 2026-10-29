@@ -207,8 +207,12 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
   runs on every tenant's writes, and can copy them out. PostgreSQL fires no
   event trigger for `EXPLAIN ANALYZE CREATE TABLE AS` (or `SELECT INTO`): a
   table made that way stays open until the next DDL command in the
-  database, which protects it, and `verify` fails on it until then. Keep
-  `CREATE` on the protected schemas to the roles that run migrations. The
+  database, which protects it, and `verify` fails on it until then. With
+  default privileges that grant the app role access to new tables, the app
+  can read and write such a table until then. So the guard is a safety net
+  for migrations, not a boundary against a role that holds `CREATE` on a
+  protected schema and means harm: keep `CREATE` there to the roles that run
+  migrations. The
   guard also refuses a `public._firewall_*` object of another role (an
   overload of a firewall function makes its calls ambiguous).
 * **Tenant column type.** The migration refuses a tenant column whose type
