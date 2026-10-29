@@ -216,7 +216,7 @@ def _scan_postgres_tables(cursor, tenant_col, excluded, opts) -> Dict[str, dict]
             "tenant_context": found,
             "altered_policies": altered,
             "predicate_check": ("unavailable: " + str(why)
-                                + " (run the scanner outside a read-only transaction, with the "
+                                + " (run outside a read-only transaction, with the "
                                   "TEMP privilege and SELECT on the table)") if unverified
                                else f"firewall functions {objects}" if objects else "ok",
             # restrictive mode: "<stem>_base" (USING true) next to the app's own

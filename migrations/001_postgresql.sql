@@ -411,89 +411,162 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp;
 
--- The DDL guard, at the end of every CREATE TABLE, ALTER TABLE, CREATE
--- POLICY and ALTER POLICY. In a schema this script protects, a table with
--- the tenant column and no firewall policies (new, renamed, or given the
--- column) is protected at once, the way this script would, so there is no
--- window until the next run. A change that weakens a protected table fails:
--- RLS off or not forced, a firewall policy missing or altered, or (in
--- permissive mode) another permissive policy, which ORs with the tenant
--- policies. It is a safety net against mistakes in migrations, not a
--- boundary against a superuser: SET dbfw.ddl_guard_skip = 'on' skips it,
--- and this script sets that for itself. SECURITY DEFINER: it reads
--- _firewall_protected_schemas, and protects a table whoever created it.
+-- The DDL guard, at the end of every CREATE TABLE, ALTER TABLE, ALTER SCHEMA,
+-- CREATE POLICY and ALTER POLICY. A table counts as protected when it has
+-- firewall policies.
+--   * In a schema this script protects, a table with the tenant column and no
+--     firewall policies (new, or given the column) is protected at once, the
+--     way this script would, so there is no window until the next run. One
+--     with a permissive policy of its own, in permissive mode, is refused
+--     instead (that policy would OR with the tenant policies).
+--   * A command fails when it weakens a protected table: RLS off or not
+--     forced, a firewall policy missing, renamed or altered, another
+--     permissive policy in permissive mode, or the table taken out of what
+--     this script protects (its schema, a name it skips, its tenant column).
+--     A renamed table, still protected, gets the policies of its new name.
+--   * Inheritance: a protected table under a parent that is not protected
+--     (INHERIT, ATTACH PARTITION) fails: reading the parent shows its rows.
+-- It binds every role but a superuser and the role that owns this script's
+-- objects: only they can skip it (SET dbfw.ddl_guard_skip = 'on'), as this
+-- script does for itself. SECURITY DEFINER (its owner is a superuser, who
+-- installs it): it protects a table whoever created it, and pauses its own
+-- event triggers while it does. Every call it makes passes text arguments,
+-- so a function planted with other argument types (name, say) cannot match
+-- better than the firewall's own.
 CREATE OR REPLACE FUNCTION public._firewall_ddl_guard()
 RETURNS EVENT_TRIGGER AS $$
 DECLARE
     t RECORD;
+    s RECORD;
+    pol RECORD;
     stem TEXT;
+    names TEXT[];
+    eligible BOOLEAN;
     have INT;
+    fw INT;
     rls BOOLEAN;
     forced BOOLEAN;
-    pol RECORD;
 BEGIN
-    IF current_setting('dbfw.ddl_guard_skip', true) = 'on' THEN
+    IF current_setting('dbfw.ddl_guard_skip', true) = 'on'
+       AND ((SELECT rolsuper FROM pg_roles WHERE rolname = session_user)
+            OR pg_has_role(session_user, (SELECT proowner FROM pg_proc
+                                          WHERE oid = 'public._firewall_protect(text, text, text, text, text)'::regprocedure),
+                           'MEMBER')) THEN
         RETURN;
     END IF;
+    -- A renamed schema takes its protected tables out of what this script protects.
     FOR t IN
-        SELECT DISTINCT c.oid, n.nspname, c.relname, s.tenant_column, s.policy_mode, s.context, d.command_tag,
+        SELECT n.oid, n.nspname::text AS nspname FROM pg_event_trigger_ddl_commands() d
+        JOIN pg_namespace n ON n.oid = d.objid
+        WHERE d.classid = 'pg_catalog.pg_namespace'::regclass
+    LOOP
+        IF NOT EXISTS (SELECT 1 FROM public._firewall_protected_schemas WHERE schema_name = t.nspname)
+           AND EXISTS (SELECT 1 FROM pg_class c JOIN pg_policy p ON p.polrelid = c.oid
+                       WHERE c.relnamespace = t.oid AND p.polname ~ '^fw_[0-9a-f]{12}_(sel|ins|upd|del)$') THEN
+            RAISE EXCEPTION 'DB Firewall: schema % holds protected tables and is not a schema the migration protects', t.nspname
+                USING HINT = 'Rename it back, or migrate the new name first.';
+        END IF;
+    END LOOP;
+    FOR t IN
+        SELECT DISTINCT c.oid, n.nspname::text AS nspname, c.relname::text AS relname, d.command_tag::text AS tag,
                CASE WHEN d.classid = 'pg_catalog.pg_policy'::regclass THEN d.objid END AS policy
         FROM pg_event_trigger_ddl_commands() d
         JOIN pg_class c ON c.oid = CASE WHEN d.classid = 'pg_catalog.pg_policy'::regclass
                                         THEN (SELECT polrelid FROM pg_policy WHERE oid = d.objid) ELSE d.objid END
         JOIN pg_namespace n ON n.oid = c.relnamespace
-        JOIN public._firewall_protected_schemas s ON s.schema_name = n.nspname
         WHERE d.classid IN ('pg_catalog.pg_class'::regclass, 'pg_catalog.pg_policy'::regclass)
-          AND c.relkind IN ('r', 'p')
-          AND c.relname NOT LIKE '#_firewall#_%' ESCAPE '#'
-          AND c.relname NOT IN ('schema_migrations', 'alembic_version', 'knex_migrations', 'prisma_migrations',
-                                '__diesel_schema_migrations', 'flyway_schema_history')
-          AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attname = s.tenant_column
-                        AND a.attnum > 0 AND NOT a.attisdropped)
+          AND c.relkind IN ('r', 'p') AND c.relpersistence <> 't'
     LOOP
+        SELECT * INTO s FROM public._firewall_protected_schemas WHERE schema_name = t.nspname;
+        eligible := s.schema_name IS NOT NULL
+            AND t.relname NOT LIKE '#_firewall#_%' ESCAPE '#'
+            AND t.relname NOT IN ('schema_migrations', 'alembic_version', 'knex_migrations', 'prisma_migrations',
+                                  '__diesel_schema_migrations', 'flyway_schema_history')
+            AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = t.oid AND a.attname = s.tenant_column
+                          AND a.attnum > 0 AND NOT a.attisdropped);
+        stem := 'fw_' || left(md5(t.nspname || '.' || t.relname), 12);
+        names := ARRAY[stem || '_sel', stem || '_ins', stem || '_upd', stem || '_del'];
         -- Read now, not in the loop's query: one command can report a table
         -- twice (CREATE TABLE with a foreign key), and the first pass protects it.
-        stem := 'fw_' || left(md5(t.nspname || '.' || t.relname), 12);
         SELECT relrowsecurity, relforcerowsecurity INTO rls, forced FROM pg_class WHERE oid = t.oid;
-        SELECT count(*) INTO have FROM pg_policy
-        WHERE polrelid = t.oid AND polname IN (stem || '_sel', stem || '_ins', stem || '_upd', stem || '_del');
-        IF have = 0 AND t.policy IS NULL THEN
-            PERFORM set_config('dbfw.ddl_guard_skip', 'on', true);
-            PERFORM public._firewall_protect(t.nspname, t.relname, t.tenant_column, t.policy_mode, t.context);
-            PERFORM set_config('dbfw.ddl_guard_skip', '', true);
-            RAISE NOTICE 'DB Firewall: RLS applied to %.% (DDL guard)', t.nspname, t.relname;
+        SELECT count(*) FILTER (WHERE polname = ANY (names)),
+               count(*) FILTER (WHERE polname ~ '^fw_[0-9a-f]{12}_(sel|ins|upd|del)$')
+          INTO have, fw FROM pg_policy WHERE polrelid = t.oid;
+        IF fw = 0 THEN
+            IF eligible AND t.policy IS NULL THEN
+                IF s.policy_mode = 'permissive' AND EXISTS (SELECT 1 FROM pg_policy WHERE polrelid = t.oid AND polpermissive) THEN
+                    RAISE EXCEPTION 'DB Firewall: %.% has a permissive policy of its own, which would OR with the tenant policies', t.nspname, t.relname
+                        USING HINT = 'Make it AS RESTRICTIVE, or migrate with policy_mode restrictive.';
+                END IF;
+                ALTER EVENT TRIGGER _firewall_ddl_guard DISABLE;
+                ALTER EVENT TRIGGER _firewall_ddl_drop_guard DISABLE;
+                PERFORM public._firewall_protect(t.nspname::text, t.relname::text, s.tenant_column::text,
+                                                 s.policy_mode::text, s.context::text);
+                ALTER EVENT TRIGGER _firewall_ddl_guard ENABLE ALWAYS;
+                ALTER EVENT TRIGGER _firewall_ddl_drop_guard ENABLE ALWAYS;
+                RAISE NOTICE 'DB Firewall: RLS applied to %.% (DDL guard)', t.nspname, t.relname;
+            END IF;
+        ELSIF NOT eligible THEN
+            RAISE EXCEPTION 'DB Firewall: % takes the protected table %.% out of what the migration protects (its schema, a name it skips, or its tenant column changed)', t.tag, t.nspname, t.relname
+                USING HINT = 'Undo the change, or drop the firewall policies with the migration''s role first.';
+        ELSIF have = 0 AND t.policy IS NULL AND rls AND forced THEN
+            -- Renamed: the policies of the old name, still in place, give way to the new name's.
+            ALTER EVENT TRIGGER _firewall_ddl_guard DISABLE;
+            ALTER EVENT TRIGGER _firewall_ddl_drop_guard DISABLE;
+            PERFORM public._firewall_protect(t.nspname::text, t.relname::text, s.tenant_column::text,
+                                             s.policy_mode::text, s.context::text);
+            ALTER EVENT TRIGGER _firewall_ddl_guard ENABLE ALWAYS;
+            ALTER EVENT TRIGGER _firewall_ddl_drop_guard ENABLE ALWAYS;
         ELSIF have < 4 OR NOT rls OR NOT forced THEN
-            RAISE EXCEPTION 'DB Firewall: % would leave %.% without its row-level security (RLS enabled and forced, the four firewall policies)', t.command_tag, t.nspname, t.relname
+            RAISE EXCEPTION 'DB Firewall: % would leave %.% without its row-level security (RLS enabled and forced, the four firewall policies)', t.tag, t.nspname, t.relname
                 USING HINT = 'Re-run the migration to change how tables are protected. The DDL guard checks every change: see migrations/001_postgresql.sql, section 5b.';
         ELSIF t.policy IS NOT NULL THEN
-            SELECT polname, polpermissive INTO pol FROM pg_policy WHERE oid = t.policy;
-            IF left(pol.polname, 15) = stem AND t.command_tag = 'ALTER POLICY' THEN
+            SELECT polname::text AS polname, polpermissive INTO pol FROM pg_policy WHERE oid = t.policy;
+            IF pol.polname = ANY (names || (stem || '_base')) AND t.tag = 'ALTER POLICY' THEN
                 RAISE EXCEPTION 'DB Firewall: ALTER POLICY on the firewall policy % of %.%', pol.polname, t.nspname, t.relname
                     USING HINT = 'Re-run the migration to change the firewall policies.';
-            ELSIF left(pol.polname, 15) <> stem AND pol.polpermissive AND t.policy_mode = 'permissive' THEN
+            ELSIF NOT pol.polname = ANY (names || (stem || '_base')) AND pol.polpermissive AND s.policy_mode = 'permissive' THEN
                 RAISE EXCEPTION 'DB Firewall: the permissive policy % on %.% ORs with the tenant policies and opens other tenants'' rows', pol.polname, t.nspname, t.relname
                     USING HINT = 'Make it AS RESTRICTIVE, or migrate with policy_mode restrictive.';
             END IF;
+        END IF;
+        -- A protected table under a parent that is not protected, or an
+        -- unprotected table that gained a protected child: reading the parent
+        -- shows the child's rows without the child's policies.
+        IF EXISTS (SELECT 1 FROM pg_inherits i WHERE i.inhrelid = t.oid
+                     AND EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = t.oid
+                                   AND p.polname ~ '^fw_[0-9a-f]{12}_(sel|ins|upd|del)$')
+                     AND NOT EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = i.inhparent
+                                       AND p.polname ~ '^fw_[0-9a-f]{12}_(sel|ins|upd|del)$'))
+           OR (NOT EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = t.oid
+                             AND p.polname ~ '^fw_[0-9a-f]{12}_(sel|ins|upd|del)$')
+               AND EXISTS (SELECT 1 FROM pg_inherits i JOIN pg_policy p ON p.polrelid = i.inhrelid
+                           WHERE i.inhparent = t.oid AND p.polname ~ '^fw_[0-9a-f]{12}_(sel|ins|upd|del)$')) THEN
+            RAISE EXCEPTION 'DB Firewall: % puts a protected table under %.%, which is not protected: reading it shows the protected rows', t.tag, t.nspname, t.relname
+                USING HINT = 'Protect the parent first (give it the tenant column and re-run the migration).';
         END IF;
     END LOOP;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
 
--- The same guard for drops: a firewall policy dropped from a protected table
--- that still exists (DROP POLICY, a column dropped with CASCADE, DROP OWNED).
--- Dropping the table itself is fine.
+-- The same guard for drops: a firewall policy dropped from a table that still
+-- exists (DROP POLICY, a column dropped with CASCADE, DROP OWNED). Dropping
+-- the table itself is fine. The same roles can skip it.
 CREATE OR REPLACE FUNCTION public._firewall_ddl_drop_guard()
 RETURNS EVENT_TRIGGER AS $$
 DECLARE
     o RECORD;
 BEGIN
-    IF current_setting('dbfw.ddl_guard_skip', true) = 'on' THEN
+    IF current_setting('dbfw.ddl_guard_skip', true) = 'on'
+       AND ((SELECT rolsuper FROM pg_roles WHERE rolname = session_user)
+            OR pg_has_role(session_user, (SELECT proowner FROM pg_proc
+                                          WHERE oid = 'public._firewall_protect(text, text, text, text, text)'::regprocedure),
+                           'MEMBER')) THEN
         RETURN;
     END IF;
     FOR o IN
         SELECT d.address_names[1] AS sch, d.address_names[2] AS tbl, d.address_names[3] AS pol
         FROM pg_event_trigger_dropped_objects() d
-        JOIN public._firewall_protected_schemas s ON s.schema_name = d.address_names[1]
         WHERE d.object_type = 'policy' AND d.address_names[3] ~ '^fw_[0-9a-f]{12}_(sel|ins|upd|del)$'
           AND to_regclass(quote_ident(d.address_names[1]) || '.' || quote_ident(d.address_names[2])) IS NOT NULL
     LOOP
@@ -529,7 +602,9 @@ BEGIN
     IF ctx NOT IN ('signed', 'plain') THEN
         RAISE EXCEPTION 'DB Firewall: dbfw.context must be signed or plain, got %', ctx;
     END IF;
-    -- What the DDL guard protects later tables with.
+    -- What the DDL guard protects later tables with (and no schema that is gone).
+    DELETE FROM public._firewall_protected_schemas p
+    WHERE NOT EXISTS (SELECT 1 FROM pg_namespace n WHERE n.nspname = p.schema_name);
     INSERT INTO public._firewall_protected_schemas (schema_name, tenant_column, policy_mode, context)
     VALUES (sch, col, mode, ctx)
     ON CONFLICT (schema_name) DO UPDATE SET tenant_column = EXCLUDED.tenant_column,
@@ -550,7 +625,8 @@ BEGIN
                 '__diesel_schema_migrations', 'flyway_schema_history'
             )
     LOOP
-        PERFORM public._firewall_protect(r.table_schema, r.table_name, col, mode, ctx);
+        -- text arguments: a function planted with other types cannot match better.
+        PERFORM public._firewall_protect(r.table_schema::text, r.table_name::text, col::text, mode::text, ctx::text);
 
         RAISE NOTICE 'DB Firewall: RLS applied to %.%', r.table_schema, r.table_name;
     END LOOP;
@@ -806,9 +882,11 @@ BEGIN
     IF NOT (SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user) THEN
         RAISE EXCEPTION 'DB Firewall: dbfw.ddl_guard needs a superuser (event triggers)';
     END IF;
+    DROP EVENT TRIGGER IF EXISTS _firewall_ddl_guard;       -- created again: its tags may have changed
     IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_event_trigger WHERE evtname = '_firewall_ddl_guard') THEN
         CREATE EVENT TRIGGER _firewall_ddl_guard ON ddl_command_end
-            WHEN TAG IN ('CREATE TABLE', 'CREATE TABLE AS', 'SELECT INTO', 'ALTER TABLE', 'CREATE POLICY', 'ALTER POLICY')
+            WHEN TAG IN ('CREATE TABLE', 'CREATE TABLE AS', 'SELECT INTO', 'ALTER TABLE', 'ALTER SCHEMA',
+                         'CREATE POLICY', 'ALTER POLICY')
             EXECUTE FUNCTION public._firewall_ddl_guard();
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_event_trigger WHERE evtname = '_firewall_ddl_drop_guard') THEN

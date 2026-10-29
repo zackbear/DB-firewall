@@ -926,6 +926,31 @@ CREATE TABLE {S}.child (doc_id int REFERENCES {S}.docs (id));
 -- @undo
 DROP TABLE {S}.child; ALTER TABLE {S}.docs DROP CONSTRAINT docs_id_key;
 
+-- @attack an exclusion constraint without the tenant column
+-- @check -: strict: keys include the tenant
+-- @mode strict
+-- @setup
+ALTER TABLE {S}.docs ADD COLUMN span int4range, ADD CONSTRAINT docs_span EXCLUDE USING gist (span WITH &&);
+-- @undo
+ALTER TABLE {S}.docs DROP COLUMN span;
+
+-- @attack a one-column unique key with a constant default (not a generated value)
+-- @check -: strict: keys include the tenant
+-- @mode strict
+-- @setup
+ALTER TABLE {S}.docs ADD COLUMN code text UNIQUE; ALTER TABLE {S}.docs ALTER COLUMN code SET DEFAULT '';
+-- @undo
+ALTER TABLE {S}.docs DROP COLUMN code;
+
+-- @attack a foreign key whose tenant position is filled by another column
+-- @check -: strict: keys include the tenant
+-- @mode strict
+-- @setup
+ALTER TABLE {S}.docs ADD CONSTRAINT docs_tenant_id UNIQUE (tenant_id, id);
+CREATE TABLE {S}.child (owner text, doc_id int, FOREIGN KEY (owner, doc_id) REFERENCES {S}.docs (tenant_id, id));
+-- @undo
+DROP TABLE {S}.child; ALTER TABLE {S}.docs DROP CONSTRAINT docs_tenant_id;
+
 -- ---------------------------------------------------------------- safe patterns
 -- @pass a security_invoker view over a protected table
 -- @min 15
@@ -978,7 +1003,10 @@ DROP EXTENSION pg_stat_statements;
 -- @setup
 ALTER TABLE {S}.docs ADD PRIMARY KEY (id); ALTER TABLE {S}.docs ADD CONSTRAINT docs_tenant_body UNIQUE (tenant_id, body);
 ALTER TABLE {S}.docs ADD CONSTRAINT docs_tenant_id UNIQUE (tenant_id, id);
-CREATE TABLE {S}.child (doc_tenant text, doc_id int, FOREIGN KEY (doc_tenant, doc_id) REFERENCES {S}.docs (tenant_id, id));
+CREATE TABLE {S}.child (tenant_id text, doc_id int, FOREIGN KEY (tenant_id, doc_id) REFERENCES {S}.docs (tenant_id, id));
+SELECT public._firewall_protect(schema_name::text, 'child', tenant_column::text, policy_mode::text, context::text)
+FROM public._firewall_protected_schemas WHERE schema_name = '{S}';
+GRANT SELECT, INSERT ON {S}.child TO {ROLE};
 -- @undo
 DROP TABLE {S}.child; ALTER TABLE {S}.docs DROP CONSTRAINT docs_tenant_id, DROP CONSTRAINT docs_tenant_body,
 DROP CONSTRAINT docs_pkey;

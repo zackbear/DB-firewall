@@ -507,3 +507,58 @@ def test_ddl_guard_is_a_boolean():
     from middleware.db_firewall.config import validate_config
     with pytest.raises(ValueError, match="ddl_guard"):
         validate_config({"engines": {"postgresql": {"ddl_guard": "yes"}}})
+
+
+def test_ddl_guard_resists_a_table_owner():
+    """Review findings for PR 18: a role that owns a table in a protected
+    schema, and can CREATE in public, cannot use the guard to become a
+    superuser, skip it, or take its table out of protection."""
+    cfg = _cfg()
+    cfg["engines"]["postgresql"].update(ddl_guard=True)
+    atk = "sg_atk"
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute(f"DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{atk}') "
+                  f"THEN CREATE ROLE {atk} LOGIN; END IF; END $$")
+        c.execute(f"GRANT CREATE, USAGE ON SCHEMA public, {SCHEMA} TO {atk}")
+        c.execute("DROP SCHEMA IF EXISTS sg_other CASCADE; CREATE SCHEMA sg_other")
+        c.execute(f"GRANT CREATE, USAGE ON SCHEMA sg_other TO {atk}")
+    try:
+        with psycopg.connect(DSN) as c:
+            run_migration(c, DBEngine.POSTGRESQL, cfg)
+        with psycopg.connect(f"{DSN} user={atk}", autocommit=True) as c:
+            # A planted overload with name arguments, an exact match for the old call.
+            c.execute("CREATE FUNCTION public._firewall_protect(a name, b name, x text, y text, z text) RETURNS void "
+                      f"LANGUAGE plpgsql AS $f$ BEGIN EXECUTE 'ALTER ROLE {atk} SUPERUSER'; END $f$")
+            c.execute(f"CREATE TABLE {SCHEMA}.bait (id int, tenant_id text)")
+        with psycopg.connect(DSN, autocommit=True) as c:
+            assert c.execute(f"SELECT rolsuper FROM pg_roles WHERE rolname = '{atk}'").fetchone()[0] is False
+            assert c.execute(f"SELECT count(*) FROM pg_policy WHERE polrelid = '{SCHEMA}.bait'::regclass").fetchone()[0] == 4
+        stem = psycopg.connect(DSN).execute(f"SELECT 'fw_' || left(md5('{SCHEMA}.bait'), 12)").fetchone()[0]
+        refused = [
+            f"SET dbfw.ddl_guard_skip = 'on'; ALTER TABLE {SCHEMA}.bait DISABLE ROW LEVEL SECURITY",   # not theirs to skip
+            f"ALTER POLICY {stem}_sel ON {SCHEMA}.bait RENAME TO mine",
+            f"CREATE POLICY {stem}_x ON {SCHEMA}.bait USING (true)",                  # named like the stem
+            f"ALTER TABLE {SCHEMA}.bait RENAME COLUMN tenant_id TO tid",
+            f"ALTER TABLE {SCHEMA}.bait RENAME TO schema_migrations",
+            f"ALTER TABLE {SCHEMA}.bait SET SCHEMA sg_other",
+            f"CREATE TABLE {SCHEMA}._firewall_p (id int, tenant_id text); ALTER TABLE {SCHEMA}.bait INHERIT {SCHEMA}._firewall_p",
+        ]
+        for sql in refused:
+            with psycopg.connect(f"{DSN} user={atk}", autocommit=True) as c, pytest.raises(psycopg.Error, match="DB Firewall"):
+                c.execute(sql)
+        with psycopg.connect(f"{DSN} user={atk}", autocommit=True) as c:
+            c.execute(f"CREATE TABLE {SCHEMA}.own (x int); CREATE POLICY everyone ON {SCHEMA}.own USING (true)")
+            with pytest.raises(psycopg.Error, match="permissive policy of its own"):
+                c.execute(f"ALTER TABLE {SCHEMA}.own ADD COLUMN tenant_id text")
+        for sql in [f"ALTER SCHEMA {SCHEMA} RENAME TO {SCHEMA}_x",                # a superuser, without the skip
+                    f"SET session_replication_role = replica; ALTER TABLE {SCHEMA}.bait DISABLE ROW LEVEL SECURITY"]:
+            with psycopg.connect(DSN, autocommit=True) as c, pytest.raises(psycopg.Error, match="DB Firewall"):
+                c.execute(sql)
+    finally:
+        _drop_guard()
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"DROP TABLE IF EXISTS {SCHEMA}.bait, {SCHEMA}.own, {SCHEMA}._firewall_p")
+            c.execute("DROP FUNCTION IF EXISTS public._firewall_protect(name, name, text, text, text)")
+            c.execute("DROP SCHEMA IF EXISTS sg_other CASCADE")
+            c.execute(f"REVOKE CREATE, USAGE ON SCHEMA public, {SCHEMA} FROM {atk}")
+            c.execute(f"DROP OWNED BY {atk}; DROP ROLE {atk}")

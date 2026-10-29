@@ -8,8 +8,14 @@
   column) is protected at the end of the command. A command that weakens a
   protected table fails: RLS off or not forced, a firewall policy dropped or
   altered (also through `DROP COLUMN ... CASCADE`), or another permissive
-  policy in permissive mode. `SET dbfw.ddl_guard_skip = 'on'` skips it; the
-  migration sets that for itself. Needs a superuser. Off by default.
+  policy in permissive mode, or the table taken out of scope (moved, renamed
+  to a skipped name, its tenant column or schema renamed) or put under an
+  unprotected parent. A table with its own permissive policy is refused, not
+  protected, in permissive mode. Only a superuser or the migration's role can
+  skip it (`SET dbfw.ddl_guard_skip = 'on'`); the migration sets that for
+  itself. The guard calls the firewall's functions with text arguments, so a
+  function planted with other argument types cannot run in its place. Needs
+  a superuser. Off by default.
 - **Migration:** protecting one table is now a function,
   `public._firewall_protect(schema, table, column, mode, context)`, which
   section 6 and the guard call. It also drops the firewall policies of an
@@ -19,8 +25,10 @@
   the app can write it.
 - **`verify`: keys include the tenant.** Unique keys and foreign keys to
   protected tables that leave out the tenant column are listed (an
-  information line; `--strict` fails), in both tools. A single-column key on
-  a generated value is not. A new information line reports the DDL guard.
+  information line; `--strict` fails), in both tools, exclusion constraints
+  included. A foreign key passes only when the referencing table's tenant
+  column fills the referenced one. A single-column key on an identity, a
+  sequence or a uuid default is not listed. A new information line reports the DDL guard.
 - **Corpus:** 96 attacks and 7 safe patterns.
 
 ## 2026-10-28: one set of PostgreSQL checks, and `python -m hooks.verify` (PR #17)

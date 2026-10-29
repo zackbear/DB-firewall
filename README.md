@@ -194,13 +194,15 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
   of the `CREATE TABLE` (or `ALTER TABLE ... ADD COLUMN`, or a rename), not at
   the next migration run, and a change that weakens a protected table fails
   (RLS off or not forced, a firewall policy dropped or altered, another
-  permissive policy in permissive mode). It is a safety net for later
-  migrations, not a boundary against a superuser. Needs a superuser.
+  permissive policy in permissive mode, the table moved, renamed out of
+  scope or put under an unprotected parent). It binds every role but a
+  superuser and the migration's own role. Needs a superuser to install.
 * **Keys that tell on other tenants.** A unique key, or a foreign key to a
   protected table, that leaves out the tenant column still sees every
   tenant's rows: a duplicate error, or a missing parent, shows the app that
-  another tenant has the value. `verify` lists them (`--strict` fails on
-  them). Put the tenant column in the key.
+  another tenant has the value. `verify` lists them, exclusion constraints
+  included (`--strict` fails on them). Put the tenant column in the key, and
+  reference `(tenant_id, id)`, not `id`.
 * **One role for all tenants.** Sessions of the same role can read each
   other's current query text in `pg_stat_activity`, and can end or cancel each
   other's backends (`pg_terminate_backend`). An app role can also change its

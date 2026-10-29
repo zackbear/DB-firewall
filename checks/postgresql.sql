@@ -201,7 +201,7 @@ SELECT true AS ok,
        CASE WHEN (SELECT count(*) FROM pg_event_trigger
                   WHERE evtname IN ('_firewall_ddl_guard', '_firewall_ddl_drop_guard') AND evtenabled <> 'D') = 2
             THEN 'on: a new table with the tenant column is protected at once, and a change that weakens a '
-                 || 'protected table fails'
+                 || 'protected table fails, for every role but a superuser and the migration''s'
             ELSE 'off (migrate --ddl-guard installs it: a new table is then protected at once, not at the next '
                  || 'migration run)' END AS detail
 
@@ -382,31 +382,39 @@ ORDER BY 1
 
 -- @query keys_without_tenant
 -- Keys that are not scoped to the tenant: RLS hides other tenants' rows, but
--- a unique key still refuses a duplicate of their value, and a foreign key
--- still finds (or misses) their parent row, so the error tells the app that
--- another tenant has the value. $1: the protected tables, as jsonb [[schema,
--- table], ...]; $2: the tenant column. A unique key (or primary key) on the
--- table whose key columns leave out the tenant column; a single-column key on
--- a generated value (identity or a DEFAULT, such as serial or a uuid) is not
--- counted: a duplicate then shows only that an id is taken. A foreign key from
--- any table to a protected one whose referenced columns leave out the tenant
--- column.
+-- a unique key or an exclusion constraint still refuses a duplicate of their
+-- value, and a foreign key still finds (or misses) their parent row, so the
+-- error tells the app that another tenant has the value. $1: the protected
+-- tables, as jsonb [[schema, table], ...]; $2: the tenant column.
+-- * A unique index (primary keys included) or exclusion constraint on the
+--   table whose key columns leave out the tenant column (a tenant column only
+--   in INCLUDE does not count). A single-column key on a generated value (an
+--   identity column, or a default from a sequence or a uuid function) is not
+--   counted: a duplicate then shows only that an id is taken.
+-- * A foreign key from any table to a protected one whose referenced tenant
+--   column is not filled by a column of that name in the referencing table
+--   (else the app can probe another tenant's rows with its own value there).
 WITH prot AS (
   SELECT c.oid, n.nspname || '.' || c.relname AS name, a.attnum AS att
   FROM jsonb_array_elements($1::jsonb) e
   JOIN pg_namespace n ON n.nspname = e->>0 JOIN pg_class c ON c.relnamespace = n.oid AND c.relname = e->>1
   JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = $2 AND a.attnum > 0 AND NOT a.attisdropped)
-SELECT 'unique key ' || i.relname || ' on ' || p.name AS item
-FROM prot p JOIN pg_index x ON x.indrelid = p.oid AND x.indisunique
+SELECT CASE WHEN x.indisexclusion THEN 'exclusion constraint ' ELSE 'unique key ' END
+       || i.relname || ' on ' || p.name AS item
+FROM prot p JOIN pg_index x ON x.indrelid = p.oid AND (x.indisunique OR x.indisexclusion)
 JOIN pg_class i ON i.oid = x.indexrelid
 WHERE NOT EXISTS (SELECT 1 FROM generate_series(0, x.indnkeyatts - 1) k WHERE x.indkey[k] = p.att)
-  AND NOT (x.indnkeyatts = 1 AND x.indkey[0] <> 0
-           AND EXISTS (SELECT 1 FROM pg_attribute a WHERE a.attrelid = p.oid AND a.attnum = x.indkey[0]
-                         AND (a.attidentity <> '' OR a.atthasdef)))
+  AND NOT (x.indnkeyatts = 1 AND x.indkey[0] <> 0 AND NOT x.indisexclusion
+           AND EXISTS (SELECT 1 FROM pg_attribute a LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+                       WHERE a.attrelid = p.oid AND a.attnum = x.indkey[0]
+                         AND (a.attidentity <> ''
+                              OR pg_get_expr(d.adbin, d.adrelid) ~ '^(nextval|gen_random_uuid|uuid_generate_v[14])\(')))
 UNION ALL
 SELECT 'foreign key ' || con.conname || ' on ' || con.conrelid::regclass::text || ' to ' || p.name
 FROM prot p JOIN pg_constraint con ON con.confrelid = p.oid AND con.contype = 'f'
-WHERE NOT (p.att = ANY (con.confkey))
+WHERE NOT EXISTS (SELECT 1 FROM generate_subscripts(con.confkey, 1) k
+                  JOIN pg_attribute ca ON ca.attrelid = con.conrelid AND ca.attnum = con.conkey[k]
+                  WHERE con.confkey[k] = p.att AND ca.attname = $2)
 ORDER BY 1
 
 -- @query query_text
