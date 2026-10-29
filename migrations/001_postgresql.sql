@@ -487,6 +487,7 @@ DECLARE
     whole BOOLEAN;
     todo BOOLEAN := false;
     mark TEXT;
+    planted TEXT;
 BEGIN
     IF TG_TAG = 'REVOKE'                   -- takes away only
        OR EXISTS (SELECT 1 FROM public._firewall_guard_calls gc       -- a call from inside the guard
@@ -499,6 +500,26 @@ BEGIN
                                           WHERE oid = 'public._firewall_protect(text, text, text, text, text)'::regprocedure),
                            'MEMBER')) THEN
         RETURN;
+    END IF;
+    -- A public._firewall_* object of another role: the firewall calls its
+    -- functions by name, so an overload (one with a default argument, say)
+    -- makes them ambiguous, and every read of a protected table, and every
+    -- protection, fails. Section 0 refuses the same at the next migration.
+    SELECT string_agg(o.name, ', ') INTO planted FROM (
+        SELECT c.oid::regclass::text AS name, c.relowner AS owner FROM pg_class c
+        WHERE c.relnamespace = 'public'::regnamespace AND c.relname LIKE '#_firewall#_%' ESCAPE '#'
+        UNION ALL
+        SELECT p.oid::regprocedure::text, p.proowner FROM pg_proc p
+        WHERE p.pronamespace = 'public'::regnamespace AND p.proname LIKE '#_firewall#_%' ESCAPE '#'
+        UNION ALL
+        SELECT y.oid::regtype::text, y.typowner FROM pg_type y
+        WHERE y.typnamespace = 'public'::regnamespace AND y.typname LIKE '#_firewall#_%' ESCAPE '#' AND y.typrelid = 0) o
+    JOIN pg_roles r ON r.oid = o.owner
+    WHERE NOT r.rolsuper
+      AND o.owner <> (SELECT proowner FROM pg_proc WHERE oid = 'public._firewall_protect(text, text, text, text, text)'::regprocedure);
+    IF planted IS NOT NULL THEN
+        RAISE EXCEPTION 'DB Firewall: % creates %, a name the firewall keeps for its own objects', TG_TAG, planted
+            USING HINT = 'Pick another name: public._firewall_* belongs to the migration''s role.';
     END IF;
     -- The tables the command names (the table of a policy or a rule).
     reported := ARRAY(SELECT CASE d.classid
@@ -520,7 +541,14 @@ BEGIN
              AND TG_TAG NOT LIKE 'DROP %';   -- a drop only takes away: the drop guard checks the policies
     scope := ARRAY(WITH RECURSIVE d(oid) AS (SELECT unnest(reported)
                                              UNION SELECT i.inhrelid FROM pg_inherits i JOIN d ON i.inhparent = d.oid)
-                   SELECT oid FROM d);
+                   SELECT oid FROM d)
+          -- and every table in a protected schema with RLS off or not forced:
+          -- EXPLAIN ANALYZE CREATE TABLE AS (or SELECT INTO) fires no event
+          -- trigger, so the next command, whatever it is, protects it
+          || ARRAY(SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                   JOIN public._firewall_protected_schemas ps ON ps.schema_name = n.nspname
+                   WHERE c.relkind IN ('r', 'p') AND c.relpersistence <> 't'
+                     AND NOT (c.relrowsecurity AND c.relforcerowsecurity));
     -- A renamed schema takes its protected tables out of what this script protects.
     FOR t IN
         SELECT n.oid, n.nspname::text AS nspname FROM pg_event_trigger_ddl_commands() d

@@ -204,7 +204,13 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
   role. Needs a superuser to install. It does not stop code the table's
   owner attaches to the table (a trigger, a CHECK constraint, a default, a
   generated column, an index expression, a domain constraint): that code
-  runs on every tenant's writes, and can copy them out.
+  runs on every tenant's writes, and can copy them out. PostgreSQL fires no
+  event trigger for `EXPLAIN ANALYZE CREATE TABLE AS` (or `SELECT INTO`): a
+  table made that way stays open until the next DDL command in the
+  database, which protects it, and `verify` fails on it until then. Keep
+  `CREATE` on the protected schemas to the roles that run migrations. The
+  guard also refuses a `public._firewall_*` object of another role (an
+  overload of a firewall function makes its calls ambiguous).
 * **Tenant column type.** The migration refuses a tenant column whose type
   belongs to a role that is not a superuser, or whose collation is not
   deterministic. The policies call that type's cast and equality, so the

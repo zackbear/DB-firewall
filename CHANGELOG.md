@@ -23,7 +23,11 @@
   permissive policy is refused, not protected, in permissive mode. A table
   owner's own code on the table (a trigger, a CHECK constraint, a default, a
   generated column, an index expression, a domain constraint) is not
-  stopped. Only a superuser or the migration's role can
+  stopped. PostgreSQL fires no event trigger for `EXPLAIN ANALYZE CREATE
+  TABLE AS` or `SELECT INTO`: such a table is protected by the next DDL
+  command in the database. A `public._firewall_*` object of another role is
+  refused (an overload with a default argument made the firewall's calls
+  ambiguous). Only a superuser or the migration's role can
   skip it (`SET dbfw.ddl_guard_skip = 'on'`); the migration sets that for
   itself. The guard calls the firewall's functions with text arguments, so a
   function planted with other argument types cannot run in its place. Needs

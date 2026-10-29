@@ -534,9 +534,11 @@ def test_ddl_guard_resists_a_table_owner():
         with psycopg.connect(DSN) as c:
             run_migration(c, DBEngine.POSTGRESQL, cfg)
         with psycopg.connect(f"{DSN} user={atk}", autocommit=True) as c:
-            # A planted overload with name arguments, an exact match for the old call.
-            c.execute("CREATE FUNCTION public._firewall_protect(a name, b name, x text, y text, z text) RETURNS void "
-                      f"LANGUAGE plpgsql AS $f$ BEGIN EXECUTE 'ALTER ROLE {atk} SUPERUSER'; END $f$")
+            # A planted overload with name arguments, an exact match for the old
+            # call: refused when created (the guard also calls with text casts).
+            with pytest.raises(psycopg.Error, match="a name the firewall keeps"):
+                c.execute("CREATE FUNCTION public._firewall_protect(a name, b name, x text, y text, z text) RETURNS void "
+                          f"LANGUAGE plpgsql AS $f$ BEGIN EXECUTE 'ALTER ROLE {atk} SUPERUSER'; END $f$")
             c.execute(f"CREATE TABLE {SCHEMA}.bait (id int, tenant_id text)")
         with psycopg.connect(DSN, autocommit=True) as c:
             assert c.execute(f"SELECT rolsuper FROM pg_roles WHERE rolname = '{atk}'").fetchone()[0] is False
@@ -583,6 +585,10 @@ def test_ddl_guard_resists_a_table_owner():
             f"DO ALSO INSERT INTO sg_other.sink VALUES (NEW.id, NEW.tenant_id)",
             f"CREATE TYPE sg_other.tid AS ENUM ('A', 'B'); "                             # its cast would decide
             f"CREATE TABLE {SCHEMA}.t3 (id int, tenant_id sg_other.tid)",
+            # An overload with a default argument makes the firewall's own calls ambiguous.
+            "CREATE FUNCTION public._firewall_tenant(x int DEFAULT 0) RETURNS text LANGUAGE sql AS $$ SELECT 'A' $$",
+            "CREATE FUNCTION public.fw_x() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$; "
+            "ALTER FUNCTION public.fw_x() RENAME TO _firewall_x",
             f"CREATE COLLATION sg_other.ci (provider = icu, locale = 'und-u-ks-level2', deterministic = false); "
             f"CREATE TABLE {SCHEMA}.t4 (id int, tenant_id text COLLATE sg_other.ci)",
             # A rule that comes along when the table is protected for the first time.
@@ -622,6 +628,13 @@ def test_ddl_guard_resists_a_table_owner():
         with psycopg.connect(f"{DSN} user={atk}", autocommit=True) as c, \
                 pytest.raises(psycopg.Error, match="permission denied"):           # only the owner writes it
             c.execute("INSERT INTO public._firewall_guard_calls VALUES (pg_backend_pid(), 'x')")
+        # EXPLAIN ANALYZE CREATE TABLE AS fires no event trigger (PostgreSQL):
+        # the next command, whatever it is, protects the table.
+        with psycopg.connect(f"{DSN} user={atk}", autocommit=True) as c:
+            c.execute(f"EXPLAIN (ANALYZE) CREATE TABLE {SCHEMA}.ex AS SELECT 1 AS id, 'A'::text AS tenant_id")
+            assert _npol(c, f"{SCHEMA}.ex") == 0
+            c.execute("CREATE FUNCTION sg_other.any_cmd() RETURNS int LANGUAGE sql AS 'SELECT 1'")   # any command
+            assert _npol(c, f"{SCHEMA}.ex") == 4
         # An open transaction that ran the guard does not hold up another role's DDL.
         with psycopg.connect(f"{DSN} user={atk}") as hold, psycopg.connect(DSN, autocommit=True) as other:
             hold.execute(f"GRANT TRUNCATE ON {SCHEMA}.bait TO {ROLE}")                 # revoked again, still open
@@ -638,7 +651,7 @@ def test_ddl_guard_resists_a_table_owner():
     finally:
         _drop_guard()
         with psycopg.connect(DSN, autocommit=True) as c:
-            c.execute(f"DROP TABLE IF EXISTS {SCHEMA}.bait, {SCHEMA}.own, {SCHEMA}._firewall_p, {SCHEMA}.pp, {SCHEMA}.free, "
+            c.execute(f"DROP TABLE IF EXISTS {SCHEMA}.bait, {SCHEMA}.own, {SCHEMA}._firewall_p, {SCHEMA}.pp, {SCHEMA}.free, {SCHEMA}.ex, "
                       f"{SCHEMA}.kid, {SCHEMA}.par, {SCHEMA}.typed, {SCHEMA}.lp")
             c.execute(f"DROP TYPE IF EXISTS {SCHEMA}.ct")
             c.execute("DROP SCHEMA IF EXISTS sg_ghost CASCADE; "
