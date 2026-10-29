@@ -690,8 +690,8 @@ BEGIN
         WHERE d.object_type = 'policy' AND d.address_names[3] ~ '^fw_[0-9a-f]{12}_(sel|ins|upd|del)$'
           AND to_regclass(quote_ident(d.address_names[1]) || '.' || quote_ident(d.address_names[2])) IS NOT NULL
     LOOP
-        RAISE EXCEPTION 'DB Firewall: dropping the firewall policy % would leave %.% without its row-level security', o.pol, o.sch, o.tbl
-            USING HINT = 'Re-run the migration to change the firewall policies.';
+        RAISE EXCEPTION 'DB Firewall: % drops the firewall policy % and would leave %.% without its row-level security', TG_TAG, o.pol, o.sch, o.tbl
+            USING HINT = 'A DROP ... CASCADE of the tenant column, its type, domain or collation also drops the policies. Re-run the migration to change the firewall policies.';
     END LOOP;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
