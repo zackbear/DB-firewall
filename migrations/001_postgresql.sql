@@ -324,6 +324,11 @@ CREATE TABLE IF NOT EXISTS public._firewall_protected_schemas (
     updated_at    TIMESTAMPTZ DEFAULT now()
 );
 
+-- _firewall_guard_calls: the guard's own calls in progress (see the guard).
+-- Only its owner reads or writes it (section 8): a role that could add a row
+-- could skip the guard.
+CREATE TABLE IF NOT EXISTS public._firewall_guard_calls (pid INT NOT NULL, call_id TEXT NOT NULL);
+
 -- RLS on and forced, TRIGGER and TRUNCATE revoked from all but the owner, and
 -- the four firewall policies (dropped and created again). Section 6 calls it
 -- for every table; the guard for a new one. The caller must own the table.
@@ -460,8 +465,7 @@ $$ LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp;
 -- It binds every role but a superuser and the role that owns this script's
 -- objects: only they can skip it (SET dbfw.ddl_guard_skip = 'on'), as this
 -- script does for itself. SECURITY DEFINER (its owner is a superuser, who
--- installs it): it protects a table whoever created it, and pauses its own
--- event triggers while it does. Every call it makes passes text arguments,
+-- installs it): it protects a table whoever created it. Every call it makes passes text arguments,
 -- so a function planted with other argument types (name, say) cannot match
 -- better than the firewall's own.
 CREATE OR REPLACE FUNCTION public._firewall_ddl_guard()
@@ -481,7 +485,14 @@ DECLARE
     reported OID[];
     scope OID[];
     whole BOOLEAN;
+    todo BOOLEAN := false;
+    mark TEXT;
 BEGIN
+    IF TG_TAG = 'REVOKE'                   -- takes away only
+       OR EXISTS (SELECT 1 FROM public._firewall_guard_calls gc       -- a call from inside the guard
+                  WHERE gc.pid = pg_backend_pid() AND gc.call_id = current_setting('dbfw.guard_call', true)) THEN
+        RETURN;
+    END IF;
     IF current_setting('dbfw.ddl_guard_skip', true) = 'on'
        AND ((SELECT rolsuper FROM pg_roles WHERE rolname = session_user)
             OR pg_has_role(session_user, (SELECT proowner FROM pg_proc
@@ -505,7 +516,8 @@ BEGIN
                             'ALTER FOREIGN TABLE', 'ALTER INDEX', 'ALTER VIEW', 'ALTER MATERIALIZED VIEW',
                             'ALTER SEQUENCE', 'CREATE POLICY', 'ALTER POLICY', 'CREATE RULE', 'CREATE INDEX',
                             'REINDEX', 'CREATE VIEW', 'CREATE SEQUENCE', 'CREATE FUNCTION', 'ALTER FUNCTION',
-                            'CREATE PROCEDURE', 'ALTER PROCEDURE', 'CREATE TRIGGER', 'ALTER TRIGGER', 'COMMENT');
+                            'CREATE PROCEDURE', 'ALTER PROCEDURE', 'CREATE TRIGGER', 'ALTER TRIGGER', 'COMMENT')
+             AND TG_TAG NOT LIKE 'DROP %';   -- a drop only takes away: the drop guard checks the policies
     scope := ARRAY(WITH RECURSIVE d(oid) AS (SELECT unnest(reported)
                                              UNION SELECT i.inhrelid FROM pg_inherits i JOIN d ON i.inhparent = d.oid)
                    SELECT oid FROM d);
@@ -583,12 +595,7 @@ BEGIN
                 RAISE EXCEPTION 'DB Firewall: %.% has a permissive policy of its own, which would OR with the tenant policies', t.nspname, t.relname
                     USING HINT = 'Make it AS RESTRICTIVE, or migrate with policy_mode restrictive.';
             END IF;
-            ALTER EVENT TRIGGER _firewall_ddl_guard DISABLE;
-            ALTER EVENT TRIGGER _firewall_ddl_drop_guard DISABLE;
-            PERFORM public._firewall_protect(t.nspname::text, t.relname::text, s.tenant_column::text,
-                                             s.policy_mode::text, s.context::text);
-            ALTER EVENT TRIGGER _firewall_ddl_guard ENABLE ALWAYS;
-            ALTER EVENT TRIGGER _firewall_ddl_drop_guard ENABLE ALWAYS;
+            todo := true;
             RAISE NOTICE 'DB Firewall: RLS applied to %.% (DDL guard)', t.nspname, t.relname;
             -- On to the checks below: a table protected just now can bring a rule along.
         ELSIF NOT eligible THEN
@@ -596,15 +603,24 @@ BEGIN
                 USING HINT = 'Undo the change, or drop the firewall policies with the migration''s role first.';
         ELSIF have = 0 AND rls AND forced THEN
             -- Renamed: the policies of the old name, still in place, give way to the new name's.
-            ALTER EVENT TRIGGER _firewall_ddl_guard DISABLE;
-            ALTER EVENT TRIGGER _firewall_ddl_drop_guard DISABLE;
-            PERFORM public._firewall_protect(t.nspname::text, t.relname::text, s.tenant_column::text,
-                                             s.policy_mode::text, s.context::text);
-            ALTER EVENT TRIGGER _firewall_ddl_guard ENABLE ALWAYS;
-            ALTER EVENT TRIGGER _firewall_ddl_drop_guard ENABLE ALWAYS;
+            todo := true;
         ELSIF have < 4 OR NOT rls OR NOT forced THEN
             RAISE EXCEPTION 'DB Firewall: % would leave %.% without its row-level security (RLS enabled and forced, the four firewall policies)', TG_TAG, t.nspname, t.relname
                 USING HINT = 'Re-run the migration to change how tables are protected. The DDL guard checks every change: see migrations/001_postgresql.sql, section 5b.';
+        END IF;
+        IF todo THEN
+            -- _firewall_protect runs DDL, which calls both guards again. They
+            -- return at once for a call from here: a one-time value, in a
+            -- table only the owner reads, marks it (no catalog write, so no
+            -- lock that another session's open transaction could hold).
+            mark := gen_random_uuid()::text;
+            INSERT INTO public._firewall_guard_calls (pid, call_id) VALUES (pg_backend_pid(), mark);
+            PERFORM set_config('dbfw.guard_call', mark, true);
+            PERFORM public._firewall_protect(t.nspname::text, t.relname::text, s.tenant_column::text,
+                                             s.policy_mode::text, s.context::text);
+            PERFORM set_config('dbfw.guard_call', '', true);
+            DELETE FROM public._firewall_guard_calls gc WHERE gc.pid = pg_backend_pid();
+            todo := false;
         END IF;
         IF s.policy_mode = 'permissive' AND EXISTS (SELECT 1 FROM pg_policy WHERE polrelid = t.oid AND polpermissive
                                                                          AND NOT polname = ANY (names)) THEN
@@ -615,9 +631,8 @@ BEGIN
             RAISE EXCEPTION 'DB Firewall: % leaves a rule on %.%: a rule runs on every tenant''s rows', TG_TAG, t.nspname, t.relname
                 USING HINT = 'Drop the rule. Use a view or a restrictive policy instead.';
         END IF;
-        -- The triggers pause here too: REVOKE is DDL, and a guard per REVOKE
-        -- would nest once per table (GRANT ... ON ALL TABLES).
-        ALTER EVENT TRIGGER _firewall_ddl_guard DISABLE;
+        -- REVOKE only takes away: the guard returns at once for it, so this
+        -- does not nest a guard per table (GRANT ... ON ALL TABLES).
         FOR g IN
             SELECT DISTINCT a.grantee, a.privilege_type FROM pg_class c, aclexplode(c.relacl) a
             WHERE c.oid = t.oid AND a.grantee <> c.relowner AND a.privilege_type IN ('TRIGGER', 'TRUNCATE')
@@ -626,7 +641,6 @@ BEGIN
                            CASE g.grantee WHEN 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(g.grantee)) END);
             RAISE NOTICE 'DB Firewall: % on %.% revoked again: only the owner keeps it (DDL guard)', g.privilege_type, t.nspname, t.relname;
         END LOOP;
-        ALTER EVENT TRIGGER _firewall_ddl_guard ENABLE ALWAYS;
     END LOOP;
     -- A protected table and a parent or child that is not protected.
     FOR t IN
@@ -659,6 +673,10 @@ RETURNS EVENT_TRIGGER AS $$
 DECLARE
     o RECORD;
 BEGIN
+    IF EXISTS (SELECT 1 FROM public._firewall_guard_calls gc       -- a call from inside the guard
+               WHERE gc.pid = pg_backend_pid() AND gc.call_id = current_setting('dbfw.guard_call', true)) THEN
+        RETURN;
+    END IF;
     IF current_setting('dbfw.ddl_guard_skip', true) = 'on'
        AND ((SELECT rolsuper FROM pg_roles WHERE rolname = session_user)
             OR pg_has_role(session_user, (SELECT proowner FROM pg_proc
@@ -750,7 +768,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- 8. Only the owner may read the key or sign, or read or change what the DDL
---    guard protects (_firewall_protected_schemas); only the owner may change
+--    guard protects (_firewall_protected_schemas, _firewall_guard_calls); only the owner may change
 --    the bypass list and the tenant map (reading the map stays allowed: the
 --    db_user_map resolution reads it). REVOKE ... FROM PUBLIC is not enough:
 --    platforms such as Supabase grant new objects in public to their roles
@@ -764,17 +782,21 @@ BEGIN
         SELECT 'TABLE ' || c.oid::regclass::text AS obj, a.privilege_type AS priv, '' AS cols, a.grantee
         FROM pg_class c, aclexplode(c.relacl) a
         WHERE c.oid IN ('public._firewall_keys'::regclass, 'public._firewall_bypass_roles'::regclass,
-                        'public._firewall_tenant_map'::regclass, 'public._firewall_protected_schemas'::regclass)
+                        'public._firewall_tenant_map'::regclass, 'public._firewall_protected_schemas'::regclass,
+                        'public._firewall_guard_calls'::regclass)
           AND a.grantee <> c.relowner
-          AND (c.oid IN ('public._firewall_keys'::regclass, 'public._firewall_protected_schemas'::regclass)
+          AND (c.oid IN ('public._firewall_keys'::regclass, 'public._firewall_protected_schemas'::regclass,
+                         'public._firewall_guard_calls'::regclass)
                OR a.privilege_type <> 'SELECT')
         UNION
         SELECT 'TABLE ' || c.oid::regclass::text, a.privilege_type, quote_ident(att.attname), a.grantee
         FROM pg_class c JOIN pg_attribute att ON att.attrelid = c.oid, aclexplode(att.attacl) a
         WHERE c.oid IN ('public._firewall_keys'::regclass, 'public._firewall_bypass_roles'::regclass,
-                        'public._firewall_tenant_map'::regclass, 'public._firewall_protected_schemas'::regclass)
+                        'public._firewall_tenant_map'::regclass, 'public._firewall_protected_schemas'::regclass,
+                        'public._firewall_guard_calls'::regclass)
           AND a.grantee <> c.relowner
-          AND (c.oid IN ('public._firewall_keys'::regclass, 'public._firewall_protected_schemas'::regclass)
+          AND (c.oid IN ('public._firewall_keys'::regclass, 'public._firewall_protected_schemas'::regclass,
+                         'public._firewall_guard_calls'::regclass)
                OR a.privilege_type <> 'SELECT')
         UNION
         SELECT 'FUNCTION ' || p.oid::regprocedure::text, 'ALL', '', a.grantee

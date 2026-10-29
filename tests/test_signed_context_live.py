@@ -575,6 +575,7 @@ def test_ddl_guard_resists_a_table_owner():
                 c.execute(sql)
         refused = [
             f"SET dbfw.ddl_guard_skip = 'on'; ALTER TABLE {SCHEMA}.bait DISABLE ROW LEVEL SECURITY",   # not theirs to skip
+            f"SET dbfw.guard_call = ''; ALTER TABLE {SCHEMA}.bait DISABLE ROW LEVEL SECURITY",   # no call of the guard's
             f"CREATE POLICY {stem}_base ON {SCHEMA}.bait AS PERMISSIVE USING (true)",   # the firewall's name
             f"CREATE TABLE sg_other.up (id int, tenant_id text) PARTITION BY LIST (tenant_id); "
             f"ALTER TABLE sg_other.up ATTACH PARTITION {SCHEMA}.bait FOR VALUES IN ('A')",
@@ -618,6 +619,17 @@ def test_ddl_guard_resists_a_table_owner():
                     f"CREATE FOREIGN TABLE sg_other.ft PARTITION OF {SCHEMA}.pp FOR VALUES IN ('Z') SERVER sg_srv"]:
             with psycopg.connect(DSN, autocommit=True) as c, pytest.raises(psycopg.Error, match="DB Firewall"):
                 c.execute(sql)
+        with psycopg.connect(f"{DSN} user={atk}", autocommit=True) as c, \
+                pytest.raises(psycopg.Error, match="permission denied"):           # only the owner writes it
+            c.execute("INSERT INTO public._firewall_guard_calls VALUES (pg_backend_pid(), 'x')")
+        # An open transaction that ran the guard does not hold up another role's DDL.
+        with psycopg.connect(f"{DSN} user={atk}") as hold, psycopg.connect(DSN, autocommit=True) as other:
+            hold.execute(f"GRANT TRUNCATE ON {SCHEMA}.bait TO {ROLE}")                 # revoked again, still open
+            hold.execute(f"CREATE TABLE {SCHEMA}.held (id int, tenant_id text)")       # protected, still open
+            other.execute("SET lock_timeout = '2s'")
+            other.execute(f"CREATE TABLE {SCHEMA}.free (id int, tenant_id text)")
+            assert _npol(other, f"{SCHEMA}.free") == 4
+            hold.rollback()
         with psycopg.connect(DSN, autocommit=True) as c:                          # a schema the migration lists
             c.execute("INSERT INTO public._firewall_protected_schemas (schema_name, tenant_column, policy_mode, context) "
                       "VALUES ('sg_ghost', 'tenant_id', 'permissive', 'signed')")
@@ -626,7 +638,7 @@ def test_ddl_guard_resists_a_table_owner():
     finally:
         _drop_guard()
         with psycopg.connect(DSN, autocommit=True) as c:
-            c.execute(f"DROP TABLE IF EXISTS {SCHEMA}.bait, {SCHEMA}.own, {SCHEMA}._firewall_p, {SCHEMA}.pp, "
+            c.execute(f"DROP TABLE IF EXISTS {SCHEMA}.bait, {SCHEMA}.own, {SCHEMA}._firewall_p, {SCHEMA}.pp, {SCHEMA}.free, "
                       f"{SCHEMA}.kid, {SCHEMA}.par, {SCHEMA}.typed, {SCHEMA}.lp")
             c.execute(f"DROP TYPE IF EXISTS {SCHEMA}.ct")
             c.execute("DROP SCHEMA IF EXISTS sg_ghost CASCADE; "

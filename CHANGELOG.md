@@ -17,7 +17,8 @@
   (`ALTER TYPE ... CASCADE`, `CREATE SCHEMA`, `GRANT ... ON ALL TABLES`), so
   a partition, a child or a typed table is protected too. With 2,000
   protected tables a `CREATE TABLE` costs it about 5 to 10 ms, a full check
-  about 100 ms. Policy names `fw_<hash>_*` are reserved. `TRIGGER` and
+  about 100 ms. It writes no catalog row while it works, so an open
+  transaction in one session does not hold up DDL in another. Policy names `fw_<hash>_*` are reserved. `TRIGGER` and
   `TRUNCATE` granted to another role are revoked again. A table with its own
   permissive policy is refused, not protected, in permissive mode. A table
   owner's own code on the table (a trigger, a CHECK constraint, a default, a
@@ -32,8 +33,9 @@
   section 6 and the guard call. It also drops the firewall policies of an
   earlier name of the table (a rename changes the policy stem). A new table,
   `public._firewall_protected_schemas`, records the schemas the migration
-  protects and how; only its owner reads or writes it, and `verify` fails when
-  the app can write it. The migration refuses a tenant column whose type
+  protects and how (and `public._firewall_guard_calls` marks the guard's own
+  calls); only its owner reads or writes them, and `verify` fails when
+  the app can write either. The migration refuses a tenant column whose type
   (through any domain) does not belong to a superuser, or whose collation is
   not deterministic: the policies call the type's cast and equality.
 - **`verify`: keys include the tenant.** Unique keys and foreign keys to

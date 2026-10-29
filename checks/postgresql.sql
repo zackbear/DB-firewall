@@ -111,7 +111,7 @@ FROM bad
 -- a schema out of the DDL guard.
 WITH bad AS (
   SELECT t AS name FROM unnest(ARRAY['public._firewall_bypass_roles', 'public._firewall_tenant_map',
-                                     'public._firewall_protected_schemas']) t
+                                     'public._firewall_protected_schemas', 'public._firewall_guard_calls']) t
   WHERE to_regclass(t) IS NOT NULL
     AND EXISTS (SELECT 1 FROM pg_roles m WHERE pg_has_role(current_user, m.oid, 'MEMBER')
                   AND (has_any_column_privilege(m.oid, t, 'INSERT') OR has_any_column_privilege(m.oid, t, 'UPDATE')
