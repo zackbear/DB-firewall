@@ -76,9 +76,13 @@ SELECT p.oid::regprocedure::text AS fn FROM pg_proc p
 WHERE (p.pronamespace = to_regnamespace('db_firewall')
        AND NOT (p.proname || '(' || oidvectortypes(p.proargtypes) || ')') = ANY($1))
    OR (p.pronamespace = 'public'::regnamespace AND p.proname LIKE '#_firewall#_%' ESCAPE '#'
-       -- not the migration's placeholders, which raise (section 7b)
-       AND NOT (obj_description(p.oid, 'pg_proc') = 'DB Firewall: moved to db_firewall'
-                AND p.prosrc LIKE 'BEGIN RAISE EXCEPTION ''DB Firewall: % moved to schema db_firewall: upgrade the app''; END'))
+       -- not the migration's placeholders, which only raise (section 7b): the
+       -- exact body, plpgsql, not SECURITY DEFINER, and the firewall's owner
+       AND NOT (p.prosrc = format('BEGIN RAISE EXCEPTION ''DB Firewall: %s moved to schema db_firewall: upgrade the app''; END', p.proname)
+                AND NOT p.prosecdef AND p.proconfig IS NULL
+                AND p.prolang = (SELECT oid FROM pg_language WHERE lanname = 'plpgsql')
+                AND p.proowner = (SELECT proowner FROM pg_proc
+                                  WHERE oid = to_regprocedure('db_firewall._firewall_protect(text, text, text, text, text)'))))
 ORDER BY 1
 
 -- @query fw_owners
@@ -135,9 +139,10 @@ FROM bad
 -- @check cannot read the key or sign
 -- With the key, or a way to sign, the app could sign any tenant.
 WITH bad AS (
-  SELECT 'table _firewall_keys' AS name WHERE to_regclass('db_firewall._firewall_keys') IS NOT NULL
+  SELECT 'table ' || k AS name FROM unnest(ARRAY['db_firewall._firewall_keys', 'public._firewall_keys']) k
+  WHERE to_regclass(k) IS NOT NULL
     AND EXISTS (SELECT 1 FROM pg_roles m WHERE pg_has_role(current_user, m.oid, 'MEMBER')
-                  AND has_any_column_privilege(m.oid, to_regclass('db_firewall._firewall_keys'), 'SELECT'))
+                  AND has_any_column_privilege(m.oid, to_regclass(k), 'SELECT'))
   UNION ALL SELECT 'function ' || p.proname FROM pg_proc p
   WHERE p.pronamespace = to_regnamespace('db_firewall') AND p.proname IN ('_firewall_sign', '_firewall_set_tenant')
     AND EXISTS (SELECT 1 FROM pg_roles m WHERE pg_has_role(current_user, m.oid, 'MEMBER')

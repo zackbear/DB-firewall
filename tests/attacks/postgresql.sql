@@ -106,6 +106,14 @@ ALTER DATABASE {DB} OWNER TO {ROLE};
 -- @undo
 ALTER DATABASE {DB} OWNER TO CURRENT_USER;
 
+-- @attack a public._firewall_* function that passes for a placeholder but runs code
+-- @check -: firewall functions unchanged
+-- @setup
+CREATE FUNCTION public._firewall_extra2(x int) RETURNS text LANGUAGE plpgsql AS $f$BEGIN RAISE EXCEPTION 'DB Firewall: %', pg_catalog.current_user || ' moved to schema db_firewall: upgrade the app'; END$f$;
+COMMENT ON FUNCTION public._firewall_extra2(int) IS 'DB Firewall: moved to db_firewall';
+-- @undo
+DROP FUNCTION public._firewall_extra2(int);
+
 -- @attack it owns schema db_firewall (could add an overload that makes the firewall's calls ambiguous)
 -- @check -: does not own firewall objects
 -- @setup

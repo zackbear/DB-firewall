@@ -865,6 +865,9 @@ def test_upgrade_with_an_old_ddl_guard_installed():
             c.execute("ALTER EVENT TRIGGER _firewall_ddl_guard ENABLE ALWAYS; "
                       "ALTER EVENT TRIGGER _firewall_ddl_drop_guard ENABLE ALWAYS")
         _migrate()                                                    # without ddl_guard: must still pass
+        with psycopg.connect(DSN) as c:          # a value from outside the script cannot switch it off
+            c.execute("SET dbfw.guard_restore = '_firewall_ddl_guard=D,_firewall_ddl_drop_guard=D'")
+            run_migration(c, DBEngine.POSTGRESQL, _cfg())
         with psycopg.connect(DSN, autocommit=True) as c:
             assert c.execute("SELECT string_agg(evtenabled::text, '') FROM pg_event_trigger "
                              "WHERE evtname LIKE '\\_firewall\\_ddl\\_%'").fetchone()[0] == "AA"

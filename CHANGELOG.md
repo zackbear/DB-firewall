@@ -39,6 +39,8 @@
 - The migration fails when another role can still `CREATE` in db_firewall
   after its `REVOKE` (a `REVOKE` takes back only its own role's grants), or
   when `PUBLIC` lacks `USAGE`; it checks again as its last statement.
+- **Corpus:** 102 attacks (a function that passes for a placeholder but runs
+  code) and 7 safe patterns.
 - **Checks:** schema `db_firewall`, every object in it, and any
   `public._firewall_*` object must belong to the migration's role or a
   superuser (the migration, `verify`, `scan` and the DDL guard). `verify`

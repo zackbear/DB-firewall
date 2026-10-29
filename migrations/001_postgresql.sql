@@ -79,6 +79,9 @@ DO $$
 DECLARE
     r RECORD;
 BEGIN
+    -- Only this block sets it (a value from ALTER ROLE/DATABASE ... SET, or
+    -- PGOPTIONS, must not reach the restore block before section 6).
+    PERFORM set_config('dbfw.guard_restore', '', true);
     IF current_setting('dbfw.schema', true) = 'db_firewall' THEN
         RAISE EXCEPTION 'DB Firewall: dbfw.schema must not be db_firewall, the firewall''s own schema';
     END IF;
@@ -109,7 +112,7 @@ BEGIN
                       AND c.relname LIKE '#_firewall#_%' ESCAPE '#' AND c.relkind IN ('r', 'p'))
             OR EXISTS (SELECT 1 FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace
                          AND p.proname LIKE '#_firewall#_%' ESCAPE '#'
-                         AND obj_description(p.oid, 'pg_proc') IS DISTINCT FROM 'DB Firewall: moved to db_firewall')) THEN
+                         AND p.prosrc IS DISTINCT FROM format('BEGIN RAISE EXCEPTION ''DB Firewall: %s moved to schema db_firewall: upgrade the app''; END', p.proname))) THEN
         IF NOT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN
             RAISE EXCEPTION 'DB Firewall: the DDL guard is installed: run this upgrade (it moves the firewall to schema db_firewall) as a superuser';
         END IF;
@@ -138,7 +141,7 @@ BEGIN
         SELECT p.oid::regprocedure::text AS sig, p.proname::text AS name, oidvectortypes(p.proargtypes) AS args
         FROM pg_proc p
         WHERE p.pronamespace = 'public'::regnamespace AND p.proname LIKE '#_firewall#_%' ESCAPE '#'
-          AND obj_description(p.oid, 'pg_proc') IS DISTINCT FROM 'DB Firewall: moved to db_firewall'
+          AND p.prosrc IS DISTINCT FROM format('BEGIN RAISE EXCEPTION ''DB Firewall: %s moved to schema db_firewall: upgrade the app''; END', p.proname)   -- not a placeholder (7b)
     LOOP
         IF to_regprocedure(format('db_firewall.%I(%s)', r.name, r.args)) IS NOT NULL THEN
             RAISE EXCEPTION 'DB Firewall: both % and its copy in db_firewall exist: drop the public one, then re-run', r.sig;
@@ -824,6 +827,7 @@ DECLARE
     e TEXT;
 BEGIN
     FOREACH e IN ARRAY COALESCE(string_to_array(NULLIF(current_setting('dbfw.guard_restore', true), ''), ','), '{}') LOOP
+        CONTINUE WHEN split_part(e, '=', 1) NOT IN ('_firewall_ddl_guard', '_firewall_ddl_drop_guard');
         EXECUTE format('ALTER EVENT TRIGGER %I %s', split_part(e, '=', 1),
                        CASE split_part(e, '=', 2) WHEN 'A' THEN 'ENABLE ALWAYS' WHEN 'R' THEN 'ENABLE REPLICA'
                                                   WHEN 'O' THEN 'ENABLE' ELSE 'DISABLE' END);
