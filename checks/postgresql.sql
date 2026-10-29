@@ -78,7 +78,8 @@ WHERE (p.pronamespace = to_regnamespace('db_firewall')
    OR (p.pronamespace = 'public'::regnamespace AND p.proname LIKE '#_firewall#_%' ESCAPE '#'
        -- not the migration's placeholders, which only raise (section 7b): the
        -- exact body, plpgsql, not SECURITY DEFINER, and the firewall's owner
-       AND NOT (p.prosrc = format('BEGIN RAISE EXCEPTION ''DB Firewall: %s moved to schema db_firewall: upgrade the app''; END', p.proname)
+       AND NOT (p.proname ~ '^_firewall_[a-z_]+$'          -- no quote in the name to break out of the body
+                AND p.prosrc = format('BEGIN RAISE EXCEPTION ''DB Firewall: %s moved to schema db_firewall: upgrade the app''; END', p.proname)
                 AND NOT p.prosecdef AND p.proconfig IS NULL
                 AND p.prolang = (SELECT oid FROM pg_language WHERE lanname = 'plpgsql')
                 AND p.proowner = (SELECT proowner FROM pg_proc
