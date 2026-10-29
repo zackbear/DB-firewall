@@ -91,12 +91,43 @@ BEGIN
                        CASE r.grantee WHEN 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(r.grantee)) END);
     END LOOP;
     GRANT USAGE ON SCHEMA db_firewall TO PUBLIC;
+    -- A REVOKE takes back only its own role's grants: check what is left.
+    IF EXISTS (SELECT 1 FROM pg_roles x, pg_namespace n WHERE n.nspname = 'db_firewall' AND NOT x.rolsuper
+                 AND NOT pg_has_role(x.oid, n.nspowner, 'MEMBER') AND has_schema_privilege(x.oid, n.oid, 'CREATE'))
+       OR NOT EXISTS (SELECT 1 FROM pg_namespace n, aclexplode(n.nspacl) a
+                      WHERE n.nspname = 'db_firewall' AND a.grantee = 0 AND a.privilege_type = 'USAGE') THEN
+        RAISE EXCEPTION 'DB Firewall: schema db_firewall: other roles can CREATE in it (%), or PUBLIC lacks USAGE on it, and this role cannot change that: run the migration as the role that owns the schema, or a superuser',
+            COALESCE((SELECT string_agg(x.rolname, ', ') FROM pg_roles x, pg_namespace n WHERE n.nspname = 'db_firewall'
+                        AND NOT x.rolsuper AND NOT pg_has_role(x.oid, n.nspowner, 'MEMBER')
+                        AND has_schema_privilege(x.oid, n.oid, 'CREATE')), 'none');
+    END IF;
+    -- An earlier version's DDL guard reads the public tables this block moves,
+    -- so it would fail on the move: pause it until section 5b has replaced its
+    -- functions (the block before section 6 sets it back as it was).
+    IF EXISTS (SELECT 1 FROM pg_event_trigger WHERE evtname IN ('_firewall_ddl_guard', '_firewall_ddl_drop_guard'))
+       AND (EXISTS (SELECT 1 FROM pg_class c WHERE c.relnamespace = 'public'::regnamespace
+                      AND c.relname LIKE '#_firewall#_%' ESCAPE '#' AND c.relkind IN ('r', 'p'))
+            OR EXISTS (SELECT 1 FROM pg_proc p WHERE p.pronamespace = 'public'::regnamespace
+                         AND p.proname LIKE '#_firewall#_%' ESCAPE '#'
+                         AND obj_description(p.oid, 'pg_proc') IS DISTINCT FROM 'DB Firewall: moved to db_firewall')) THEN
+        IF NOT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) THEN
+            RAISE EXCEPTION 'DB Firewall: the DDL guard is installed: run this upgrade (it moves the firewall to schema db_firewall) as a superuser';
+        END IF;
+        PERFORM set_config('dbfw.guard_restore',
+                           (SELECT string_agg(evtname || '=' || evtenabled::text, ',') FROM pg_event_trigger
+                            WHERE evtname IN ('_firewall_ddl_guard', '_firewall_ddl_drop_guard')), true);
+        FOR r IN SELECT evtname FROM pg_event_trigger WHERE evtname IN ('_firewall_ddl_guard', '_firewall_ddl_drop_guard') LOOP
+            EXECUTE format('ALTER EVENT TRIGGER %I DISABLE', r.evtname);
+        END LOOP;
+    END IF;
     -- Move what an earlier version made in public. SET SCHEMA keeps each
-    -- object, so the policies, event triggers and rows that use it stay.
+    -- object, so the policies, event triggers and rows that use it stay. The
+    -- placeholders section 7b leaves in public (views, and functions that
+    -- raise) stay where they are.
     FOR r IN
         SELECT c.relname::text AS name FROM pg_class c
         WHERE c.relnamespace = 'public'::regnamespace AND c.relname LIKE '#_firewall#_%' ESCAPE '#'
-          AND c.relkind IN ('r', 'p', 'v')
+          AND c.relkind IN ('r', 'p')
     LOOP
         IF to_regclass(format('db_firewall.%I', r.name)) IS NOT NULL THEN
             RAISE EXCEPTION 'DB Firewall: both public.% and db_firewall.% exist: keep one (db_firewall), then re-run', r.name, r.name;
@@ -107,6 +138,7 @@ BEGIN
         SELECT p.oid::regprocedure::text AS sig, p.proname::text AS name, oidvectortypes(p.proargtypes) AS args
         FROM pg_proc p
         WHERE p.pronamespace = 'public'::regnamespace AND p.proname LIKE '#_firewall#_%' ESCAPE '#'
+          AND obj_description(p.oid, 'pg_proc') IS DISTINCT FROM 'DB Firewall: moved to db_firewall'
     LOOP
         IF to_regprocedure(format('db_firewall.%I(%s)', r.name, r.args)) IS NOT NULL THEN
             RAISE EXCEPTION 'DB Firewall: both % and its copy in db_firewall exist: drop the public one, then re-run', r.sig;
@@ -785,6 +817,21 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
 
+-- The event triggers section 0b paused, as they were (their functions are
+-- this script's now).
+DO $$
+DECLARE
+    e TEXT;
+BEGIN
+    FOREACH e IN ARRAY COALESCE(string_to_array(NULLIF(current_setting('dbfw.guard_restore', true), ''), ','), '{}') LOOP
+        EXECUTE format('ALTER EVENT TRIGGER %I %s', split_part(e, '=', 1),
+                       CASE split_part(e, '=', 2) WHEN 'A' THEN 'ENABLE ALWAYS' WHEN 'R' THEN 'ENABLE REPLICA'
+                                                  WHEN 'O' THEN 'ENABLE' ELSE 'DISABLE' END);
+    END LOOP;
+    PERFORM set_config('dbfw.guard_restore', '', true);
+END;
+$$;
+
 -- ============================================================================
 -- 6. AUTO-APPLY RLS TO ALL TABLES WITH THE TENANT COLUMN (dbfw.tenant_column)
 -- ============================================================================
@@ -856,10 +903,45 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- 7b. Placeholders in public for one release, under the names an earlier
+--     version used there, so app code from before the move (which calls them
+--     without a schema, or as public._firewall_*) fails instead of reaching
+--     an object another role created there: a tenant map that names another
+--     tenant, say. The views have no rows and take no writes; each function
+--     raises.
+DO $$
+DECLARE
+    f RECORD;
+BEGIN
+    IF to_regclass('public._firewall_tenant_map') IS NULL THEN
+        CREATE VIEW public._firewall_tenant_map AS
+            SELECT NULL::text AS db_user, NULL::text AS tenant_id, NULL::boolean AS is_active WHERE false;
+    END IF;
+    IF to_regclass('public._firewall_audit_log') IS NULL THEN
+        CREATE VIEW public._firewall_audit_log AS
+            SELECT NULL::inet AS client_addr, NULL::text AS tenant_id, NULL::text AS auth_method WHERE false;
+    END IF;
+    FOR f IN
+        SELECT p.proname::text AS name, pg_get_function_arguments(p.oid) AS args,
+               pg_get_function_identity_arguments(p.oid) AS ident, pg_get_function_result(p.oid) AS ret
+        FROM pg_proc p
+        WHERE p.pronamespace = 'db_firewall'::regnamespace
+          AND p.prorettype <> 'pg_catalog.event_trigger'::regtype AND p.proname <> '_firewall_protect'
+    LOOP
+        EXECUTE format('CREATE OR REPLACE FUNCTION public.%I(%s) RETURNS %s LANGUAGE plpgsql AS %L',
+                       f.name, f.args, f.ret,
+                       format('BEGIN RAISE EXCEPTION ''DB Firewall: %s moved to schema db_firewall: upgrade the app''; END', f.name));
+        EXECUTE format('COMMENT ON FUNCTION public.%I(%s) IS %L', f.name, f.ident, 'DB Firewall: moved to db_firewall');
+    END LOOP;
+END;
+$$;
+
 -- 8. Only the owner may read the key or sign, or read or change what the DDL
---    guard protects (_firewall_protected_schemas, _firewall_guard_calls); only the owner may change
---    the bypass list and the tenant map (reading the map stays allowed: the
---    db_user_map resolution reads it). REVOKE ... FROM PUBLIC is not enough:
+--    guard protects; only the owner may change the bypass list and the tenant
+--    map (reading them stays allowed: the db_user_map resolution reads the
+--    map); the app may add audit rows but not read, change or trigger on them
+--    (a trigger there runs inside _firewall_set_tenant, as its owner). Every
+--    relation in db_firewall is covered, with that allow list. REVOKE ... FROM PUBLIC is not enough:
 --    platforms such as Supabase grant new objects in public to their roles
 --    directly (default privileges), so every grantee but the owner is
 --    revoked, column grants included.
@@ -868,25 +950,28 @@ DECLARE
     r RECORD;
 BEGIN
     FOR r IN
-        SELECT 'TABLE ' || c.oid::regclass::text AS obj, a.privilege_type AS priv, '' AS cols, a.grantee
-        FROM pg_class c, aclexplode(c.relacl) a
-        WHERE c.oid IN ('db_firewall._firewall_keys'::regclass, 'db_firewall._firewall_bypass_roles'::regclass,
-                        'db_firewall._firewall_tenant_map'::regclass, 'db_firewall._firewall_protected_schemas'::regclass,
-                        'db_firewall._firewall_guard_calls'::regclass)
-          AND a.grantee <> c.relowner
-          AND (c.oid IN ('db_firewall._firewall_keys'::regclass, 'db_firewall._firewall_protected_schemas'::regclass,
-                         'db_firewall._firewall_guard_calls'::regclass)
-               OR a.privilege_type <> 'SELECT')
+        -- Every relation in db_firewall and every public._firewall_* placeholder:
+        -- each grantee but the owner keeps only what this list allows.
+        WITH rel AS (
+            SELECT c.oid, c.relacl, c.relowner, c.relkind,
+                   CASE WHEN c.relnamespace = 'db_firewall'::regnamespace THEN c.relname::text END AS name,
+                   CASE c.relname WHEN '_firewall_bypass_roles' THEN ARRAY['SELECT']
+                                  WHEN '_firewall_tenant_map'   THEN ARRAY['SELECT']
+                                  WHEN '_firewall_audit_log'     THEN ARRAY['INSERT']   -- the middleware's audit rows
+                                  WHEN '_firewall_audit_log_id_seq' THEN ARRAY['USAGE']
+                                  ELSE ARRAY[]::text[] END AS allowed
+            FROM pg_class c
+            WHERE c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+              AND (c.relnamespace = 'db_firewall'::regnamespace
+                   OR (c.relnamespace = 'public'::regnamespace AND c.relname LIKE '#_firewall#_%' ESCAPE '#')))
+        SELECT CASE WHEN rel.relkind = 'S' THEN 'SEQUENCE ' ELSE 'TABLE ' END || rel.oid::regclass::text AS obj,
+               a.privilege_type AS priv, '' AS cols, a.grantee
+        FROM rel, aclexplode(rel.relacl) a
+        WHERE a.grantee <> rel.relowner AND NOT (rel.name IS NOT NULL AND a.privilege_type = ANY (rel.allowed))
         UNION
-        SELECT 'TABLE ' || c.oid::regclass::text, a.privilege_type, quote_ident(att.attname), a.grantee
-        FROM pg_class c JOIN pg_attribute att ON att.attrelid = c.oid, aclexplode(att.attacl) a
-        WHERE c.oid IN ('db_firewall._firewall_keys'::regclass, 'db_firewall._firewall_bypass_roles'::regclass,
-                        'db_firewall._firewall_tenant_map'::regclass, 'db_firewall._firewall_protected_schemas'::regclass,
-                        'db_firewall._firewall_guard_calls'::regclass)
-          AND a.grantee <> c.relowner
-          AND (c.oid IN ('db_firewall._firewall_keys'::regclass, 'db_firewall._firewall_protected_schemas'::regclass,
-                         'db_firewall._firewall_guard_calls'::regclass)
-               OR a.privilege_type <> 'SELECT')
+        SELECT 'TABLE ' || rel.oid::regclass::text, a.privilege_type, quote_ident(att.attname), a.grantee
+        FROM rel JOIN pg_attribute att ON att.attrelid = rel.oid, aclexplode(att.attacl) a
+        WHERE a.grantee <> rel.relowner AND NOT (rel.name IS NOT NULL AND a.privilege_type = ANY (rel.allowed))
         UNION
         SELECT 'FUNCTION ' || p.oid::regprocedure::text, 'ALL', '', a.grantee
         FROM pg_proc p, aclexplode(COALESCE(p.proacl, acldefault('f', p.proowner))) a
@@ -1139,6 +1224,19 @@ BEGIN
     WHERE r.rolname <> current_user AND NOT r.rolsuper;
     IF bad IS NOT NULL THEN
         RAISE EXCEPTION 'DB Firewall: % not owned by % or a superuser. Another role may have planted them: drop them, or ALTER ... OWNER TO a trusted role, and re-run.', bad, current_user;
+    END IF;
+END;
+$$;
+
+-- And schema db_firewall: no role but its owner's (and superusers) can CREATE
+-- in it, and every role may use it (the same test as in section 0b).
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles x, pg_namespace n WHERE n.nspname = 'db_firewall' AND NOT x.rolsuper
+                 AND NOT pg_has_role(x.oid, n.nspowner, 'MEMBER') AND has_schema_privilege(x.oid, n.oid, 'CREATE'))
+       OR NOT EXISTS (SELECT 1 FROM pg_namespace n, aclexplode(n.nspacl) a
+                      WHERE n.nspname = 'db_firewall' AND a.grantee = 0 AND a.privilege_type = 'USAGE') THEN
+        RAISE EXCEPTION 'DB Firewall: schema db_firewall: another role can CREATE in it, or PUBLIC lacks USAGE on it (granted while this script ran?): re-run';
     END IF;
 END;
 $$;

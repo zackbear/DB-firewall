@@ -20,7 +20,25 @@
   `public` with `SET SCHEMA`, which keeps each object: the key, the rows,
   the event triggers and the policies of every schema stay (they now show
   `db_firewall._firewall_tenant()`). It refuses when both copies of an
-  object exist, and when `dbfw.schema` is `db_firewall`.
+  object exist, and when `dbfw.schema` is `db_firewall`. With the DDL guard
+  installed, run the upgrade as a superuser: the old guard reads the public
+  tables the upgrade moves, so the upgrade pauses it and then sets it back
+  as it was.
+- **Placeholders in public, for one release:** views `public._firewall_tenant_map`
+  and `public._firewall_audit_log` with no rows that take no writes, and a
+  function under each old name that raises "moved to schema db_firewall".
+  App code from before the move fails there, instead of reaching an object
+  another role created under the old name (a tenant map naming another
+  tenant, say). Deploy the new app version with the migration, or before it.
+- **Section 8 covers every relation in db_firewall**, with an allow list:
+  `SELECT` on the bypass list and the tenant map, `INSERT` on the audit log
+  (and `USAGE` on its sequence), nothing else. Before, the audit log kept
+  whatever default privileges gave, and `TRIGGER` there ran the app's
+  function inside `_firewall_set_tenant`, as its owner, which could read the
+  key.
+- The migration fails when another role can still `CREATE` in db_firewall
+  after its `REVOKE` (a `REVOKE` takes back only its own role's grants), or
+  when `PUBLIC` lacks `USAGE`; it checks again as its last statement.
 - **Checks:** schema `db_firewall`, every object in it, and any
   `public._firewall_*` object must belong to the migration's role or a
   superuser (the migration, `verify`, `scan` and the DDL guard). `verify`

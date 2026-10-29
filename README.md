@@ -159,7 +159,13 @@ PostgreSQL tenant context (`engines.postgresql.tenant_context`, `dbfw.context`):
   add an overload there (one with a default argument, say) could make every
   call ambiguous. A run on an install from before this schema moves the
   objects out of `public` with `SET SCHEMA`, which keeps each object: the
-  key, the rows and the policies of every schema stay. The migration binds
+  key, the rows and the policies of every schema stay. For one release it
+  leaves placeholders under the old names in `public` (views with no rows,
+  functions that raise), so old app code fails instead of reaching an
+  object another role created there: deploy the new app with the migration.
+  The app keeps only `SELECT` on the bypass list and the tenant map, and
+  `INSERT` on the audit log; the migration revokes every other privilege
+  on the relations in `db_firewall`. The migration binds
   every name and operator in `pg_catalog`, so a planted operator such as
   `public.=` for `varchar, text` cannot bind into a policy. It refuses to
   run when schema `db_firewall`, an object in it, or a `public._firewall_*`

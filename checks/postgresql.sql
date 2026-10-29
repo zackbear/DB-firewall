@@ -75,7 +75,10 @@ FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang WHERE p.oid = to_regproce
 SELECT p.oid::regprocedure::text AS fn FROM pg_proc p
 WHERE (p.pronamespace = to_regnamespace('db_firewall')
        AND NOT (p.proname || '(' || oidvectortypes(p.proargtypes) || ')') = ANY($1))
-   OR (p.pronamespace = 'public'::regnamespace AND p.proname LIKE '#_firewall#_%' ESCAPE '#')
+   OR (p.pronamespace = 'public'::regnamespace AND p.proname LIKE '#_firewall#_%' ESCAPE '#'
+       -- not the migration's placeholders, which raise (section 7b)
+       AND NOT (obj_description(p.oid, 'pg_proc') = 'DB Firewall: moved to db_firewall'
+                AND p.prosrc LIKE 'BEGIN RAISE EXCEPTION ''DB Firewall: % moved to schema db_firewall: upgrade the app''; END'))
 ORDER BY 1
 
 -- @query fw_owners
@@ -118,7 +121,8 @@ FROM bad
 -- a schema out of the DDL guard.
 WITH bad AS (
   SELECT t AS name FROM unnest(ARRAY['db_firewall._firewall_bypass_roles', 'db_firewall._firewall_tenant_map',
-                                     'db_firewall._firewall_protected_schemas', 'db_firewall._firewall_guard_calls']) t
+                                     'db_firewall._firewall_protected_schemas', 'db_firewall._firewall_guard_calls',
+                                     'public._firewall_bypass_roles', 'public._firewall_tenant_map']) t
   WHERE to_regclass(t) IS NOT NULL
     AND EXISTS (SELECT 1 FROM pg_roles m WHERE pg_has_role(current_user, m.oid, 'MEMBER')
                   AND (has_any_column_privilege(m.oid, t, 'INSERT') OR has_any_column_privilege(m.oid, t, 'UPDATE')
@@ -133,7 +137,7 @@ FROM bad
 WITH bad AS (
   SELECT 'table _firewall_keys' AS name WHERE to_regclass('db_firewall._firewall_keys') IS NOT NULL
     AND EXISTS (SELECT 1 FROM pg_roles m WHERE pg_has_role(current_user, m.oid, 'MEMBER')
-                  AND has_any_column_privilege(m.oid, 'db_firewall._firewall_keys'::regclass, 'SELECT'))
+                  AND has_any_column_privilege(m.oid, to_regclass('db_firewall._firewall_keys'), 'SELECT'))
   UNION ALL SELECT 'function ' || p.proname FROM pg_proc p
   WHERE p.pronamespace = to_regnamespace('db_firewall') AND p.proname IN ('_firewall_sign', '_firewall_set_tenant')
     AND EXISTS (SELECT 1 FROM pg_roles m WHERE pg_has_role(current_user, m.oid, 'MEMBER')
