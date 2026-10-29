@@ -29,7 +29,8 @@
   included. A foreign key passes only when the referencing table's tenant
   column fills the referenced one. A single-column key on an identity, a
   sequence or a uuid default is not listed. A new information line reports the DDL guard.
-- **Corpus:** 96 attacks and 7 safe patterns.
+- **Corpus:** 99 attacks and 7 safe patterns.
+- **`scan`:** the Python predicate message matches the Node one (parity).
 
 ## 2026-10-28: one set of PostgreSQL checks, and `python -m hooks.verify` (PR #17)
 
