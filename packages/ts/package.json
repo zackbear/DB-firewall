@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "Tenant isolation for TypeScript AI agents on PostgreSQL: every transaction runs as one tenant, enforced by row-level security.",
   "license": "MIT",
+  "publishConfig": { "access": "public" },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
