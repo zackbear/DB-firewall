@@ -18,7 +18,10 @@
   row cap (`--max-rows`, default 100) and the byte cap (`--max-bytes`,
   default 1000000), so a huge result never reaches the server. Statement
   timeout 5 s by default. It refuses to start as a role that can skip RLS,
-  or without `DB_FIREWALL_TENANT_KEY`.
+  without `DB_FIREWALL_TENANT_KEY`, or while sessions of the role can read
+  each other's SQL text (`migrate --harden` revokes it; `--allow-query-text`
+  when one tenant uses the role). Error messages are cut to 2,000
+  characters.
 - **`examples/nextjs-agent`:** a starter app. Next.js, Claude through the AI
   SDK, two demo tenants with tenant-scoped keys, and the MCP server over
   HTTP with a short-lived token per chat request. Its test drives the agent

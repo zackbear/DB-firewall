@@ -23,15 +23,40 @@ export interface ServerOptions {
   statementTimeoutMs?: number;
   /** Bytes of row JSON a query returns at most (default 1000000). A row larger than this comes back as its size only. */
   maxBytes?: number;
+  /** Start even though sessions of this role can read each other's SQL text (see checkSetup). */
+  allowQueryText?: boolean;
 }
 
-/** Check once at start-up: the key is set and the role cannot skip RLS. */
+// The migration's own check (checks/postgresql.sql, query_text): can a role
+// this one can act as read other sessions' SQL text?
+const QUERY_TEXT = `SELECT EXISTS (SELECT 1 FROM pg_roles m WHERE pg_has_role(current_user, m.oid, 'MEMBER')
+  AND (has_table_privilege(m.oid, 'pg_catalog.pg_stat_activity', 'SELECT')
+       OR has_function_privilege(m.oid, 'pg_catalog.pg_stat_get_activity(integer)', 'EXECUTE')
+       OR has_function_privilege(m.oid, 'pg_catalog.pg_stat_get_backend_activity(integer)', 'EXECUTE')
+       OR EXISTS (SELECT 1 FROM pg_proc f WHERE f.proname = 'pg_stat_statements'
+                    AND has_function_privilege(m.oid, f.oid, 'EXECUTE'))
+       OR EXISTS (SELECT 1 FROM pg_class v WHERE v.relname = 'pg_stat_statements' AND v.relkind = 'v'
+                    AND has_table_privilege(m.oid, v.oid, 'SELECT')))) AS can`;
+
+/**
+ * Check once at start-up: the key is set, the role cannot skip RLS, and its
+ * sessions cannot read each other's SQL text. All tenants share the role
+ * (the HTTP server, or one stdio process per tenant), so through
+ * pg_stat_activity one tenant could read another's queries, literal values
+ * included. `db-firewall migrate --harden --app-role <role>` revokes that.
+ */
 export async function checkSetup(opts: ServerOptions): Promise<void> {
   if (!process.env[TENANT_KEY_ENV]) {
     throw new Error(`DB Firewall MCP: set ${TENANT_KEY_ENV} (the key the migration installed): ` +
                     "without it a signed database shows no rows");
   }
   await assertSafeRole(opts.pool);
+  if (!opts.allowQueryText && (await opts.pool.query(QUERY_TEXT)).rows[0].can) {
+    throw new Error("DB Firewall MCP: sessions of this role can read each other's SQL text (pg_stat_activity, " +
+                    "pg_stat_statements), so one tenant could read another's queries. Run " +
+                    "db-firewall migrate --harden --app-role <role>, or pass --allow-query-text " +
+                    "when one tenant only uses this role");
+  }
 }
 
 // The model's SQL runs in two steps.
@@ -44,6 +69,13 @@ export async function checkSetup(opts: ServerOptions): Promise<void> {
 //  2. Wrapped: PostgreSQL turns each row into JSON text, replaces a row larger
 //     than maxBytes with its size, and stops at maxRows and maxBytes. So a
 //     huge result never reaches this process.
+/** Error text, cut short: PostgreSQL can put a huge value in a message (a constant it computed while planning). */
+const MAX_ERROR = 2000;
+const errorText = (e: unknown): string => {
+  const m = String((e as Error)?.message ?? e);
+  return m.length > MAX_ERROR ? `${m.slice(0, MAX_ERROR)}... (${m.length} characters)` : m;
+};
+
 const READ_KINDS = "read only: one SELECT, WITH, VALUES or TABLE statement";
 const WRITE_KINDS = "one SELECT, WITH, VALUES, TABLE, INSERT, UPDATE, DELETE or MERGE statement " +
   "(MERGE needs PostgreSQL 17)";
@@ -96,7 +128,7 @@ export function createServer(opts: ServerOptions, tenantId: string): McpServer {
       return fn(c);
     });
   const safely = async (fn: () => Promise<ReturnType<typeof text>>) => {
-    try { return await fn(); } catch (e) { return text(`Error: ${(e as Error).message}`, true); }
+    try { return await fn(); } catch (e) { return text(`Error: ${errorText(e)}`, true); }
   };
 
   const server = new McpServer({ name: "db-firewall", version: VERSION });
@@ -132,11 +164,11 @@ export function createServer(opts: ServerOptions, tenantId: string): McpServer {
       await ext(`DECLARE _dbfw_mcp NO SCROLL CURSOR FOR\n${q}\n`);
     } catch (e) {
       await c.query("ROLLBACK TO SAVEPOINT _dbfw_mcp");
-      if (!opts.allowWrites) throw new Error(`${(e as Error).message} (${READ_KINDS})`);
+      if (!opts.allowWrites) throw new Error(`${errorText(e)} (${READ_KINDS})`);
       try {
         await ext(`PREPARE _dbfw_mcp AS\n${q}\n`);
       } catch (e2) {
-        throw new Error(`${(e2 as Error).message} (${WRITE_KINDS})`);
+        throw new Error(`${errorText(e2)} (${WRITE_KINDS})`);
       }
       await c.query("DEALLOCATE _dbfw_mcp");
       await c.query("SAVEPOINT _dbfw_mcp_w");
@@ -152,7 +184,8 @@ export function createServer(opts: ServerOptions, tenantId: string): McpServer {
       }
     }
     await c.query("CLOSE _dbfw_mcp");
-    const r = await ext(capped(`(\n${q}\n) AS _q`, "_q", maxRows, maxBytes, false));
+    // The inner LIMIT stops the scan at the row cap (the byte cap filters, it does not stop).
+    const r = await ext(capped(`(SELECT * FROM (\n${q}\n) AS _q0 LIMIT ${maxRows + 1}) AS _q`, "_q", maxRows, maxBytes, false));
     return result(r.rows, maxRows, maxBytes);
   }))));
 

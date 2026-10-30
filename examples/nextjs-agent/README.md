@@ -23,7 +23,7 @@ npm ci
 (cd ../../packages/ts && npm ci && npm run build)
 (cd ../../packages/cli && npm ci && npm run build)
 (cd ../../packages/mcp && npm ci && npm run build)
-npm run db:migrate                         # install the policies, then verify as app_user
+npm run db:migrate                         # install the policies, harden for app_user, verify as it
 npm run mcp &                              # the MCP server on http://127.0.0.1:3333/mcp
 npm run dev                                # http://localhost:3000
 ```

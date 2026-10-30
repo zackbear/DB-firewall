@@ -10,8 +10,10 @@ An MCP server for PostgreSQL where every tool call runs as one tenant. PostgreSQ
 
    ```bash
    export DB_FIREWALL_TENANT_KEY=$(openssl rand -hex 32)
-   npx db-firewall migrate --url "$ADMIN_URL" --schema app
+   npx db-firewall migrate --url "$ADMIN_URL" --schema app --harden --app-role app_user
    ```
+
+   `--harden` matters here. All tenants share the app role, and sessions of one role can read each other's SQL text, literal values included, in `pg_stat_activity`. The server refuses to start while the role can do that. `--allow-query-text` overrides this, but use it only when one tenant uses the role.
 
 2. Give the server its own app role: a normal login role, not a superuser, without `BYPASSRLS`, with only the grants the agent needs (`SELECT` alone for a read-only agent). The server refuses to start as a role that can skip RLS.
 3. Check isolation as that role: `npx db-firewall verify --url "$APP_URL" --schema app --tenant acme`.
@@ -63,6 +65,7 @@ Each call is one transaction:
 - The statement is first checked alone, as a cursor (reads) or a prepared statement (writes). So it is exactly one statement of the kinds above. `EXPLAIN`, `SET`, `COMMIT`, `COPY`, `LISTEN` and other commands are refused. `EXPLAIN ANALYZE` would show plans and row counts of other tenants' rows.
 - Then PostgreSQL turns each row into JSON and applies the row and byte limits, so a huge result never reaches the server.
 - After the call, the session is reset. A connection whose session was tampered with is closed, not reused.
+- An error message is cut to 2,000 characters, because PostgreSQL can put a huge value in one.
 
 ## What it does not do
 
@@ -91,5 +94,6 @@ const server = createServer(opts, "acme"); // an McpServer bound to tenant acme:
 - one statement per call;
 - writes only inside the tenant;
 - the row and byte caps, also for a 20 MB row;
-- refusal to start as a superuser or without the key;
+- refusal to start as a superuser, without the key, or while the role can read other sessions' SQL;
+- error messages cut short;
 - the HTTP token checks, `POST` only, and the required issuer and audience.

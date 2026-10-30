@@ -20,6 +20,8 @@ const USAGE = `db-firewall-mcp: an MCP server for PostgreSQL where every tool ca
   --allow-writes            allow INSERT, UPDATE and DELETE, still inside the tenant (default: read only)
   --max-rows <n>            rows a query returns at most (default: 100)
   --max-bytes <n>           bytes of row JSON a query returns at most (default: 1000000)
+  --allow-query-text        start even though sessions of the role can read each other's SQL text
+                            (only when one tenant uses the role; else: db-firewall migrate --harden)
   --statement-timeout <ms>  per call (default: 5000)
   --port <n>                HTTP port (default: 3333); --host <addr> (default: 127.0.0.1)
   --jwt-secret-env <VAR>    the environment variable that holds the HS256 secret
@@ -39,7 +41,7 @@ async function main(): Promise<number> {
   const { values: a } = parseArgs({ strict: true, options: {
     url: { type: "string" }, schema: { type: "string" }, tenant: { type: "string" },
     "allow-writes": { type: "boolean" }, "max-rows": { type: "string" }, "max-bytes": { type: "string" },
-    "statement-timeout": { type: "string" },
+    "statement-timeout": { type: "string" }, "allow-query-text": { type: "boolean" },
     http: { type: "boolean" }, port: { type: "string" }, host: { type: "string" },
     "jwt-secret-env": { type: "string" }, "jwks-url": { type: "string" },
     issuer: { type: "string" }, audience: { type: "string" }, "tenant-claim": { type: "string" },
@@ -52,7 +54,7 @@ async function main(): Promise<number> {
   const opts = {
     pool, schema: a.schema ?? "public", allowWrites: !!a["allow-writes"],
     maxRows: int(a["max-rows"], 100, "max-rows"), maxBytes: int(a["max-bytes"], 1_000_000, "max-bytes"),
-    statementTimeoutMs: int(a["statement-timeout"], 5000, "statement-timeout"),
+    statementTimeoutMs: int(a["statement-timeout"], 5000, "statement-timeout"), allowQueryText: !!a["allow-query-text"],
   };
   await checkSetup(opts);
 

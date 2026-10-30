@@ -28,7 +28,7 @@ const json = (r) => JSON.parse(r.content[0].text);
 async function stdio(args) {
   const client = new Client({ name: "test", version: "1" });
   await client.connect(new StdioClientTransport({
-    command: "node", args: [CLI, "--url", appUrl(), "--schema", S, ...args],
+    command: "node", args: [CLI, "--url", appUrl(), "--schema", S, "--allow-query-text", ...args],
     env: { ...process.env, DB_FIREWALL_TENANT_KEY: KEY }, stderr: "pipe" }));
   return client;
 }
@@ -139,12 +139,39 @@ describe("db-firewall-mcp", live, () => {
     } finally { await c.close(); }
   });
 
+  it("refuses to start while the role can read other sessions' SQL; starts once that is revoked", async () => {
+    const { spawnSync } = await import("node:child_process");
+    const start = () => spawnSync("node", [CLI, "--url", appUrl(), "--schema", S, "--tenant", "A"],
+                                  { env: process.env, encoding: "utf8", input: "", timeout: 10000 });
+    const r = start();
+    assert.equal(r.status, 2);
+    assert.match(r.stderr, /read each other's SQL text/);
+    const fns = "pg_catalog.pg_stat_get_activity(integer), pg_catalog.pg_stat_get_backend_activity(integer)";
+    await admin(`REVOKE SELECT ON pg_catalog.pg_stat_activity FROM PUBLIC; REVOKE EXECUTE ON FUNCTION ${fns} FROM PUBLIC`);
+    try {
+      const ok = start();                  // stdin closes at once: the server starts, then ends
+      assert.doesNotMatch(ok.stderr, /read each other's SQL text/);
+    } finally {
+      await admin(`GRANT SELECT ON pg_catalog.pg_stat_activity TO PUBLIC; GRANT EXECUTE ON FUNCTION ${fns} TO PUBLIC`);
+    }
+  });
+
+  it("cuts an error message short (PostgreSQL can put a huge value in one)", async () => {
+    const c = await stdio(["--tenant", "A"]);
+    try {
+      const r = await c.callTool({ name: "query", arguments: { sql: "SELECT repeat('x', 3000000)::int AS a" } });
+      assert.equal(r.isError, true);
+      assert.ok(r.content[0].text.length < 3000, String(r.content[0].text.length));
+      assert.match(r.content[0].text, /characters\)/);
+    } finally { await c.close(); }
+  });
+
   it("refuses to start as a superuser, or without the key", async () => {
     const { spawnSync } = await import("node:child_process");
-    const asAdmin = spawnSync("node", [CLI, "--url", ADMIN_URL, "--tenant", "A"], { env: process.env, encoding: "utf8" });
+    const asAdmin = spawnSync("node", [CLI, "--url", ADMIN_URL, "--tenant", "A", "--allow-query-text"], { env: process.env, encoding: "utf8" });
     assert.equal(asAdmin.status, 2);
     assert.match(asAdmin.stderr, /superuser|BYPASSRLS/);
-    const noKey = spawnSync("node", [CLI, "--url", appUrl(), "--tenant", "A"],
+    const noKey = spawnSync("node", [CLI, "--url", appUrl(), "--tenant", "A", "--allow-query-text"],
                             { env: { ...process.env, DB_FIREWALL_TENANT_KEY: "" }, encoding: "utf8" });
     assert.equal(noKey.status, 2);
     assert.match(noKey.stderr, /DB_FIREWALL_TENANT_KEY/);

@@ -11,5 +11,7 @@ const run = (args) => {
   const r = spawnSync(process.execPath, [cli, ...args], { stdio: "inherit" });
   if (r.status !== 0) process.exit(r.status ?? 1);
 };
-run(["migrate", "--url", process.env.ADMIN_DATABASE_URL, "--schema", "app"]);
+// --harden: all tenants share app_user, so its sessions must not read each
+// other's SQL text (pg_stat_activity); the MCP server refuses to start otherwise.
+run(["migrate", "--url", process.env.ADMIN_DATABASE_URL, "--schema", "app", "--harden", "--app-role", "app_user"]);
 run(["verify", "--url", process.env.DATABASE_URL, "--schema", "app", "--tenant", "acme"]);
