@@ -88,8 +88,8 @@ describe("migrate, scan, verify", live, () => {
   });
   after(async () => {
     await sql(`DROP SCHEMA IF EXISTS ${S} CASCADE; DROP SCHEMA IF EXISTS ${S}_other CASCADE;
-      DELETE FROM public._firewall_bypass_roles WHERE role_name = '${ROLE}';
-      REVOKE ALL ON public._firewall_bypass_roles FROM ${ROLE};`);
+      DELETE FROM db_firewall._firewall_bypass_roles WHERE role_name = '${ROLE}';
+      REVOKE ALL ON db_firewall._firewall_bypass_roles FROM ${ROLE};`);
   });
   // An isolated change for one test, undone after it.
   async function withChange(apply, undo, fn) { await sql(apply); try { await fn(); } finally { await sql(undo); } }
@@ -265,7 +265,7 @@ describe("migrate, scan, verify", live, () => {
         assert.equal((await run(["migrate", "--url", ADMIN_URL, ...scope, "--mode", "restrictive"])).code, 0);
         assert.equal(byTable((await json(["scan", "--url", ADMIN_URL, ...scope])).data.tables).vdocs.protected, true);
         await sql(`SET search_path = public; ALTER POLICY ${stem}_sel ON ${S}.vdocs USING
-          (tenant_id = (SELECT public._firewall_tenant()) OR (SELECT public._firewall_is_bypass_role(current_user::text)))`);
+          (tenant_id = (SELECT db_firewall._firewall_tenant()) OR (SELECT db_firewall._firewall_is_bypass_role(current_user::text)))`);
         const t = byTable((await json(["scan", "--url", ADMIN_URL, ...scope])).data.tables).vdocs;
         assert.equal(t.protected, false);
         assert.ok(t.altered_policies.includes(`${stem}_sel`));

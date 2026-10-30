@@ -32,7 +32,7 @@ _DEFAULT_BASELINE = json.dumps({"role": "none"})
 # _set_context_postgres on such a connection resets again first.
 _reset_pending: "weakref.WeakSet" = weakref.WeakSet()
 
-_RESET = "public._firewall_reset_session(%s::pg_catalog.text::pg_catalog.jsonb)"
+_RESET = "db_firewall._firewall_reset_session(%s::pg_catalog.text::pg_catalog.jsonb)"
 
 
 def _remember_baseline(connection, settings) -> None:
@@ -66,7 +66,7 @@ def tenant_key() -> Optional[bytes]:
 
 
 def sign_tenant(key: bytes, nonce: str, tenant_id: str) -> str:
-    """hex(HMAC-SHA256(key, nonce:tenant)), as public._firewall_sign() computes it."""
+    """hex(HMAC-SHA256(key, nonce:tenant)), as db_firewall._firewall_sign() computes it."""
     return hmac.new(key, f"{nonce}:{tenant_id}".encode("utf-8"), hashlib.sha256).hexdigest()
 
 
@@ -106,10 +106,10 @@ def _set_context_postgres(connection, tenant_id: str):
                            "context is unsigned. A database migrated with the default signed "
                            "context then shows no rows. Set it, or migrate with tenant_context: plain.")
         cursor.execute("SELECT set_config('app.current_tenant', %s, true), "
-                       "public._firewall_session_settings()::text", (tenant_id,))
+                       "db_firewall._firewall_session_settings()::text", (tenant_id,))
         _remember_baseline(connection, cursor.fetchone()[1])
     else:
-        cursor.execute("SELECT public._firewall_nonce(), public._firewall_session_settings()::text")
+        cursor.execute("SELECT db_firewall._firewall_nonce(), db_firewall._firewall_session_settings()::text")
         nonce, settings = cursor.fetchone()
         _remember_baseline(connection, settings)
         sig = sign_tenant(key, nonce, tenant_id)

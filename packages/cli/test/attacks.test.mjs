@@ -13,7 +13,7 @@ const ADMIN_URL = process.env.DBFW_PG_URL;
 if (!ADMIN_URL && process.env.DBFW_REQUIRE_LIVE) throw new Error("DBFW_REQUIRE_LIVE set but DBFW_PG_URL is not");
 const live = { skip: ADMIN_URL ? false : "DBFW_PG_URL not set" };
 // Pinned, so a case cannot disappear in silence: change it with the corpus.
-const ATTACKS = 101, PASSES = 7;
+const ATTACKS = 102, PASSES = 7;
 const S = "atk", ROLE = "dbfw_atk", PW = "DbfwAtk_2026x";
 const DB = ADMIN_URL ? new URL(ADMIN_URL).pathname.slice(1) : "";
 const KEY = "5a".repeat(32);
@@ -88,7 +88,7 @@ async function leak(text) {
   await c.connect();
   try {
     await c.query("BEGIN");
-    const { rows: [{ n }] } = await c.query("SELECT public._firewall_nonce() AS n");
+    const { rows: [{ n }] } = await c.query("SELECT db_firewall._firewall_nonce() AS n");
     await c.query("SELECT set_config('app.current_tenant', 'A', true), set_config('app.tenant_sig', $1, true)",
                   [sign(Buffer.from(KEY, "hex"), n, "A")]);
     const res = await c.query(text);

@@ -28,7 +28,7 @@ SECRET = "b-secret"
 KEY = bytes.fromhex("5a" * 32)
 S, ROLE = "atk_py", "dbfw_atk_py"
 # Pinned with packages/cli/test/attacks.test.mjs: change both with the corpus.
-ATTACKS, PASSES = 101, 7
+ATTACKS, PASSES = 102, 7
 NO_ACTIVITY = ("REVOKE SELECT ON pg_catalog.pg_stat_activity FROM PUBLIC; REVOKE EXECUTE ON FUNCTION "
                "pg_catalog.pg_stat_get_activity(integer), pg_catalog.pg_stat_get_backend_activity(integer) FROM PUBLIC")
 RESTORE = ("GRANT SELECT ON pg_catalog.pg_stat_activity TO PUBLIC; GRANT EXECUTE ON FUNCTION "
@@ -212,7 +212,7 @@ def _leak(sql):
         cur = conn.cursor()
         cur.execute("BEGIN")
         try:
-            nonce = cur.execute("SELECT public._firewall_nonce()").fetchone()[0]
+            nonce = cur.execute("SELECT db_firewall._firewall_nonce()").fetchone()[0]
             cur.execute("SELECT set_config('app.current_tenant', 'A', true), set_config('app.tenant_sig', %s, true)",
                         (sign_tenant(KEY, nonce, "A"),))
             rows = []

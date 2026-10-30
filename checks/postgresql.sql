@@ -69,19 +69,34 @@ SELECT prosrc, prosecdef, proconfig, provolatile, l.lanname, format_type(prorett
 FROM pg_proc p JOIN pg_language l ON l.oid = p.prolang WHERE p.oid = to_regprocedure($1)
 
 -- @query fw_extra
--- public._firewall_* functions the migration does not create ($1: its signatures).
+-- Functions in schema db_firewall the migration does not create ($1: its
+-- signatures), and any public._firewall_* function (an earlier version kept
+-- them there; the migration moves them).
 SELECT p.oid::regprocedure::text AS fn FROM pg_proc p
-WHERE p.pronamespace = 'public'::regnamespace AND p.proname LIKE '#_firewall#_%' ESCAPE '#'
-  AND NOT (p.proname || '(' || oidvectortypes(p.proargtypes) || ')') = ANY($1)
+WHERE (p.pronamespace = to_regnamespace('db_firewall')
+       AND NOT (p.proname || '(' || oidvectortypes(p.proargtypes) || ')') = ANY($1))
+   OR (p.pronamespace = 'public'::regnamespace AND p.proname LIKE '#_firewall#_%' ESCAPE '#'
+       -- not the migration's placeholders, which only raise (section 7b): the
+       -- exact body, plpgsql, not SECURITY DEFINER, and the firewall's owner
+       AND NOT (p.proname ~ '^_firewall_[a-z_]+$'          -- no quote in the name to break out of the body
+                AND p.prosrc = format('BEGIN RAISE EXCEPTION ''DB Firewall: %s moved to schema db_firewall: upgrade the app''; END', p.proname)
+                AND NOT p.prosecdef AND p.proconfig IS NULL
+                AND p.prolang = (SELECT oid FROM pg_language WHERE lanname = 'plpgsql')
+                AND p.proowner = (SELECT proowner FROM pg_proc
+                                  WHERE oid = to_regprocedure('db_firewall._firewall_protect(text, text, text, text, text)'))))
 ORDER BY 1
 
 -- @query fw_owners
--- The owners of the public._firewall_* objects: one, or only superusers.
+-- The owners of schema db_firewall, of the objects in it, and of any
+-- public._firewall_* object: one, or only superusers.
 SELECT pg_get_userbyid(o.owner) AS owner, r.rolsuper AS super, string_agg(o.name, ', ' ORDER BY o.name) AS objects
-FROM (SELECT relname::text AS name, relowner AS owner FROM pg_class
-      WHERE relnamespace = 'public'::regnamespace AND relname LIKE '#_firewall#_%' ESCAPE '#'
+FROM (SELECT 'schema db_firewall' AS name, nspowner AS owner FROM pg_namespace WHERE nspname = 'db_firewall'
+      UNION ALL SELECT relname::text, relowner FROM pg_class
+      WHERE relnamespace = to_regnamespace('db_firewall')
+         OR (relnamespace = 'public'::regnamespace AND relname LIKE '#_firewall#_%' ESCAPE '#')
       UNION ALL SELECT proname::text, proowner FROM pg_proc
-      WHERE pronamespace = 'public'::regnamespace AND proname LIKE '#_firewall#_%' ESCAPE '#') o
+      WHERE pronamespace = to_regnamespace('db_firewall')
+         OR (pronamespace = 'public'::regnamespace AND proname LIKE '#_firewall#_%' ESCAPE '#')) o
 JOIN pg_roles r ON r.oid = o.owner
 GROUP BY o.owner, r.rolsuper ORDER BY count(*) DESC
 
@@ -96,7 +111,7 @@ WITH bad AS (
          || CASE WHEN r.rolsuper THEN ' is a superuser' WHEN r.rolbypassrls THEN ' has BYPASSRLS'
                  ELSE ' is in _firewall_bypass_roles' END AS item, 0 AS o, r.rolname
   FROM pg_roles r WHERE pg_has_role(current_user, r.oid, 'MEMBER')
-    AND (r.rolsuper OR r.rolbypassrls OR public._firewall_is_bypass_role(r.rolname::text))
+    AND (r.rolsuper OR r.rolbypassrls OR db_firewall._firewall_is_bypass_role(r.rolname::text))
   UNION ALL
   SELECT 'is a member of ' || rolname || ', which reads or runs things as the server', 1, rolname FROM pg_roles
   WHERE rolname IN ('pg_read_all_data', 'pg_write_all_data', 'pg_execute_server_program',
@@ -110,8 +125,9 @@ FROM bad
 -- The app could add itself as a bypass role, map itself to a tenant, or take
 -- a schema out of the DDL guard.
 WITH bad AS (
-  SELECT t AS name FROM unnest(ARRAY['public._firewall_bypass_roles', 'public._firewall_tenant_map',
-                                     'public._firewall_protected_schemas', 'public._firewall_guard_calls']) t
+  SELECT t AS name FROM unnest(ARRAY['db_firewall._firewall_bypass_roles', 'db_firewall._firewall_tenant_map',
+                                     'db_firewall._firewall_protected_schemas', 'db_firewall._firewall_guard_calls',
+                                     'public._firewall_bypass_roles', 'public._firewall_tenant_map']) t
   WHERE to_regclass(t) IS NOT NULL
     AND EXISTS (SELECT 1 FROM pg_roles m WHERE pg_has_role(current_user, m.oid, 'MEMBER')
                   AND (has_any_column_privilege(m.oid, t, 'INSERT') OR has_any_column_privilege(m.oid, t, 'UPDATE')
@@ -124,11 +140,12 @@ FROM bad
 -- @check cannot read the key or sign
 -- With the key, or a way to sign, the app could sign any tenant.
 WITH bad AS (
-  SELECT 'table _firewall_keys' AS name WHERE to_regclass('public._firewall_keys') IS NOT NULL
+  SELECT 'table ' || k AS name FROM unnest(ARRAY['db_firewall._firewall_keys', 'public._firewall_keys']) k
+  WHERE to_regclass(k) IS NOT NULL
     AND EXISTS (SELECT 1 FROM pg_roles m WHERE pg_has_role(current_user, m.oid, 'MEMBER')
-                  AND has_any_column_privilege(m.oid, 'public._firewall_keys'::regclass, 'SELECT'))
+                  AND has_any_column_privilege(m.oid, to_regclass(k), 'SELECT'))
   UNION ALL SELECT 'function ' || p.proname FROM pg_proc p
-  WHERE p.pronamespace = 'public'::regnamespace AND p.proname IN ('_firewall_sign', '_firewall_set_tenant')
+  WHERE p.pronamespace = to_regnamespace('db_firewall') AND p.proname IN ('_firewall_sign', '_firewall_set_tenant')
     AND EXISTS (SELECT 1 FROM pg_roles m WHERE pg_has_role(current_user, m.oid, 'MEMBER')
                   AND has_function_privilege(m.oid, p.oid, 'EXECUTE')))
 SELECT count(*) = 0 AS ok,
@@ -137,15 +154,19 @@ SELECT count(*) = 0 AS ok,
 FROM bad
 
 -- @check does not own firewall objects
--- The owner of schema public (on PostgreSQL 15 and later the database owner,
--- through pg_database_owner) can drop the bypass list and create its own; an
+-- The owner of schema db_firewall can drop the bypass list and create its
+-- own, or add an overload that makes the firewall's calls ambiguous; an
 -- owner of a firewall object can replace it.
 WITH bad AS (
-  SELECT 'schema public' AS name FROM pg_namespace WHERE nspname = 'public' AND pg_has_role(current_user, nspowner, 'MEMBER')
-  UNION ALL SELECT 'table ' || relname FROM pg_class WHERE relnamespace = 'public'::regnamespace
-    AND relname LIKE '#_firewall#_%' ESCAPE '#' AND pg_has_role(current_user, relowner, 'MEMBER')
-  UNION ALL SELECT 'function ' || proname FROM pg_proc WHERE pronamespace = 'public'::regnamespace
-    AND proname LIKE '#_firewall#_%' ESCAPE '#' AND pg_has_role(current_user, proowner, 'MEMBER'))
+  SELECT 'schema db_firewall' AS name FROM pg_namespace WHERE nspname = 'db_firewall' AND pg_has_role(current_user, nspowner, 'MEMBER')
+  UNION ALL SELECT 'table ' || relname FROM pg_class
+  WHERE (relnamespace = to_regnamespace('db_firewall')
+         OR (relnamespace = 'public'::regnamespace AND relname LIKE '#_firewall#_%' ESCAPE '#'))
+    AND pg_has_role(current_user, relowner, 'MEMBER')
+  UNION ALL SELECT 'function ' || proname FROM pg_proc
+  WHERE (pronamespace = to_regnamespace('db_firewall')
+         OR (pronamespace = 'public'::regnamespace AND proname LIKE '#_firewall#_%' ESCAPE '#'))
+    AND pg_has_role(current_user, proowner, 'MEMBER'))
 SELECT count(*) = 0 AS ok,
        COALESCE('can act as the owner of ' || string_agg(name, ', ' ORDER BY name)
                 || ' (could drop or replace the bypass list)', 'owns none') AS detail
@@ -265,7 +286,7 @@ SELECT pg_has_role(current_user, c.relowner, 'MEMBER') AS owns,
 FROM pg_class c WHERE c.oid = $1::regclass
 
 -- @query nonce
-SELECT public._firewall_nonce() AS n
+SELECT db_firewall._firewall_nonce() AS n
 
 -- ============================================================== verify: read paths RLS does not guard
 -- @query bypass_views
@@ -278,7 +299,7 @@ SELECT public._firewall_nonce() AS n
 WITH RECURSIVE rel AS (
   SELECT v.oid, v.relkind = 'm' OR (NOT COALESCE((SELECT option_value::boolean FROM pg_options_to_table(v.reloptions)
                                                  WHERE option_name = 'security_invoker'), false)
-                                    AND (r.rolsuper OR r.rolbypassrls OR public._firewall_is_bypass_role(r.rolname::text))) AS bad
+                                    AND (r.rolsuper OR r.rolbypassrls OR db_firewall._firewall_is_bypass_role(r.rolname::text))) AS bad
   FROM pg_class v JOIN pg_roles r ON r.oid = v.relowner WHERE v.relkind IN ('v', 'm')),
 dep AS (
   SELECT DISTINCT rw.ev_class AS v, d.refobjid AS t FROM pg_rewrite rw
@@ -361,11 +382,11 @@ WITH implicit AS (
 SELECT p.oid::regprocedure::text AS name, pg_get_userbyid(p.proowner) AS owner, p.proleakproof AS leakproof
 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace JOIN pg_roles r ON r.oid = p.proowner
 WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
-  AND NOT (n.nspname = 'public' AND p.proname LIKE '#_firewall#_%' ESCAPE '#')
+  AND n.nspname <> 'db_firewall'
   AND (EXISTS (SELECT 1 FROM pg_roles m WHERE pg_has_role(current_user, m.oid, 'MEMBER')
                  AND has_function_privilege(m.oid, p.oid, 'EXECUTE'))
        OR p.oid IN (SELECT f FROM implicit))
-  AND (p.proleakproof OR (p.prosecdef AND (r.rolsuper OR r.rolbypassrls OR public._firewall_is_bypass_role(r.rolname::text))))
+  AND (p.proleakproof OR (p.prosecdef AND (r.rolsuper OR r.rolbypassrls OR db_firewall._firewall_is_bypass_role(r.rolname::text))))
 ORDER BY 1
 
 -- @query other_schemas
@@ -507,5 +528,5 @@ WHERE current_setting('lo_compat_privileges')::boolean OR pg_has_role(current_us
 SELECT p.oid::regprocedure::text AS sig
 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
 WHERE p.prosecdef AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-  AND NOT (n.nspname = 'public' AND p.proname LIKE '#_firewall#_%' ESCAPE '#')
+  AND n.nspname <> 'db_firewall'
 ORDER BY 1

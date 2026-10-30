@@ -315,11 +315,11 @@ class TestLivePostgres:
 
     def test_audit_row_and_purge(self, pg, cfg):
         cfg["audit"]["enabled"] = True
-        before = pg.execute("SELECT count(*) FROM _firewall_audit_log WHERE auth_method = 'middleware'").fetchone()[0]
+        before = pg.execute("SELECT count(*) FROM db_firewall._firewall_audit_log WHERE auth_method = 'middleware'").fetchone()[0]
         protect(pg, tenant_id="A", config=cfg)
-        after = pg.execute("SELECT count(*) FROM _firewall_audit_log WHERE auth_method = 'middleware'").fetchone()[0]
+        after = pg.execute("SELECT count(*) FROM db_firewall._firewall_audit_log WHERE auth_method = 'middleware'").fetchone()[0]
         assert after == before + 1
-        pg.execute("UPDATE _firewall_audit_log SET assigned_at = now() - interval '100 days' "
+        pg.execute("UPDATE db_firewall._firewall_audit_log SET assigned_at = now() - interval '100 days' "
                    "WHERE auth_method = 'middleware'")
         assert purge_audit(pg, cfg, DBEngine.POSTGRESQL) >= 1
         assert purge_audit(pg, cfg, DBEngine.POSTGRESQL) == 0
@@ -369,7 +369,7 @@ class TestLivePostgres:
         db_firewall.sqlalchemy_event_hooks(eng, config=cfg2)
         with tenant_scope("A"), eng.connect() as c:
             assert [r[0] for r in c.execute(sa.text("SELECT id FROM cf_orders"))] == [1]
-            n = c.execute(sa.text("SELECT count(*) FROM _firewall_audit_log "
+            n = c.execute(sa.text("SELECT count(*) FROM db_firewall._firewall_audit_log "
                                   "WHERE auth_method = 'middleware' AND tenant_id = 'A'")).scalar()
             assert n >= 1
         eng.dispose()

@@ -60,9 +60,9 @@ REVOKE {ROLE}_su FROM {ROLE}; DROP ROLE {ROLE}_su;
 -- @check -: role
 -- @leak SELECT string_agg(body, ',') FROM {S}.docs
 -- @setup
-INSERT INTO public._firewall_bypass_roles (role_name) VALUES ('{ROLE}');
+INSERT INTO db_firewall._firewall_bypass_roles (role_name) VALUES ('{ROLE}');
 -- @undo
-DELETE FROM public._firewall_bypass_roles WHERE role_name = '{ROLE}';
+DELETE FROM db_firewall._firewall_bypass_roles WHERE role_name = '{ROLE}';
 
 -- @attack it can write server files
 -- @check -: role
@@ -80,13 +80,13 @@ REVOKE pg_write_all_data FROM {ROLE};
 
 -- @attack a role it can SET ROLE to but does not inherit can write the bypass list (NOINHERIT)
 -- @check -: cannot write firewall tables
--- @leak SET LOCAL ROLE {ROLE}_w2; INSERT INTO public._firewall_bypass_roles (role_name) VALUES ('{ROLE}'); RESET ROLE; SELECT string_agg(body, ',') FROM {S}.docs
+-- @leak SET LOCAL ROLE {ROLE}_w2; INSERT INTO db_firewall._firewall_bypass_roles (role_name) VALUES ('{ROLE}'); RESET ROLE; SELECT string_agg(body, ',') FROM {S}.docs
 -- @setup
-CREATE ROLE {ROLE}_w2 NOLOGIN; GRANT INSERT ON public._firewall_bypass_roles TO {ROLE}_w2;
+CREATE ROLE {ROLE}_w2 NOLOGIN; GRANT INSERT ON db_firewall._firewall_bypass_roles TO {ROLE}_w2;
 ALTER ROLE {ROLE} NOINHERIT; GRANT {ROLE}_w2 TO {ROLE};
 -- @undo
 ALTER ROLE {ROLE} INHERIT; REVOKE {ROLE}_w2 FROM {ROLE};
-REVOKE ALL ON public._firewall_bypass_roles FROM {ROLE}_w2; DROP ROLE {ROLE}_w2;
+REVOKE ALL ON db_firewall._firewall_bypass_roles FROM {ROLE}_w2; DROP ROLE {ROLE}_w2;
 
 -- ---------------------------------------------------------------- ownership
 -- @attack it owns the table (an owner can turn RLS off)
@@ -106,20 +106,27 @@ ALTER DATABASE {DB} OWNER TO {ROLE};
 -- @undo
 ALTER DATABASE {DB} OWNER TO CURRENT_USER;
 
--- @attack it owns the database, so schema public (PostgreSQL 15+: pg_database_owner)
--- @check -: does not own firewall objects
--- @min 15
+-- @attack a public._firewall_* function that passes for a placeholder but runs code
+-- @check -: firewall functions unchanged
 -- @setup
-ALTER DATABASE {DB} OWNER TO {ROLE};
+CREATE FUNCTION public._firewall_extra2(x int) RETURNS text LANGUAGE plpgsql AS $f$BEGIN RAISE EXCEPTION 'DB Firewall: %', pg_catalog.current_user || ' moved to schema db_firewall: upgrade the app'; END$f$;
+COMMENT ON FUNCTION public._firewall_extra2(int) IS 'DB Firewall: moved to db_firewall';
 -- @undo
-ALTER DATABASE {DB} OWNER TO CURRENT_USER;
+DROP FUNCTION public._firewall_extra2(int);
+
+-- @attack it owns schema db_firewall (could add an overload that makes the firewall's calls ambiguous)
+-- @check -: does not own firewall objects
+-- @setup
+ALTER SCHEMA db_firewall OWNER TO {ROLE};
+-- @undo
+ALTER SCHEMA db_firewall OWNER TO CURRENT_USER;
 
 -- @attack it owns a firewall function (and replaces it)
 -- @check -: does not own firewall objects
 -- @setup
-ALTER FUNCTION public._firewall_is_bypass_role(text) OWNER TO {ROLE};
+ALTER FUNCTION db_firewall._firewall_is_bypass_role(text) OWNER TO {ROLE};
 -- @undo
-ALTER FUNCTION public._firewall_is_bypass_role(text) OWNER TO CURRENT_USER;
+ALTER FUNCTION db_firewall._firewall_is_bypass_role(text) OWNER TO CURRENT_USER;
 
 -- @attack it owns a schema (an owner can grant itself CREATE back)
 -- @check -: cannot create in any schema
@@ -138,77 +145,77 @@ DROP DOMAIN {S}.sec;
 -- ---------------------------------------------------------------- firewall tables and functions
 -- @attack it can write the bypass list
 -- @check -: cannot write firewall tables
--- @leak INSERT INTO public._firewall_bypass_roles (role_name) VALUES (current_user); SELECT string_agg(body, ',') FROM {S}.docs
+-- @leak INSERT INTO db_firewall._firewall_bypass_roles (role_name) VALUES (current_user); SELECT string_agg(body, ',') FROM {S}.docs
 -- @setup
-GRANT INSERT ON public._firewall_bypass_roles TO {ROLE};
+GRANT INSERT ON db_firewall._firewall_bypass_roles TO {ROLE};
 -- @undo
-REVOKE INSERT ON public._firewall_bypass_roles FROM {ROLE};
+REVOKE INSERT ON db_firewall._firewall_bypass_roles FROM {ROLE};
 
 -- @attack it has a column grant on the bypass list
 -- @check -: cannot write firewall tables
--- @leak INSERT INTO public._firewall_bypass_roles (role_name) VALUES (current_user); SELECT string_agg(body, ',') FROM {S}.docs
+-- @leak INSERT INTO db_firewall._firewall_bypass_roles (role_name) VALUES (current_user); SELECT string_agg(body, ',') FROM {S}.docs
 -- @setup
-GRANT INSERT (role_name) ON public._firewall_bypass_roles TO {ROLE};
+GRANT INSERT (role_name) ON db_firewall._firewall_bypass_roles TO {ROLE};
 -- @undo
-REVOKE INSERT (role_name) ON public._firewall_bypass_roles FROM {ROLE};
+REVOKE INSERT (role_name) ON db_firewall._firewall_bypass_roles FROM {ROLE};
 
 -- @attack a SET-only role can write the bypass list
 -- @check -: cannot write firewall tables
 -- @min 16
--- @leak SET LOCAL ROLE {ROLE}_w; INSERT INTO public._firewall_bypass_roles (role_name) VALUES ('{ROLE}'); RESET ROLE; SELECT string_agg(body, ',') FROM {S}.docs
+-- @leak SET LOCAL ROLE {ROLE}_w; INSERT INTO db_firewall._firewall_bypass_roles (role_name) VALUES ('{ROLE}'); RESET ROLE; SELECT string_agg(body, ',') FROM {S}.docs
 -- @setup
-CREATE ROLE {ROLE}_w NOLOGIN; GRANT INSERT ON public._firewall_bypass_roles TO {ROLE}_w;
+CREATE ROLE {ROLE}_w NOLOGIN; GRANT INSERT ON db_firewall._firewall_bypass_roles TO {ROLE}_w;
 GRANT {ROLE}_w TO {ROLE} WITH INHERIT FALSE;
 -- @undo
-REVOKE {ROLE}_w FROM {ROLE}; REVOKE ALL ON public._firewall_bypass_roles FROM {ROLE}_w; DROP ROLE {ROLE}_w;
+REVOKE {ROLE}_w FROM {ROLE}; REVOKE ALL ON db_firewall._firewall_bypass_roles FROM {ROLE}_w; DROP ROLE {ROLE}_w;
 
 -- @attack it can UPDATE a row of the bypass list
 -- @check -: cannot write firewall tables
--- @leak UPDATE public._firewall_bypass_roles SET role_name = current_user; SELECT string_agg(body, ',') FROM {S}.docs
+-- @leak UPDATE db_firewall._firewall_bypass_roles SET role_name = current_user; SELECT string_agg(body, ',') FROM {S}.docs
 -- @setup
-INSERT INTO public._firewall_bypass_roles (role_name) VALUES ('{ROLE}_mig'); GRANT UPDATE ON public._firewall_bypass_roles TO {ROLE};
+INSERT INTO db_firewall._firewall_bypass_roles (role_name) VALUES ('{ROLE}_mig'); GRANT UPDATE ON db_firewall._firewall_bypass_roles TO {ROLE};
 -- @undo
-REVOKE UPDATE ON public._firewall_bypass_roles FROM {ROLE}; DELETE FROM public._firewall_bypass_roles WHERE role_name IN ('{ROLE}_mig', '{ROLE}');
+REVOKE UPDATE ON db_firewall._firewall_bypass_roles FROM {ROLE}; DELETE FROM db_firewall._firewall_bypass_roles WHERE role_name IN ('{ROLE}_mig', '{ROLE}');
 
 -- @attack it can execute _firewall_set_tenant
 -- @check -: cannot read the key or sign
--- @leak SELECT public._firewall_set_tenant('B'); SELECT string_agg(body, ',') FROM {S}.docs
+-- @leak SELECT db_firewall._firewall_set_tenant('B'); SELECT string_agg(body, ',') FROM {S}.docs
 -- @setup
-GRANT EXECUTE ON FUNCTION public._firewall_set_tenant(text) TO {ROLE};
+GRANT EXECUTE ON FUNCTION db_firewall._firewall_set_tenant(text) TO {ROLE};
 -- @undo
-REVOKE EXECUTE ON FUNCTION public._firewall_set_tenant(text) FROM {ROLE};
+REVOKE EXECUTE ON FUNCTION db_firewall._firewall_set_tenant(text) FROM {ROLE};
 
 -- @attack it can write the tenant map
 -- @check -: cannot write firewall tables
--- @leak INSERT INTO public._firewall_tenant_map (db_user, tenant_id) VALUES (session_user, 'B'); SELECT set_config('app.current_tenant', '', true); SELECT public._firewall_auto_resolve(); SELECT string_agg(body, ',') FROM {S}.docs
+-- @leak INSERT INTO db_firewall._firewall_tenant_map (db_user, tenant_id) VALUES (session_user, 'B'); SELECT set_config('app.current_tenant', '', true); SELECT db_firewall._firewall_auto_resolve(); SELECT string_agg(body, ',') FROM {S}.docs
 -- @setup
-GRANT INSERT ON public._firewall_tenant_map TO {ROLE};
+GRANT INSERT ON db_firewall._firewall_tenant_map TO {ROLE};
 -- @undo
-REVOKE INSERT ON public._firewall_tenant_map FROM {ROLE}; DELETE FROM public._firewall_tenant_map;
+REVOKE INSERT ON db_firewall._firewall_tenant_map FROM {ROLE}; DELETE FROM db_firewall._firewall_tenant_map;
 
 -- @attack it can read the signing key
 -- @check -: cannot read the key or sign
 -- @setup
-GRANT SELECT ON public._firewall_keys TO {ROLE};
+GRANT SELECT ON db_firewall._firewall_keys TO {ROLE};
 -- @undo
-REVOKE SELECT ON public._firewall_keys FROM {ROLE};
+REVOKE SELECT ON db_firewall._firewall_keys FROM {ROLE};
 
 -- @attack it can sign
 -- @check -: cannot read the key or sign
--- @leak SELECT set_config('app.current_tenant', 'B', true), set_config('app.tenant_sig', public._firewall_sign('B'), true); SELECT string_agg(body, ',') FROM {S}.docs
+-- @leak SELECT set_config('app.current_tenant', 'B', true), set_config('app.tenant_sig', db_firewall._firewall_sign('B'), true); SELECT string_agg(body, ',') FROM {S}.docs
 -- @setup
-GRANT EXECUTE ON FUNCTION public._firewall_sign(text) TO {ROLE};
+GRANT EXECUTE ON FUNCTION db_firewall._firewall_sign(text) TO {ROLE};
 -- @undo
-REVOKE EXECUTE ON FUNCTION public._firewall_sign(text) FROM {ROLE};
+REVOKE EXECUTE ON FUNCTION db_firewall._firewall_sign(text) FROM {ROLE};
 
 -- @attack the bypass function was changed
 -- @check -: firewall functions unchanged
 -- @leak SET LOCAL dbfw.maintenance = 'on'; SELECT string_agg(body, ',') FROM {S}.docs
 -- @setup
 -- CREATE OR REPLACE keeps the function the policies call; the undo puts the saved one back.
-CREATE TABLE public.{S}_saved AS SELECT pg_get_functiondef('public._firewall_is_bypass_role(text)'::regprocedure) AS def;
-CREATE OR REPLACE FUNCTION public._firewall_is_bypass_role(p_role TEXT) RETURNS BOOLEAN AS $f$
-    SELECT EXISTS (SELECT 1 FROM public._firewall_bypass_roles WHERE role_name = p_role)
+CREATE TABLE public.{S}_saved AS SELECT pg_get_functiondef('db_firewall._firewall_is_bypass_role(text)'::regprocedure) AS def;
+CREATE OR REPLACE FUNCTION db_firewall._firewall_is_bypass_role(p_role TEXT) RETURNS BOOLEAN AS $f$
+    SELECT EXISTS (SELECT 1 FROM db_firewall._firewall_bypass_roles WHERE role_name = p_role)
         OR current_setting('dbfw.maintenance', true) = 'on';
 $f$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
 -- @undo
@@ -218,8 +225,8 @@ DO $u$ BEGIN EXECUTE (SELECT def FROM public.{S}_saved); END $u$; DROP TABLE pub
 -- @check -: firewall functions unchanged
 -- @leak SELECT set_config('app.current_tenant', 'B', true); SELECT string_agg(body, ',') FROM {S}.docs
 -- @setup
-CREATE TABLE public.{S}_saved AS SELECT pg_get_functiondef('public._firewall_tenant()'::regprocedure) AS def;
-CREATE OR REPLACE FUNCTION public._firewall_tenant() RETURNS TEXT AS $f$
+CREATE TABLE public.{S}_saved AS SELECT pg_get_functiondef('db_firewall._firewall_tenant()'::regprocedure) AS def;
+CREATE OR REPLACE FUNCTION db_firewall._firewall_tenant() RETURNS TEXT AS $f$
     SELECT NULLIF(current_setting('app.current_tenant', true), '');
 $f$ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
 -- @undo
@@ -228,18 +235,18 @@ DO $u$ BEGIN EXECUTE (SELECT def FROM public.{S}_saved); END $u$; DROP TABLE pub
 -- @attack _firewall_auto_resolve was changed
 -- @check -: firewall functions unchanged
 -- @setup
-ALTER FUNCTION public._firewall_auto_resolve() RENAME TO _firewall_auto_resolve_saved;
-CREATE FUNCTION public._firewall_auto_resolve() RETURNS TEXT AS $f$ SELECT 'x'::text $f$ LANGUAGE sql;
+ALTER FUNCTION db_firewall._firewall_auto_resolve() RENAME TO _firewall_auto_resolve_saved;
+CREATE FUNCTION db_firewall._firewall_auto_resolve() RETURNS TEXT AS $f$ SELECT 'x'::text $f$ LANGUAGE sql;
 -- @undo
-DROP FUNCTION public._firewall_auto_resolve();
-ALTER FUNCTION public._firewall_auto_resolve_saved() RENAME TO _firewall_auto_resolve;
+DROP FUNCTION db_firewall._firewall_auto_resolve();
+ALTER FUNCTION db_firewall._firewall_auto_resolve_saved() RENAME TO _firewall_auto_resolve;
 
 -- @attack an extra _firewall_ function
 -- @check -: firewall functions unchanged
 -- @setup
-CREATE FUNCTION public._firewall_extra() RETURNS int LANGUAGE sql AS 'SELECT 1';
+CREATE FUNCTION db_firewall._firewall_extra() RETURNS int LANGUAGE sql AS 'SELECT 1';
 -- @undo
-DROP FUNCTION public._firewall_extra();
+DROP FUNCTION db_firewall._firewall_extra();
 
 -- ---------------------------------------------------------------- privileges RLS does not cover
 -- @attack it has TRUNCATE (RLS does not apply to it)
@@ -1024,8 +1031,8 @@ DROP EXTENSION pg_stat_statements;
 ALTER TABLE {S}.docs ADD PRIMARY KEY (id); ALTER TABLE {S}.docs ADD CONSTRAINT docs_tenant_body UNIQUE (tenant_id, body);
 ALTER TABLE {S}.docs ADD CONSTRAINT docs_tenant_id UNIQUE (tenant_id, id);
 CREATE TABLE {S}.child (tenant_id text, doc_id int, FOREIGN KEY (tenant_id, doc_id) REFERENCES {S}.docs (tenant_id, id));
-SELECT public._firewall_protect(schema_name::text, 'child', tenant_column::text, policy_mode::text, context::text)
-FROM public._firewall_protected_schemas WHERE schema_name = '{S}';
+SELECT db_firewall._firewall_protect(schema_name::text, 'child', tenant_column::text, policy_mode::text, context::text)
+FROM db_firewall._firewall_protected_schemas WHERE schema_name = '{S}';
 GRANT SELECT, INSERT ON {S}.child TO {ROLE};
 -- @undo
 DROP TABLE {S}.child; ALTER TABLE {S}.docs DROP CONSTRAINT docs_tenant_id, DROP CONSTRAINT docs_tenant_body,

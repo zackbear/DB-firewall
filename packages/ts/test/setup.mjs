@@ -38,7 +38,7 @@ export async function setup() {
     await admin.query(`INSERT INTO ${SCHEMA}.docs VALUES (1, 'A', 'a-doc'), (2, 'B', 'b-doc')`);
     await admin.query(`GRANT USAGE ON SCHEMA ${SCHEMA} TO ${APP_USER}`);
     await admin.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ${SCHEMA}.docs TO ${APP_USER}`);
-    await admin.query(`DELETE FROM public._firewall_bypass_roles WHERE role_name = '${APP_USER}'`)
+    await admin.query(`DELETE FROM db_firewall._firewall_bypass_roles WHERE role_name = '${APP_USER}'`)
       .catch(() => {});                       // table exists only after a first migration
     await admin.query("SELECT set_config('dbfw.tenant_column', 'tenant_id', false), " +
                       `set_config('dbfw.schema', '${SCHEMA}', false), ` +

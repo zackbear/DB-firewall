@@ -78,11 +78,11 @@ def schema():
         conn.execute(f"GRANT USAGE ON SCHEMA public TO {APP_ROLE}")
         conn.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON {TABLE}, {ITEMS} TO {APP_ROLE}")
         conn.execute(f"GRANT USAGE ON SEQUENCE {ITEMS}_id_seq TO {APP_ROLE}")
-        if conn.execute("SELECT to_regclass('_firewall_bypass_roles')").fetchone()[0]:
-            conn.execute("DELETE FROM _firewall_bypass_roles")
+        if conn.execute("SELECT to_regclass('db_firewall._firewall_bypass_roles')").fetchone()[0]:
+            conn.execute("DELETE FROM db_firewall._firewall_bypass_roles")
         conn.execute(sql)   # pass 1
         conn.execute(sql)   # pass 2 must also succeed (idempotent)
-        assert conn.execute("SELECT count(*) FROM _firewall_bypass_roles").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM db_firewall._firewall_bypass_roles").fetchone()[0] == 0
         assert _policies(conn, TABLE) == _expected_policies("public", TABLE)
     yield
 
@@ -155,7 +155,7 @@ def test_temp_table_cannot_shadow_bypass_roles():
         raw.execute("CREATE TEMP TABLE _firewall_bypass_roles(role_name text)")
         raw.execute("INSERT INTO _firewall_bypass_roles VALUES (current_user)")
         raw.execute("SET search_path = pg_temp, public")
-        assert raw.execute("SELECT _firewall_is_bypass_role(current_user::text)").fetchone()[0] is False
+        assert raw.execute("SELECT db_firewall._firewall_is_bypass_role(current_user::text)").fetchone()[0] is False
         rows = raw.execute(f"SELECT tenant_id FROM {TABLE}").fetchall()
         assert rows == [], f"temp-table shadow of _firewall_bypass_roles bypassed RLS: {rows!r}"
         raw.rollback()

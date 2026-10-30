@@ -36,9 +36,9 @@ export type Context = "signed" | "plain";
 export function predicate(column: string, context: Context): string {
   return context === "plain"
     ? `${ident(column)} = NULLIF(current_setting('app.current_tenant', true), '') ` +
-      "OR public._firewall_is_bypass_role(current_user::text)"
-    : `${ident(column)} = (SELECT public._firewall_tenant()) ` +
-      "OR (SELECT public._firewall_is_bypass_role(current_user::text))";
+      "OR db_firewall._firewall_is_bypass_role(current_user::text)"
+    : `${ident(column)} = (SELECT db_firewall._firewall_tenant()) ` +
+      "OR (SELECT db_firewall._firewall_is_bypass_role(current_user::text))";
 }
 
 // The tables and their policies: @query scan_tables.
@@ -102,22 +102,22 @@ const norm = (x: string) => x.replace(/\s+/g, " ").trim();
 
 /**
  * Every function the migration creates must match it (body, SECURITY DEFINER,
- * settings, volatility, language, return type), with no extra public._firewall_*
+ * settings, volatility, language, return type), with no extra db_firewall._firewall_*
  * function: the policies call some of them, others sign, and a changed body
  * (say, a session-setting "maintenance switch") opens every table while the
- * policies still look exact. Every public._firewall_* object must have one
+ * policies still look exact. Every db_firewall._firewall_* object must have one
  * owner, or only superusers: an object another role planted keeps its owner.
  */
 export async function firewallObjects(client: pg.ClientBase): Promise<{ ok: boolean; detail: string }> {
   const sql = readFileSync(MIGRATION, "utf8");
-  const want = [...sql.matchAll(/CREATE OR REPLACE FUNCTION public\.(_firewall_\w+)\(([^)]*)\)\s*RETURNS (\w+) AS \$\$([\s\S]*?)\$\$ LANGUAGE (\w+)([^;]*);/g)]
+  const want = [...sql.matchAll(/CREATE OR REPLACE FUNCTION db_firewall\.(_firewall_\w+)\(([^)]*)\)\s*RETURNS (\w+) AS \$\$([\s\S]*?)\$\$ LANGUAGE (\w+)([^;]*);/g)]
     .map(([, name, args, ret, body, lang, tail]) => ({
       name: name!, sig: args!.split(",").map((a) => a.trim().split(/\s+/)[1]?.toLowerCase()).filter(Boolean).join(", "),
       ret: ret!.toLowerCase(), body: body!, lang: lang!.toLowerCase(), tail: tail!,
     }));
   const diff: string[] = [];
   for (const w of want) {
-    const { rows: [f] } = await client.query(q("fw_function"), [`public.${w.name}(${w.sig})`]);
+    const { rows: [f] } = await client.query(q("fw_function"), [`db_firewall.${w.name}(${w.sig})`]);
     if (!f) { diff.push(`${w.name} (missing)`); continue; }
     const path = /SET search_path = ([^\n;]+?)\s*$/m.exec(w.tail)?.[1];
     const what = [

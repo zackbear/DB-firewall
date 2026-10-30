@@ -13,6 +13,6 @@ export function tenantKey(): Buffer | undefined {
   return Buffer.from(raw, "hex");
 }
 
-/** hex(HMAC-SHA256(key, nonce:tenant)), as public._firewall_sign() computes it. */
+/** hex(HMAC-SHA256(key, nonce:tenant)), as db_firewall._firewall_sign() computes it. */
 export const sign = (key: Buffer, nonce: string, tenant: string) =>
   createHmac("sha256", key).update(`${nonce}:${tenant}`, "utf8").digest("hex");

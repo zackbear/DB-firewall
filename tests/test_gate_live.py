@@ -56,7 +56,7 @@ def schema():
         a.execute(f"INSERT INTO {ALIAS} VALUES ('x','A'),('A','B')")
         a.execute("GRANT USAGE ON SCHEMA public TO dbfw_app")
         a.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON {T}, {MIXED}, {ALIAS} TO dbfw_app")
-        a.execute("REVOKE ALL ON _firewall_tenant_map FROM dbfw_app")
+        a.execute("REVOKE ALL ON db_firewall._firewall_tenant_map FROM dbfw_app")
     yield
     TenantContext.clear()
 

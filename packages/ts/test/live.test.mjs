@@ -233,11 +233,11 @@ describe("node-postgres", live, () => {
       const { rows } = await admin.query("SELECT rolsuper FROM pg_roles WHERE rolname = current_user");
       if (rows[0].rolsuper) await assert.rejects(assertSafeRole(admin), /superuser/);
     } finally { await admin.end(); }
-    await adminQuery("INSERT INTO public._firewall_bypass_roles (role_name) VALUES ('dbfw_ts')");
+    await adminQuery("INSERT INTO db_firewall._firewall_bypass_roles (role_name) VALUES ('dbfw_ts')");
     try {
       await assert.rejects(assertSafeRole(pool), /_firewall_bypass_roles/);
     } finally {
-      await adminQuery("DELETE FROM public._firewall_bypass_roles WHERE role_name = 'dbfw_ts'");
+      await adminQuery("DELETE FROM db_firewall._firewall_bypass_roles WHERE role_name = 'dbfw_ts'");
     }
   });
 });

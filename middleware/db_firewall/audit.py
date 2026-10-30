@@ -37,9 +37,11 @@ _PURGE_SQL = {
 
 def audit_table(config: dict, engine: str) -> str:
     """engines.<engine>.audit_table, else audit.table_name. Checked here too:
-    a config passed as a dict never went through load_config."""
-    return check_table_name(engine_options(config, engine).get("audit_table")
+    a config passed as a dict never went through load_config. On PostgreSQL
+    the default table is in the firewall's schema, db_firewall."""
+    name = check_table_name(engine_options(config, engine).get("audit_table")
                             or (config.get("audit") or {}).get("table_name") or "_firewall_audit_log")
+    return "db_firewall._firewall_audit_log" if engine == DBEngine.POSTGRESQL and name == "_firewall_audit_log" else name
 
 
 def audit_enabled(config: dict) -> bool:
