@@ -1,0 +1,32 @@
+{
+  "name": "db-firewall-nextjs-agent",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "db:migrate": "node --env-file=.env.local scripts/migrate.mjs",
+    "mcp": "node --env-file=.env.local ../../packages/mcp/dist/cli.js --http --schema app --jwt-secret-env MCP_JWT_SECRET --issuer starter --audience db-firewall-mcp",
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "test": "node --test --test-concurrency=1 test/*.test.ts"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "4.0.79",
+    "@ai-sdk/mcp": "2.0.74",
+    "@ai-sdk/react": "4.0.143",
+    "ai": "7.0.140",
+    "jose": "6.2.12",
+    "next": "16.4.1",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "@types/pg": "8.23.1",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "pg": "8.23.1",
+    "typescript": "5.9.3"
+  }
+}

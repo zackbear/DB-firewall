@@ -1,0 +1,35 @@
+{
+  "name": "@db-firewall/mcp",
+  "version": "0.1.0",
+  "description": "An MCP server for PostgreSQL where every tool call runs as one tenant, enforced by row-level security. The tenant comes from the server (a flag, or a verified token), never from the model.",
+  "license": "MIT",
+  "type": "module",
+  "bin": { "db-firewall-mcp": "./dist/cli.js" },
+  "main": "./dist/server.js",
+  "types": "./dist/server.d.ts",
+  "exports": {
+    ".": { "types": "./dist/server.d.ts", "import": "./dist/server.js" },
+    "./http": { "types": "./dist/http.d.ts", "import": "./dist/http.js" }
+  },
+  "files": ["dist", "README.md"],
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test --test-concurrency=1 \"test/**/*.test.mjs\"",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@db-firewall/pg": "file:../ts",
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "jose": "6.2.12",
+    "pg": "8.23.1",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "@types/pg": "8.23.1",
+    "typescript": "5.9.3"
+  },
+  "keywords": ["mcp", "postgres", "rls", "row-level-security", "multi-tenant", "ai-agent"],
+  "repository": { "type": "git", "url": "git+https://github.com/zackbear/DB-firewall.git", "directory": "packages/mcp" }
+}

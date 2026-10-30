@@ -1,0 +1,26 @@
+:root { --bg: #fafaf9; --fg: #1c1917; --muted: #57534e; --line: #e7e5e4; --accent: #0f766e; --card: #fff; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0c0a09; --fg: #f5f5f4; --muted: #a8a29e; --line: #292524; --accent: #2dd4bf; --card: #1c1917; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.5 system-ui, sans-serif; }
+main { max-width: 760px; margin: 0 auto; padding: 24px 16px; }
+button { font: inherit; padding: 8px 14px; border: 1px solid var(--line); border-radius: 8px;
+         background: var(--card); color: var(--fg); cursor: pointer; }
+button:disabled { opacity: .5; cursor: default; }
+.login form { display: flex; gap: 12px; flex-wrap: wrap; }
+.login p { color: var(--muted); }
+header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 12px;
+         border-bottom: 1px solid var(--line); }
+code { color: var(--accent); }
+.messages { list-style: none; padding: 0; display: grid; gap: 12px; }
+.messages li { padding: 10px 14px; border-radius: 10px; background: var(--card); border: 1px solid var(--line); }
+.messages li.user { border-color: var(--accent); }
+.tool summary { color: var(--muted); cursor: pointer; font-size: 14px; }
+.tool pre { overflow-x: auto; font-size: 13px; }
+.examples { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0; }
+.examples button { font-size: 14px; }
+.chat form { display: flex; gap: 8px; }
+.chat input { flex: 1; min-width: 0; font: inherit; padding: 8px 12px; border: 1px solid var(--line);
+              border-radius: 8px; background: var(--card); color: var(--fg); }
+.error { color: #dc2626; }

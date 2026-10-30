@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-10-30: MCP server and agent starter (PR #20)
+
+- **`@db-firewall/mcp`** (`packages/mcp`): an MCP server for PostgreSQL
+  with three tools, `list_tables`, `describe_table` and `query`. Every call
+  is one transaction as one tenant, signed with the database's key, so SQL
+  the model sends cannot switch tenants. The tenant comes from `--tenant`
+  (stdio) or from a verified JWT per request (`--http`: HS256 secret or
+  JWKS, `exp` required, issuer and audience checked; a bad token gets 401).
+  No tool has a tenant argument. Read only by default (`--allow-writes`),
+  a row cap (`--max-rows`, default 100), a statement timeout (default
+  5 s), one statement per call. It refuses to start as a role that can
+  skip RLS, or without `DB_FIREWALL_TENANT_KEY`.
+- **`examples/nextjs-agent`:** a starter app. Next.js, Claude through the AI
+  SDK, two demo tenants with tenant-scoped keys, and the MCP server over
+  HTTP with a short-lived token per chat request. Its test drives the agent
+  with a mock model against the real server and database.
+- **CI:** the typescript job also runs both on PostgreSQL 14 to 17.
+
 ## 2026-10-29: the firewall's own schema, db_firewall (PR #19)
 
 - **Breaking (PostgreSQL):** the firewall's tables and functions move from
