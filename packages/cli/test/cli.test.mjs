@@ -300,7 +300,8 @@ describe("migrate, scan, verify", live, () => {
   // What migrate --harden revokes from PUBLIC besides grants, and how to give it back.
   const RESTORE = "GRANT EXECUTE ON FUNCTION pg_catalog.pg_terminate_backend(integer, bigint), " +
     "pg_catalog.pg_cancel_backend(integer), pg_catalog.pg_stat_get_activity(integer), " +
-    "pg_catalog.pg_stat_get_backend_activity(integer) TO PUBLIC; GRANT SELECT ON pg_catalog.pg_stat_activity TO PUBLIC";
+    "pg_catalog.pg_stat_get_backend_activity(integer), pg_catalog.pg_notify(text, text) TO PUBLIC; " +
+    "GRANT SELECT ON pg_catalog.pg_stat_activity TO PUBLIC";
 
   describe("verify --strict (allowlist)", () => {
     // The excluded tables are readable but outside the scan: allowlist them.

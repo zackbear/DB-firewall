@@ -103,11 +103,12 @@ jobs:
           ! grep -qi "skipped" live.txt
 
   typescript:
-    # packages/ts (@db-firewall/pg) and packages/cli (db-firewall, with the
-    # attack corpus) against PostgreSQL with the real migration.
+    # packages/ts (@db-firewall/pg), packages/cli (db-firewall, with the
+    # attack corpus), packages/mcp and the agent starter against PostgreSQL
+    # with the real migration.
     name: typescript (PostgreSQL ${{ matrix.postgres }})
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -136,8 +137,18 @@ jobs:
           cache-dependency-path: |
             packages/ts/package-lock.json
             packages/cli/package-lock.json
+            packages/mcp/package-lock.json
+            examples/nextjs-agent/package-lock.json
       - run: npm ci
       - run: npm test
       - name: CLI (db-firewall migrate / scan / verify)
         working-directory: packages/cli
         run: npm ci && npm test
+      - name: MCP server (@db-firewall/mcp)
+        working-directory: packages/mcp
+        run: npm ci && npm test
+      - name: Agent starter (examples/nextjs-agent)
+        working-directory: examples/nextjs-agent
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+        run: npm ci && npm test && npx next build

@@ -1146,7 +1146,11 @@ $$;
 --       and pg_stat_statements when installed: one shared role sees the SQL
 --       text of its other sessions, so one tenant could read the literal
 --       values in another tenant's queries. Roles that only have pg_monitor
---       lose pg_stat_activity too: grant it to them again.
+--       lose pg_stat_activity too: grant it to them again;
+--     - pg_notify(text, text): any session can send any payload to every
+--       listener in the database (a job queue, a cache), so SQL one tenant runs
+--       could send messages in another's name. The NOTIFY statement needs no
+--       grant: give pg_notify back to roles that call it (GRANT EXECUTE).
 --     Database-wide, so off by default; needs a superuser. With dbfw.app_role
 --     it refuses (and the whole script changes nothing) when that role can act
 --     as the owner of the database or of any object in it (an owner can grant
@@ -1243,7 +1247,8 @@ BEGIN
     END LOOP;
     REVOKE SELECT ON pg_catalog.pg_stat_activity FROM PUBLIC;
     REVOKE EXECUTE ON FUNCTION pg_catalog.pg_stat_get_activity(integer),
-                               pg_catalog.pg_stat_get_backend_activity(integer) FROM PUBLIC;
+                               pg_catalog.pg_stat_get_backend_activity(integer),
+                               pg_catalog.pg_notify(text, text) FROM PUBLIC;
     -- pg_stat_statements, when installed: its text keeps some literal values.
     FOR r IN SELECT format('REVOKE EXECUTE ON FUNCTION %s FROM PUBLIC', p.oid::pg_catalog.regprocedure) AS cmd
              FROM pg_catalog.pg_proc p WHERE p.proname = 'pg_stat_statements'
@@ -1272,6 +1277,10 @@ BEGIN
               AND n.nspname NOT IN ('pg_catalog', 'information_schema') AND n.nspname NOT LIKE 'pg#_%' ESCAPE '#'
               AND EXISTS (SELECT 1 FROM pg_catalog.pg_roles m WHERE pg_catalog.pg_has_role(app_oid, m.oid, 'MEMBER')
                             AND pg_catalog.has_table_privilege(m.oid, c.oid, 'TRIGGER, TRUNCATE'))
+            UNION ALL
+            SELECT 'EXECUTE on pg_notify'
+            WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_roles m WHERE pg_catalog.pg_has_role(app_oid, m.oid, 'MEMBER')
+                            AND pg_catalog.has_function_privilege(m.oid, 'pg_catalog.pg_notify(text, text)', 'EXECUTE'))
             UNION ALL
             SELECT 'pg_stat_activity or pg_stat_statements'
             WHERE EXISTS (SELECT 1 FROM pg_catalog.pg_roles m WHERE pg_catalog.pg_has_role(app_oid, m.oid, 'MEMBER')

@@ -415,7 +415,7 @@ In both modes the database-native RLS/VPD policy remains the second layer: the r
 | **Django** (WSGI and ASGI) | `django_middleware_class(tenant_id_source=...)` |
 | **FastAPI** | `fastapi_middleware(app, tenant_id_source=...)` |
 | **Flask** | `flask_hooks(app, tenant_id_source=...)` |
-| **MCP Servers** | `mcp_wrapper.py` stdio proxy |
+| **MCP Servers** | `@db-firewall/mcp` (PostgreSQL, RLS), `mcp_wrapper.py` stdio proxy (others) |
 | **LangChain** | Wrap the connection before passing to agent |
 | **TypeScript** (node-postgres, postgres.js, Drizzle, AI SDK) | [`@db-firewall/pg`](packages/ts/README.md): `withTenant`, `bindTenant`, `assertSafeRole` (PostgreSQL RLS) |
 | **Node CLI** (PostgreSQL) | [`npx db-firewall`](packages/cli/README.md) `migrate` / `scan` / `verify` (no Python needed) |
@@ -464,7 +464,20 @@ Upgrade notes for these integrations are in [CHANGELOG.md](CHANGELOG.md).
 
 ## MCP Server Protection
 
-Wrap any MCP database server to auto-inject tenant isolation:
+**PostgreSQL: use the DB Firewall MCP server.** [`@db-firewall/mcp`](packages/mcp)
+is an MCP server whose every tool call runs as one tenant under the
+migration's row-level security. The tenant comes from a flag (stdio) or a
+verified JWT per request (HTTP), never from the model. It is read only by
+default. [`examples/nextjs-agent`](examples/nextjs-agent) is a starter app
+with it: Next.js, Claude and two demo tenants.
+
+```json
+{ "mcpServers": { "company-db": { "command": "npx",
+  "args": ["-y", "@db-firewall/mcp", "--tenant", "acme", "--schema", "app"],
+  "env": { "DATABASE_URL": "postgres://app_user:...@db/app", "DB_FIREWALL_TENANT_KEY": "..." } } } }
+```
+
+**Any other MCP database server:** wrap it to auto-inject tenant isolation:
 
 **Before (UNSAFE):**
 

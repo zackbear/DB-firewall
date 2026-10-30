@@ -1,0 +1,11 @@
+# PostgreSQL with the demo data. The firewall migration runs after it starts:
+# npm run db:migrate (see README.md).
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: starter
+    ports: ["127.0.0.1:5432:5432"]
+    volumes:
+      - ./db/seed.sql:/docker-entrypoint-initdb.d/seed.sql:ro

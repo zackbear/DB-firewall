@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-10-30: MCP server and agent starter (PR #20)
+
+- **`@db-firewall/mcp`** (`packages/mcp`): an MCP server for PostgreSQL
+  with three tools, `list_tables`, `describe_table` and `query`. Every call
+  is one transaction as one tenant, signed with the database's key, so SQL
+  the model sends cannot switch tenants. The tenant comes from `--tenant`
+  (stdio) or from a verified JWT per request (`--http`: HS256 secret or
+  JWKS, `exp` required, issuer and audience checked; a bad token gets 401).
+  No tool has a tenant argument. `--issuer` and `--audience` are required
+  in HTTP mode, which answers `POST` only. Read only by default
+  (`--allow-writes`). Each statement is checked alone first (a cursor for
+  reads, a prepared statement for writes), so it is one `SELECT`, `WITH`,
+  `VALUES`, `TABLE` (or, with writes, `INSERT`, `UPDATE`, `DELETE`,
+  `MERGE`) statement; `EXPLAIN`, whose plans show other tenants' row
+  counts, and every other command are refused. PostgreSQL then applies the
+  row cap (`--max-rows`, default 100) and the byte cap (`--max-bytes`,
+  default 1000000), so a huge result never reaches the server. Statement
+  timeout 5 s by default. It refuses to start as a role that can skip RLS,
+  without `DB_FIREWALL_TENANT_KEY`, or while sessions of the role can read
+  each other's SQL text (`migrate --harden` revokes it; `--allow-query-text`
+  when one tenant uses the role). Error messages are cut to 2,000
+  characters. It also refuses a role that can run `pg_notify()`, which sends
+  any payload to every listener in the database.
+- **`migrate --harden`** also revokes `pg_notify(text, text)` from `PUBLIC`.
+  The `NOTIFY` statement needs no grant; give `pg_notify` back to roles that
+  call it.
+- **`examples/nextjs-agent`:** a starter app. Next.js, Claude through the AI
+  SDK, two demo tenants with tenant-scoped keys, and the MCP server over
+  HTTP with a short-lived token per chat request. Its test drives the agent
+  with a mock model against the real server and database.
+- **CI:** the typescript job also runs both on PostgreSQL 14 to 17.
+
 ## 2026-10-29: the firewall's own schema, db_firewall (PR #19)
 
 - **Breaking (PostgreSQL):** the firewall's tables and functions move from
