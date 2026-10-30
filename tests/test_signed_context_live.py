@@ -1009,3 +1009,17 @@ def test_a_trigger_on_a_firewall_table_is_refused():
             c.execute("DROP TRIGGER sg_spy ON db_firewall._firewall_audit_log; DROP FUNCTION public.sg_spy()")
     _migrate()
 
+
+def test_a_foreign_key_to_a_firewall_table_is_refused():
+    """A foreign key to the audit log (an earlier version let the app have
+    REFERENCES there) would block _firewall_purge_audit once a row used it."""
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute("CREATE TABLE public.sg_ref (a bigint REFERENCES db_firewall._firewall_audit_log (id))")
+    try:
+        with pytest.raises(psycopg.errors.RaiseException, match="foreign key sg_ref_a_fkey from public.sg_ref"):
+            _migrate()
+    finally:
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute("DROP TABLE public.sg_ref")
+    _migrate()
+

@@ -82,12 +82,17 @@ BEGIN
         WHERE w.rulename <> '_RETURN' AND (c.relnamespace = fw
               OR (c.relnamespace = 'public'::regnamespace AND c.relname LIKE '#_firewall#_%' ESCAPE '#'))
         UNION ALL
+        SELECT format('foreign key %I from %s', k.conname, k.conrelid::regclass)    -- it can block the audit purge
+        FROM pg_constraint k JOIN pg_class c ON c.oid = k.confrelid
+        WHERE k.contype = 'f' AND (c.relnamespace = fw
+              OR (c.relnamespace = 'public'::regnamespace AND c.relname LIKE '#_firewall#_%' ESCAPE '#'))
+        UNION ALL
         SELECT format('policy %I on %s', y.polname, y.polrelid::regclass)
         FROM pg_policy y JOIN pg_class c ON c.oid = y.polrelid
         WHERE c.relnamespace = fw
               OR (c.relnamespace = 'public'::regnamespace AND c.relname LIKE '#_firewall#_%' ESCAPE '#')) z;
     IF bad IS NOT NULL THEN
-        RAISE EXCEPTION 'DB Firewall: % on the firewall''s own tables: the firewall makes none, and they run for whoever writes there. Drop them, then re-run.', bad;
+        RAISE EXCEPTION 'DB Firewall: % on the firewall''s own tables: the firewall makes none, and they run for whoever writes there (or block what it deletes). Drop them, then re-run.', bad;
     END IF;
 END;
 $$;
@@ -132,6 +137,11 @@ DECLARE
         WHERE w.rulename <> '_RETURN' AND (c.relnamespace = 'db_firewall'::regnamespace
               OR (c.relnamespace = 'public'::regnamespace AND c.relname LIKE '#_firewall#_%' ESCAPE '#'))
         UNION ALL
+        SELECT format('foreign key %I from %s', k.conname, k.conrelid::regclass)
+        FROM pg_constraint k JOIN pg_class c ON c.oid = k.confrelid
+        WHERE k.contype = 'f' AND (c.relnamespace = 'db_firewall'::regnamespace
+              OR (c.relnamespace = 'public'::regnamespace AND c.relname LIKE '#_firewall#_%' ESCAPE '#'))
+        UNION ALL
         SELECT format('policy %I on %s', y.polname, y.polrelid::regclass)
         FROM pg_policy y JOIN pg_class c ON c.oid = y.polrelid
         WHERE c.relnamespace = 'db_firewall'::regnamespace
@@ -159,7 +169,7 @@ BEGIN
     END IF;
     EXECUTE hooks INTO bad;
     IF bad IS NOT NULL THEN
-        RAISE EXCEPTION 'DB Firewall: % on the firewall''s own tables: the firewall makes none, and they run for whoever writes there. Drop them, then re-run.', bad;
+        RAISE EXCEPTION 'DB Firewall: % on the firewall''s own tables: the firewall makes none, and they run for whoever writes there (or block what it deletes). Drop them, then re-run.', bad;
     END IF;
     -- Who else can CREATE in it. In a schema made here, revoke (default
     -- privileges may have granted it): nobody else sees the schema before
@@ -240,7 +250,7 @@ BEGIN
     END IF;
     EXECUTE hooks INTO bad;
     IF bad IS NOT NULL THEN
-        RAISE EXCEPTION 'DB Firewall: % on the firewall''s own tables: the firewall makes none, and they run for whoever writes there. Drop them, then re-run.', bad;
+        RAISE EXCEPTION 'DB Firewall: % on the firewall''s own tables: the firewall makes none, and they run for whoever writes there (or block what it deletes). Drop them, then re-run.', bad;
     END IF;
 END;
 $$;
@@ -1352,12 +1362,17 @@ BEGIN
         WHERE w.rulename <> '_RETURN' AND (c.relnamespace = fw
               OR (c.relnamespace = 'public'::regnamespace AND c.relname LIKE '#_firewall#_%' ESCAPE '#'))
         UNION ALL
+        SELECT format('foreign key %I from %s', k.conname, k.conrelid::regclass)    -- it can block the audit purge
+        FROM pg_constraint k JOIN pg_class c ON c.oid = k.confrelid
+        WHERE k.contype = 'f' AND (c.relnamespace = fw
+              OR (c.relnamespace = 'public'::regnamespace AND c.relname LIKE '#_firewall#_%' ESCAPE '#'))
+        UNION ALL
         SELECT format('policy %I on %s', y.polname, y.polrelid::regclass)
         FROM pg_policy y JOIN pg_class c ON c.oid = y.polrelid
         WHERE c.relnamespace = fw
               OR (c.relnamespace = 'public'::regnamespace AND c.relname LIKE '#_firewall#_%' ESCAPE '#')) z;
     IF bad IS NOT NULL THEN
-        RAISE EXCEPTION 'DB Firewall: % on the firewall''s own tables: the firewall makes none, and they run for whoever writes there. Drop them, then re-run.', bad;
+        RAISE EXCEPTION 'DB Firewall: % on the firewall''s own tables: the firewall makes none, and they run for whoever writes there (or block what it deletes). Drop them, then re-run.', bad;
     END IF;
 END;
 $$;
