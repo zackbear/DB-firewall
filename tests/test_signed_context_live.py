@@ -951,3 +951,61 @@ def test_the_app_inserts_audit_rows_on_its_columns_only():
         c.execute(f"REVOKE INSERT (client_addr, tenant_id, auth_method, application) "
                   f"ON db_firewall._firewall_audit_log FROM {ROLE}")
         c.execute(f"REVOKE USAGE ON SEQUENCE db_firewall._firewall_audit_log_id_seq FROM {ROLE}")
+
+
+def test_a_table_planted_in_public_before_the_move_is_refused_before_any_write():
+    """Upgrade race: another role commits public._firewall_keys, with a trigger,
+    after section 0b checked and before its move loop. Injected here at that
+    point. The move must refuse it before the key INSERT can fire the trigger."""
+    from pathlib import Path
+    mig = (Path(__file__).resolve().parent.parent / "migrations" / "001_postgresql.sql").read_text()
+    plant = """    EXECUTE 'SET LOCAL ROLE sg_planter';
+    EXECUTE 'CREATE TABLE public._firewall_keys (id boolean PRIMARY KEY DEFAULT true, key bytea NOT NULL, '
+            'ipad bytea NOT NULL, opad bytea NOT NULL, created_at timestamptz DEFAULT now())';
+    EXECUTE 'CREATE FUNCTION public.steal() RETURNS trigger LANGUAGE plpgsql AS $f$ '
+            'BEGIN RAISE NOTICE ''leaked as %'', current_user; RETURN NEW; END $f$';
+    EXECUTE 'CREATE TRIGGER steal BEFORE INSERT OR UPDATE ON public._firewall_keys '
+            'FOR EACH ROW EXECUTE FUNCTION public.steal()';
+    EXECUTE 'RESET ROLE';
+"""
+    marker = "    -- Move what an earlier version made in public."
+    assert mig.count(marker) == 1
+    mig = mig.replace(marker, plant + marker, 1)
+    fresh = "dbfw_fresh_move"
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute(f"DROP DATABASE IF EXISTS {fresh}")
+        c.execute(f"CREATE DATABASE {fresh}")
+        c.execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'sg_planter') "
+                  "THEN CREATE ROLE sg_planter; END IF; END $$")
+    notices = []
+    try:
+        with psycopg.connect(f"{DSN} dbname={fresh}", autocommit=True) as c:
+            c.execute("GRANT CREATE ON SCHEMA public TO sg_planter")
+            c.add_notice_handler(lambda d: notices.append(d.message_primary))
+            c.execute("SELECT set_config('dbfw.tenant_key', repeat('ab', 32), false)")
+            with pytest.raises(psycopg.errors.RaiseException, match="not owned by"):
+                c.execute(mig)
+        assert not [n for n in notices if n.startswith("leaked")], notices
+    finally:
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"DROP DATABASE IF EXISTS {fresh}")
+            c.execute("DROP ROLE IF EXISTS sg_planter")
+
+
+def test_a_trigger_on_a_firewall_table_is_refused():
+    """An earlier version let the app have TRIGGER on the audit log, and a
+    trigger there runs inside _firewall_set_tenant as its owner (it could read
+    the key). The firewall makes no triggers, rules or policies on its own
+    tables: the migration refuses any."""
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute("CREATE FUNCTION public.sg_spy() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$")
+        c.execute("CREATE TRIGGER sg_spy AFTER INSERT ON db_firewall._firewall_audit_log "
+                  "FOR EACH ROW EXECUTE FUNCTION public.sg_spy()")
+    try:
+        with pytest.raises(psycopg.errors.RaiseException, match="trigger sg_spy on db_firewall._firewall_audit_log"):
+            _migrate()
+    finally:
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute("DROP TRIGGER sg_spy ON db_firewall._firewall_audit_log; DROP FUNCTION public.sg_spy()")
+    _migrate()
+

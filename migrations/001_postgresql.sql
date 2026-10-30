@@ -67,6 +67,28 @@ BEGIN
     IF bad IS NOT NULL THEN
         RAISE EXCEPTION 'DB Firewall: % not owned by % or a superuser. Another role may have planted them: drop them, or ALTER ... OWNER TO a trusted role, and re-run.', bad, current_user;
     END IF;
+    -- And code or row rules on the firewall's own tables: a trigger there runs
+    -- for whoever writes the table (_firewall_set_tenant writes the audit log
+    -- as its owner). The firewall makes none; an earlier version let the app
+    -- have TRIGGER on the audit log.
+    SELECT string_agg(h, ', ') INTO bad FROM (
+        SELECT format('trigger %I on %s', t.tgname, t.tgrelid::regclass) AS h
+        FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+        WHERE NOT t.tgisinternal AND (c.relnamespace = fw
+              OR (c.relnamespace = 'public'::regnamespace AND c.relname LIKE '#_firewall#_%' ESCAPE '#'))
+        UNION ALL
+        SELECT format('rule %I on %s', w.rulename, w.ev_class::regclass)
+        FROM pg_rewrite w JOIN pg_class c ON c.oid = w.ev_class
+        WHERE w.rulename <> '_RETURN' AND (c.relnamespace = fw
+              OR (c.relnamespace = 'public'::regnamespace AND c.relname LIKE '#_firewall#_%' ESCAPE '#'))
+        UNION ALL
+        SELECT format('policy %I on %s', y.polname, y.polrelid::regclass)
+        FROM pg_policy y JOIN pg_class c ON c.oid = y.polrelid
+        WHERE c.relnamespace = fw
+              OR (c.relnamespace = 'public'::regnamespace AND c.relname LIKE '#_firewall#_%' ESCAPE '#')) z;
+    IF bad IS NOT NULL THEN
+        RAISE EXCEPTION 'DB Firewall: % on the firewall''s own tables: the firewall makes none, and they run for whoever writes there. Drop them, then re-run.', bad;
+    END IF;
 END;
 $$;
 
@@ -80,23 +102,7 @@ DECLARE
     r RECORD;
     bad TEXT;
     made BOOLEAN := false;
-BEGIN
-    -- Only this block sets it (a value from ALTER ROLE/DATABASE ... SET, or
-    -- PGOPTIONS, must not reach the restore block before section 6).
-    PERFORM set_config('dbfw.guard_restore', '', true);
-    IF current_setting('dbfw.schema', true) = 'db_firewall' THEN
-        RAISE EXCEPTION 'DB Firewall: dbfw.schema must not be db_firewall, the firewall''s own schema';
-    END IF;
-    -- No IF NOT EXISTS: a schema another role made after section 0 checked
-    -- makes this fail, instead of being used. One made here stays out of other
-    -- sessions' sight until COMMIT, so nobody else can put anything in it.
-    IF to_regnamespace('db_firewall') IS NULL THEN
-        CREATE SCHEMA db_firewall;
-        made := true;
-    END IF;
-    -- Section 0's check again, now that the schema exists, before anything is
-    -- written or moved: a schema or object made after section 0 ran.
-    SELECT string_agg(o.name || ' (owner ' || pg_get_userbyid(o.owner) || ')', ', ') INTO bad
+    owners CONSTANT TEXT := $q$SELECT string_agg(o.name || ' (owner ' || pg_get_userbyid(o.owner) || ')', ', ')
     FROM (SELECT 'schema db_firewall' AS name, n.nspowner AS owner FROM pg_namespace n WHERE n.nspname = 'db_firewall'
           UNION ALL
           SELECT c.oid::regclass::text, c.relowner FROM pg_class c
@@ -114,9 +120,46 @@ BEGIN
           UNION ALL
           SELECT o.oid::regoperator::text, o.oprowner FROM pg_operator o WHERE o.oprnamespace = 'db_firewall'::regnamespace) o
     JOIN pg_roles x ON x.oid = o.owner
-    WHERE x.rolname <> current_user AND NOT x.rolsuper;
+    WHERE x.rolname <> current_user AND NOT x.rolsuper$q$;
+    hooks CONSTANT TEXT := $q$SELECT string_agg(h, ', ') FROM (
+        SELECT format('trigger %I on %s', t.tgname, t.tgrelid::regclass) AS h
+        FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+        WHERE NOT t.tgisinternal AND (c.relnamespace = 'db_firewall'::regnamespace
+              OR (c.relnamespace = 'public'::regnamespace AND c.relname LIKE '#_firewall#_%' ESCAPE '#'))
+        UNION ALL
+        SELECT format('rule %I on %s', w.rulename, w.ev_class::regclass)
+        FROM pg_rewrite w JOIN pg_class c ON c.oid = w.ev_class
+        WHERE w.rulename <> '_RETURN' AND (c.relnamespace = 'db_firewall'::regnamespace
+              OR (c.relnamespace = 'public'::regnamespace AND c.relname LIKE '#_firewall#_%' ESCAPE '#'))
+        UNION ALL
+        SELECT format('policy %I on %s', y.polname, y.polrelid::regclass)
+        FROM pg_policy y JOIN pg_class c ON c.oid = y.polrelid
+        WHERE c.relnamespace = 'db_firewall'::regnamespace
+              OR (c.relnamespace = 'public'::regnamespace AND c.relname LIKE '#_firewall#_%' ESCAPE '#')) z$q$;
+BEGIN
+    -- Only this block sets it (a value from ALTER ROLE/DATABASE ... SET, or
+    -- PGOPTIONS, must not reach the restore block before section 6).
+    PERFORM set_config('dbfw.guard_restore', '', true);
+    IF current_setting('dbfw.schema', true) = 'db_firewall' THEN
+        RAISE EXCEPTION 'DB Firewall: dbfw.schema must not be db_firewall, the firewall''s own schema';
+    END IF;
+    -- No IF NOT EXISTS: a schema another role made after section 0 checked
+    -- makes this fail, instead of being used. One made here stays out of other
+    -- sessions' sight until COMMIT, so nobody else can put anything in it.
+    IF to_regnamespace('db_firewall') IS NULL THEN
+        CREATE SCHEMA db_firewall;
+        made := true;
+    END IF;
+    -- Section 0's check again, now that the schema exists, before anything is
+    -- written or moved (a schema or object made after section 0 ran), and
+    -- again after the move below (an object planted in public meanwhile).
+    EXECUTE owners INTO bad;
     IF bad IS NOT NULL THEN
         RAISE EXCEPTION 'DB Firewall: % not owned by % or a superuser. Another role may have planted them: drop them, or ALTER ... OWNER TO a trusted role, and re-run.', bad, current_user;
+    END IF;
+    EXECUTE hooks INTO bad;
+    IF bad IS NOT NULL THEN
+        RAISE EXCEPTION 'DB Firewall: % on the firewall''s own tables: the firewall makes none, and they run for whoever writes there. Drop them, then re-run.', bad;
     END IF;
     -- Who else can CREATE in it. In a schema made here, revoke (default
     -- privileges may have granted it): nobody else sees the schema before
@@ -164,26 +207,41 @@ BEGIN
     -- placeholders section 7b leaves in public (views, and functions that
     -- raise) stay where they are.
     FOR r IN
-        SELECT c.relname::text AS name FROM pg_class c
+        SELECT c.relname::text AS name, c.relowner FROM pg_class c
         WHERE c.relnamespace = 'public'::regnamespace AND c.relname LIKE '#_firewall#_%' ESCAPE '#'
           AND c.relkind IN ('r', 'p')
     LOOP
+        IF NOT (pg_get_userbyid(r.relowner) = current_user OR (SELECT rolsuper FROM pg_roles WHERE oid = r.relowner)) THEN
+            RAISE EXCEPTION 'DB Firewall: public.% (owner %) not owned by % or a superuser: another role may have planted it', r.name, pg_get_userbyid(r.relowner), current_user;
+        END IF;
         IF to_regclass(format('db_firewall.%I', r.name)) IS NOT NULL THEN
             RAISE EXCEPTION 'DB Firewall: both public.% and db_firewall.% exist: keep one (db_firewall), then re-run', r.name, r.name;
         END IF;
         EXECUTE format('ALTER TABLE public.%I SET SCHEMA db_firewall', r.name);
     END LOOP;
     FOR r IN
-        SELECT p.oid::regprocedure::text AS sig, p.proname::text AS name, oidvectortypes(p.proargtypes) AS args
+        SELECT p.oid::regprocedure::text AS sig, p.proname::text AS name, oidvectortypes(p.proargtypes) AS args, p.proowner
         FROM pg_proc p
         WHERE p.pronamespace = 'public'::regnamespace AND p.proname LIKE '#_firewall#_%' ESCAPE '#'
           AND p.prosrc IS DISTINCT FROM format('BEGIN RAISE EXCEPTION ''DB Firewall: %s moved to schema db_firewall: upgrade the app''; END', p.proname)   -- not a placeholder (7b)
     LOOP
+        IF NOT (pg_get_userbyid(r.proowner) = current_user OR (SELECT rolsuper FROM pg_roles WHERE oid = r.proowner)) THEN
+            RAISE EXCEPTION 'DB Firewall: % (owner %) not owned by % or a superuser: another role may have planted it', r.sig, pg_get_userbyid(r.proowner), current_user;
+        END IF;
         IF to_regprocedure(format('db_firewall.%I(%s)', r.name, r.args)) IS NOT NULL THEN
             RAISE EXCEPTION 'DB Firewall: both % and its copy in db_firewall exist: drop the public one, then re-run', r.sig;
         END IF;
         EXECUTE format('ALTER ROUTINE %s SET SCHEMA db_firewall', r.sig);
     END LOOP;
+    -- What was moved is now in db_firewall, under this transaction's locks.
+    EXECUTE owners INTO bad;
+    IF bad IS NOT NULL THEN
+        RAISE EXCEPTION 'DB Firewall: % not owned by % or a superuser. Another role may have planted them: drop them, or ALTER ... OWNER TO a trusted role, and re-run.', bad, current_user;
+    END IF;
+    EXECUTE hooks INTO bad;
+    IF bad IS NOT NULL THEN
+        RAISE EXCEPTION 'DB Firewall: % on the firewall''s own tables: the firewall makes none, and they run for whoever writes there. Drop them, then re-run.', bad;
+    END IF;
 END;
 $$;
 
@@ -1278,6 +1336,28 @@ BEGIN
     WHERE r.rolname <> current_user AND NOT r.rolsuper;
     IF bad IS NOT NULL THEN
         RAISE EXCEPTION 'DB Firewall: % not owned by % or a superuser. Another role may have planted them: drop them, or ALTER ... OWNER TO a trusted role, and re-run.', bad, current_user;
+    END IF;
+    -- And code or row rules on the firewall's own tables: a trigger there runs
+    -- for whoever writes the table (_firewall_set_tenant writes the audit log
+    -- as its owner). The firewall makes none; an earlier version let the app
+    -- have TRIGGER on the audit log.
+    SELECT string_agg(h, ', ') INTO bad FROM (
+        SELECT format('trigger %I on %s', t.tgname, t.tgrelid::regclass) AS h
+        FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+        WHERE NOT t.tgisinternal AND (c.relnamespace = fw
+              OR (c.relnamespace = 'public'::regnamespace AND c.relname LIKE '#_firewall#_%' ESCAPE '#'))
+        UNION ALL
+        SELECT format('rule %I on %s', w.rulename, w.ev_class::regclass)
+        FROM pg_rewrite w JOIN pg_class c ON c.oid = w.ev_class
+        WHERE w.rulename <> '_RETURN' AND (c.relnamespace = fw
+              OR (c.relnamespace = 'public'::regnamespace AND c.relname LIKE '#_firewall#_%' ESCAPE '#'))
+        UNION ALL
+        SELECT format('policy %I on %s', y.polname, y.polrelid::regclass)
+        FROM pg_policy y JOIN pg_class c ON c.oid = y.polrelid
+        WHERE c.relnamespace = fw
+              OR (c.relnamespace = 'public'::regnamespace AND c.relname LIKE '#_firewall#_%' ESCAPE '#')) z;
+    IF bad IS NOT NULL THEN
+        RAISE EXCEPTION 'DB Firewall: % on the firewall''s own tables: the firewall makes none, and they run for whoever writes there. Drop them, then re-run.', bad;
     END IF;
 END;
 $$;
