@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-10-30: ready for npm
+
+- **License:** MIT, Copyright (c) 2026 Dragus Enterprises (`LICENSE`, also in
+  each npm package).
+- **npm:** `@db-firewall/pg` and `@db-firewall/mcp` publish with public
+  access. `db-firewall` (the CLI) and `@db-firewall/pg` go first;
+  `@db-firewall/mcp` then depends on the published `@db-firewall/pg`.
+
 ## 2026-10-30: MCP server and agent starter (PR #20)
 
 - **`@db-firewall/mcp`** (`packages/mcp`): an MCP server for PostgreSQL

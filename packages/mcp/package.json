@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "An MCP server for PostgreSQL where every tool call runs as one tenant, enforced by row-level security. The tenant comes from the server (a flag, or a verified token), never from the model.",
   "license": "MIT",
+  "publishConfig": { "access": "public" },
   "type": "module",
   "bin": { "db-firewall-mcp": "./dist/cli.js" },
   "main": "./dist/server.js",
