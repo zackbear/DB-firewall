@@ -746,11 +746,18 @@ def test_migration_moves_firewall_objects_out_of_public():
 
 
 def test_only_the_owner_creates_in_the_firewall_schema():
+    # An existing db_firewall another role can CREATE in: refused, not fixed in
+    # place (a REVOKE here would take effect only at COMMIT).
     with psycopg.connect(DSN, autocommit=True) as c:
         c.execute(f"GRANT CREATE ON SCHEMA db_firewall TO {ROLE}")
-    _migrate()                                                       # revokes it
+    try:
+        with pytest.raises(psycopg.errors.RaiseException, match="other roles can CREATE in schema db_firewall"):
+            _migrate()
+    finally:
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"REVOKE CREATE ON SCHEMA db_firewall FROM {ROLE}")
+    _migrate()
     with psycopg.connect(DSN, autocommit=True) as c:
-        assert c.execute(f"SELECT has_schema_privilege('{ROLE}', 'db_firewall', 'CREATE')").fetchone()[0] is False
         c.execute(f"GRANT CREATE ON SCHEMA db_firewall TO {ROLE}")
         c.execute(f"SET ROLE {ROLE}")
         c.execute("CREATE FUNCTION db_firewall._firewall_tenant(x int DEFAULT 0) RETURNS text "
@@ -804,8 +811,14 @@ def test_firewall_relations_keep_only_what_the_app_needs():
                 "SELECT c.relname, string_agg(a.privilege_type, ',' ORDER BY a.privilege_type) FROM pg_class c, "
                 "aclexplode(c.relacl) a WHERE c.relnamespace = 'db_firewall'::regnamespace "
                 "AND a.grantee = %s::regrole GROUP BY 1 ORDER BY 1", (ROLE,)).fetchall()
-        assert privs == [("_firewall_audit_log", "INSERT"), ("_firewall_audit_log_id_seq", "USAGE"),
+            cols = c.execute(
+                "SELECT string_agg(att.attname || ':' || a.privilege_type, ',' ORDER BY att.attname) "
+                "FROM pg_attribute att, aclexplode(att.attacl) a "
+                "WHERE att.attrelid = 'db_firewall._firewall_audit_log'::regclass AND a.grantee = %s::regrole",
+                (ROLE,)).fetchone()[0]
+        assert privs == [("_firewall_audit_log_id_seq", "USAGE"),
                          ("_firewall_bypass_roles", "SELECT"), ("_firewall_tenant_map", "SELECT")]
+        assert cols == "application:INSERT,auth_method:INSERT,client_addr:INSERT,tenant_id:INSERT"   # no id, db_user
     finally:
         with psycopg.connect(DSN, autocommit=True) as c:
             c.execute(f"REVOKE ALL ON ALL TABLES IN SCHEMA db_firewall FROM {ROLE}")
@@ -877,3 +890,64 @@ def test_upgrade_with_an_old_ddl_guard_installed():
         _drop_guard()
         with psycopg.connect(DSN, autocommit=True) as c:
             c.execute(f"DROP TABLE IF EXISTS {SCHEMA}.after_up")
+
+
+def test_a_schema_planted_after_the_first_check_is_refused_before_any_write():
+    """Fresh install race: another role creates db_firewall, with a trigger on
+    _firewall_keys, between section 0 and 0b. Injected here as a step between
+    them. The migration must refuse before it writes the key, so the trigger
+    (which would run as the migration's superuser) never fires."""
+    from pathlib import Path
+    mig = (Path(__file__).resolve().parent.parent / "migrations" / "001_postgresql.sql").read_text()
+    plant = """SET LOCAL ROLE sg_planter;
+CREATE SCHEMA db_firewall;
+CREATE TABLE db_firewall._firewall_keys (id boolean PRIMARY KEY DEFAULT true, key bytea NOT NULL,
+    ipad bytea NOT NULL, opad bytea NOT NULL, created_at timestamptz DEFAULT now());
+CREATE FUNCTION db_firewall.steal() RETURNS trigger LANGUAGE plpgsql AS $f$
+BEGIN RAISE NOTICE 'leaked as %', current_user; RETURN NEW; END $f$;
+CREATE TRIGGER steal BEFORE INSERT OR UPDATE ON db_firewall._firewall_keys FOR EACH ROW EXECUTE FUNCTION db_firewall.steal();
+RESET ROLE;
+"""
+    assert mig.count("-- 0b. ") == 1
+    mig = mig.replace("-- 0b. ", plant + "-- 0b. ", 1)
+    fresh = "dbfw_fresh_race"
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute(f"DROP DATABASE IF EXISTS {fresh}")
+        c.execute(f"CREATE DATABASE {fresh}")
+        c.execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'sg_planter') "
+                  "THEN CREATE ROLE sg_planter; END IF; END $$")
+        c.execute(f"GRANT CREATE ON DATABASE {fresh} TO sg_planter")
+    notices = []
+    try:
+        with psycopg.connect(f"{DSN} dbname={fresh}", autocommit=True) as c:
+            c.add_notice_handler(lambda d: notices.append(d.message_primary))
+            c.execute("SELECT set_config('dbfw.tenant_key', repeat('ab', 32), false)")
+            with pytest.raises(psycopg.errors.RaiseException, match="not owned by"):
+                c.execute(mig)
+        assert not [n for n in notices if n.startswith("leaked")], notices
+    finally:
+        with psycopg.connect(DSN, autocommit=True) as c:
+            c.execute(f"DROP DATABASE IF EXISTS {fresh}")
+            c.execute("DROP ROLE IF EXISTS sg_planter")
+
+
+def test_the_app_inserts_audit_rows_on_its_columns_only():
+    """INSERT on id would let the app take future ids (later rows, and
+    _firewall_set_tenant, then fail); on db_user or session_pid, forge them."""
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute(f"GRANT INSERT ON db_firewall._firewall_audit_log TO {ROLE}")
+        c.execute(f"GRANT USAGE ON SEQUENCE db_firewall._firewall_audit_log_id_seq TO {ROLE}")
+    _migrate()
+    with psycopg.connect(DSN, autocommit=True) as c:
+        c.execute(f"SET ROLE {ROLE}")
+        c.execute("INSERT INTO db_firewall._firewall_audit_log (client_addr, tenant_id, auth_method) "
+                  "VALUES (NULL, 'A', 'test')")
+        for col, val in [("id", "999999"), ("db_user", "'someone'"), ("session_pid", "1")]:
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                c.execute(f"INSERT INTO db_firewall._firewall_audit_log ({col}, tenant_id) VALUES ({val}, 'A')")
+        c.execute("RESET ROLE")
+        assert c.execute(f"SELECT has_table_privilege('{ROLE}', 'db_firewall._firewall_audit_log', 'INSERT')"
+                         ).fetchone()[0] is False
+        c.execute(f"REVOKE INSERT (client_addr, tenant_id, auth_method, application) "
+                  f"ON db_firewall._firewall_audit_log FROM {ROLE}")
+        c.execute(f"REVOKE USAGE ON SEQUENCE db_firewall._firewall_audit_log_id_seq FROM {ROLE}")

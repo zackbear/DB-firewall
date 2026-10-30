@@ -78,6 +78,8 @@ $$;
 DO $$
 DECLARE
     r RECORD;
+    bad TEXT;
+    made BOOLEAN := false;
 BEGIN
     -- Only this block sets it (a value from ALTER ROLE/DATABASE ... SET, or
     -- PGOPTIONS, must not reach the restore block before section 6).
@@ -85,25 +87,59 @@ BEGIN
     IF current_setting('dbfw.schema', true) = 'db_firewall' THEN
         RAISE EXCEPTION 'DB Firewall: dbfw.schema must not be db_firewall, the firewall''s own schema';
     END IF;
-    CREATE SCHEMA IF NOT EXISTS db_firewall;
-    FOR r IN
-        SELECT a.grantee FROM pg_namespace n, aclexplode(n.nspacl) a
-        WHERE n.nspname = 'db_firewall' AND a.privilege_type = 'CREATE' AND a.grantee <> n.nspowner
-    LOOP
-        EXECUTE format('REVOKE CREATE ON SCHEMA db_firewall FROM %s CASCADE',
-                       CASE r.grantee WHEN 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(r.grantee)) END);
-    END LOOP;
-    GRANT USAGE ON SCHEMA db_firewall TO PUBLIC;
-    -- A REVOKE takes back only its own role's grants: check what is left.
-    IF EXISTS (SELECT 1 FROM pg_roles x, pg_namespace n WHERE n.nspname = 'db_firewall' AND NOT x.rolsuper
-                 AND NOT pg_has_role(x.oid, n.nspowner, 'MEMBER') AND has_schema_privilege(x.oid, n.oid, 'CREATE'))
-       OR NOT EXISTS (SELECT 1 FROM pg_namespace n, aclexplode(n.nspacl) a
-                      WHERE n.nspname = 'db_firewall' AND a.grantee = 0 AND a.privilege_type = 'USAGE') THEN
-        RAISE EXCEPTION 'DB Firewall: schema db_firewall: other roles can CREATE in it (%), or PUBLIC lacks USAGE on it, and this role cannot change that: run the migration as the role that owns the schema, or a superuser',
-            COALESCE((SELECT string_agg(x.rolname, ', ') FROM pg_roles x, pg_namespace n WHERE n.nspname = 'db_firewall'
-                        AND NOT x.rolsuper AND NOT pg_has_role(x.oid, n.nspowner, 'MEMBER')
-                        AND has_schema_privilege(x.oid, n.oid, 'CREATE')), 'none');
+    -- No IF NOT EXISTS: a schema another role made after section 0 checked
+    -- makes this fail, instead of being used. One made here stays out of other
+    -- sessions' sight until COMMIT, so nobody else can put anything in it.
+    IF to_regnamespace('db_firewall') IS NULL THEN
+        CREATE SCHEMA db_firewall;
+        made := true;
     END IF;
+    -- Section 0's check again, now that the schema exists, before anything is
+    -- written or moved: a schema or object made after section 0 ran.
+    SELECT string_agg(o.name || ' (owner ' || pg_get_userbyid(o.owner) || ')', ', ') INTO bad
+    FROM (SELECT 'schema db_firewall' AS name, n.nspowner AS owner FROM pg_namespace n WHERE n.nspname = 'db_firewall'
+          UNION ALL
+          SELECT c.oid::regclass::text, c.relowner FROM pg_class c
+          WHERE c.relnamespace = 'db_firewall'::regnamespace
+             OR (c.relnamespace = 'public'::regnamespace AND c.relname LIKE '#_firewall#_%' ESCAPE '#')
+          UNION ALL
+          SELECT p.oid::regprocedure::text, p.proowner FROM pg_proc p
+          WHERE p.pronamespace = 'db_firewall'::regnamespace
+             OR (p.pronamespace = 'public'::regnamespace AND p.proname LIKE '#_firewall#_%' ESCAPE '#')
+          UNION ALL
+          SELECT t.oid::regtype::text, t.typowner FROM pg_type t
+          WHERE (t.typnamespace = 'db_firewall'::regnamespace
+                 OR (t.typnamespace = 'public'::regnamespace AND t.typname LIKE '#_firewall#_%' ESCAPE '#'))
+            AND t.typrelid = 0
+          UNION ALL
+          SELECT o.oid::regoperator::text, o.oprowner FROM pg_operator o WHERE o.oprnamespace = 'db_firewall'::regnamespace) o
+    JOIN pg_roles x ON x.oid = o.owner
+    WHERE x.rolname <> current_user AND NOT x.rolsuper;
+    IF bad IS NOT NULL THEN
+        RAISE EXCEPTION 'DB Firewall: % not owned by % or a superuser. Another role may have planted them: drop them, or ALTER ... OWNER TO a trusted role, and re-run.', bad, current_user;
+    END IF;
+    -- Who else can CREATE in it. In a schema made here, revoke (default
+    -- privileges may have granted it): nobody else sees the schema before
+    -- COMMIT. In one that existed, refuse: a REVOKE here would only take
+    -- effect at COMMIT, and until then that role could still add an object
+    -- this script then uses.
+    IF made THEN
+        FOR r IN
+            SELECT a.grantee FROM pg_namespace n, aclexplode(n.nspacl) a
+            WHERE n.nspname = 'db_firewall' AND a.privilege_type = 'CREATE' AND a.grantee <> n.nspowner
+        LOOP
+            EXECUTE format('REVOKE CREATE ON SCHEMA db_firewall FROM %s CASCADE',
+                           CASE r.grantee WHEN 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(r.grantee)) END);
+        END LOOP;
+    END IF;
+    IF EXISTS (SELECT 1 FROM pg_roles x, pg_namespace n WHERE n.nspname = 'db_firewall' AND NOT x.rolsuper
+                 AND NOT pg_has_role(x.oid, n.nspowner, 'MEMBER') AND has_schema_privilege(x.oid, n.oid, 'CREATE')) THEN
+        RAISE EXCEPTION 'DB Firewall: other roles can CREATE in schema db_firewall (%): REVOKE CREATE ON SCHEMA db_firewall FROM them (and from PUBLIC), then re-run',
+            (SELECT string_agg(x.rolname, ', ') FROM pg_roles x, pg_namespace n WHERE n.nspname = 'db_firewall'
+               AND NOT x.rolsuper AND NOT pg_has_role(x.oid, n.nspowner, 'MEMBER')
+               AND has_schema_privilege(x.oid, n.oid, 'CREATE'));
+    END IF;
+    GRANT USAGE ON SCHEMA db_firewall TO PUBLIC;
     -- An earlier version's DDL guard reads the public tables this block moves,
     -- so it would fail on the move: pause it until section 5b has replaced its
     -- functions (the block before section 6 sets it back as it was).
@@ -953,6 +989,18 @@ DO $$
 DECLARE
     r RECORD;
 BEGIN
+    -- The audit log: INSERT on the columns the middleware writes only. With
+    -- INSERT on id, the app could take future ids (and later rows, and
+    -- _firewall_set_tenant, would fail); with db_user or session_pid, it
+    -- could forge them. A table-level INSERT becomes these column grants.
+    FOR r IN
+        SELECT DISTINCT a.grantee FROM pg_class c, aclexplode(c.relacl) a
+        WHERE c.oid = 'db_firewall._firewall_audit_log'::regclass AND a.privilege_type = 'INSERT' AND a.grantee <> c.relowner
+    LOOP
+        EXECUTE format('REVOKE INSERT ON db_firewall._firewall_audit_log FROM %1$s; '
+                       'GRANT INSERT (client_addr, tenant_id, auth_method, application) ON db_firewall._firewall_audit_log TO %1$s',
+                       CASE r.grantee WHEN 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(r.grantee)) END);
+    END LOOP;
     FOR r IN
         -- Every relation in db_firewall and every public._firewall_* placeholder:
         -- each grantee but the owner keeps only what this list allows.
@@ -961,7 +1009,7 @@ BEGIN
                    CASE WHEN c.relnamespace = 'db_firewall'::regnamespace THEN c.relname::text END AS name,
                    CASE c.relname WHEN '_firewall_bypass_roles' THEN ARRAY['SELECT']
                                   WHEN '_firewall_tenant_map'   THEN ARRAY['SELECT']
-                                  WHEN '_firewall_audit_log'     THEN ARRAY['INSERT']   -- the middleware's audit rows
+                                  WHEN '_firewall_audit_log'     THEN ARRAY[]::text[]   -- column grants only, below
                                   WHEN '_firewall_audit_log_id_seq' THEN ARRAY['USAGE']
                                   ELSE ARRAY[]::text[] END AS allowed
             FROM pg_class c
@@ -976,6 +1024,8 @@ BEGIN
         SELECT 'TABLE ' || rel.oid::regclass::text, a.privilege_type, quote_ident(att.attname), a.grantee
         FROM rel JOIN pg_attribute att ON att.attrelid = rel.oid, aclexplode(att.attacl) a
         WHERE a.grantee <> rel.relowner AND NOT (rel.name IS NOT NULL AND a.privilege_type = ANY (rel.allowed))
+          AND NOT (rel.name = '_firewall_audit_log' AND a.privilege_type = 'INSERT'
+                   AND att.attname IN ('client_addr', 'tenant_id', 'auth_method', 'application'))
         UNION
         SELECT 'FUNCTION ' || p.oid::regprocedure::text, 'ALL', '', a.grantee
         FROM pg_proc p, aclexplode(COALESCE(p.proacl, acldefault('f', p.proowner))) a
