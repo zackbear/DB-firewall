@@ -10,19 +10,22 @@ import { startHttp } from "./http.js";
 const USAGE = `db-firewall-mcp: an MCP server for PostgreSQL where every tool call runs as one tenant.
 
   db-firewall-mcp --tenant <id> [options]                 stdio, one tenant (Claude Desktop, Claude Code)
-  db-firewall-mcp --http --jwt-secret-env <VAR> [options] HTTP, the tenant from a verified JWT per request
-  db-firewall-mcp --http --jwks-url <url> [options]
+  db-firewall-mcp --http --jwt-secret-env <VAR> --issuer <iss> --audience <aud> [options]
+                                                          HTTP, the tenant from a verified JWT per request
+  db-firewall-mcp --http --jwks-url <url> --issuer <iss> --audience <aud> [options]
 
   --url <postgres-url>      the app role's database URL (default: DATABASE_URL)
   --schema <name>           the schema list_tables and describe_table show (default: public)
   --tenant <id>             stdio: the tenant (default: DB_FIREWALL_MCP_TENANT)
   --allow-writes            allow INSERT, UPDATE and DELETE, still inside the tenant (default: read only)
   --max-rows <n>            rows a query returns at most (default: 100)
+  --max-bytes <n>           bytes of row JSON a query returns at most (default: 1000000)
   --statement-timeout <ms>  per call (default: 5000)
   --port <n>                HTTP port (default: 3333); --host <addr> (default: 127.0.0.1)
   --jwt-secret-env <VAR>    the environment variable that holds the HS256 secret
   --jwks-url <url>          or the identity provider's JWKS URL
-  --issuer <iss>  --audience <aud>  --tenant-claim <name> (default: tenant_id)
+  --issuer <iss> --audience <aud>  HTTP: required, the iss and aud tokens must carry
+  --tenant-claim <name>     HTTP: the claim that holds the tenant (default: tenant_id)
 
   DB_FIREWALL_TENANT_KEY must be set: the key the migration installed.`;
 
@@ -35,7 +38,8 @@ function int(v: string | undefined, d: number, name: string): number {
 async function main(): Promise<number> {
   const { values: a } = parseArgs({ strict: true, options: {
     url: { type: "string" }, schema: { type: "string" }, tenant: { type: "string" },
-    "allow-writes": { type: "boolean" }, "max-rows": { type: "string" }, "statement-timeout": { type: "string" },
+    "allow-writes": { type: "boolean" }, "max-rows": { type: "string" }, "max-bytes": { type: "string" },
+    "statement-timeout": { type: "string" },
     http: { type: "boolean" }, port: { type: "string" }, host: { type: "string" },
     "jwt-secret-env": { type: "string" }, "jwks-url": { type: "string" },
     issuer: { type: "string" }, audience: { type: "string" }, "tenant-claim": { type: "string" },
@@ -47,7 +51,8 @@ async function main(): Promise<number> {
   const pool = new pg.Pool({ connectionString: url, max: 10 });
   const opts = {
     pool, schema: a.schema ?? "public", allowWrites: !!a["allow-writes"],
-    maxRows: int(a["max-rows"], 100, "max-rows"), statementTimeoutMs: int(a["statement-timeout"], 5000, "statement-timeout"),
+    maxRows: int(a["max-rows"], 100, "max-rows"), maxBytes: int(a["max-bytes"], 1_000_000, "max-bytes"),
+    statementTimeoutMs: int(a["statement-timeout"], 5000, "statement-timeout"),
   };
   await checkSetup(opts);
 
@@ -56,7 +61,8 @@ async function main(): Promise<number> {
     if (secretVar && !process.env[secretVar]) throw new Error(`${secretVar} is not set`);
     const port = int(a.port, 3333, "port");
     await startHttp({ ...opts, port, host: a.host, jwtSecret: secretVar ? process.env[secretVar] : undefined,
-                      jwksUrl: a["jwks-url"], issuer: a.issuer, audience: a.audience, tenantClaim: a["tenant-claim"] });
+                      jwksUrl: a["jwks-url"], issuer: a.issuer ?? "", audience: a.audience ?? "",
+                      tenantClaim: a["tenant-claim"] });
     process.stderr.write(`db-firewall-mcp: http://${a.host ?? "127.0.0.1"}:${port}/mcp` +
                          `${opts.allowWrites ? " (writes allowed)" : " (read only)"}\n`);
     return -1;                                   // keep running

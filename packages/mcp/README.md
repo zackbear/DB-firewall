@@ -39,10 +39,10 @@ npx @db-firewall/mcp --http --schema app --jwt-secret-env MCP_JWT_SECRET \
   --issuer my-app --audience db-firewall-mcp          # http://127.0.0.1:3333/mcp
 ```
 
-- Each request needs `Authorization: Bearer <JWT>`. The server checks the signature, `exp` (required), and the issuer and audience you give. Then it reads the tenant from the `tenant_id` claim (`--tenant-claim` changes it).
+- Each request is a `POST` with `Authorization: Bearer <JWT>`. The server checks the signature, `exp`, `iss` and `aud`. Then it reads the tenant from the `tenant_id` claim (`--tenant-claim` changes it). `--issuer` and `--audience` are required: without them, any token from a shared identity provider would do.
 - `--jwt-secret-env <VAR>` names the variable that holds an HS256 secret of at least 32 bytes. Or use `--jwks-url <url>` for an identity provider's keys (RS256, PS256, ES256, EdDSA).
 - A missing, forged, expired or tenant-less token gets `401`, and nothing runs. The reply gives no reason.
-- Streamable HTTP, stateless: a new MCP server, bound to the token's tenant, serves each request.
+- Streamable HTTP, stateless: a new MCP server, bound to the token's tenant, serves each request. `GET` and `DELETE` (a stream, a session) get `405`.
 - It listens on `127.0.0.1` by default (`--host`, `--port`). Put TLS and the public address in front of it.
 
 Your app signs a short-lived token for the signed-in user's tenant, from your own auth, and passes it to its MCP client. [`examples/nextjs-agent`](../../examples/nextjs-agent) does this with the Vercel AI SDK.
@@ -53,20 +53,21 @@ Your app signs a short-lived token for the signed-in user's tenant, from your ow
 |---|---|
 | `list_tables` | The tables in `--schema` that the role can use (not the firewall's own). |
 | `describe_table` | The columns of one table in `--schema`. |
-| `query` | One SQL statement. Its rows come back as JSON, at most `--max-rows` (default 100), with `truncated` when there were more. |
+| `query` | One SQL statement: `SELECT`, `WITH`, `VALUES` or `TABLE`; with `--allow-writes` also `INSERT`, `UPDATE`, `DELETE` and `MERGE` (`MERGE` needs PostgreSQL 17). Its rows come back as JSON, at most `--max-rows` (default 100) and `--max-bytes` (default 1000000), with `truncated` when there were more. A row larger than `--max-bytes` comes back as its size. |
 
 Each call is one transaction:
 - The tenant is signed for this transaction only, and SQL the model sends cannot switch it.
 - The transaction is `READ ONLY` unless you pass `--allow-writes`. With writes, a row for another tenant fails the policy's `WITH CHECK`.
 - `statement_timeout` is `--statement-timeout` (default 5000 ms).
 - `search_path` is `--schema`.
-- A string with more than one statement is refused.
+- The statement is first checked alone, as a cursor (reads) or a prepared statement (writes). So it is exactly one statement of the kinds above. `EXPLAIN`, `SET`, `COMMIT`, `COPY`, `LISTEN` and other commands are refused. `EXPLAIN ANALYZE` would show plans and row counts of other tenants' rows.
+- Then PostgreSQL turns each row into JSON and applies the row and byte limits, so a huge result never reaches the server.
 - After the call, the session is reset. A connection whose session was tampered with is closed, not reused.
 
 ## What it does not do
 
 - **It does not limit what SQL the role may run.** The database role and its grants do that. Grant only what the agent needs.
-- **It does not hide side channels that RLS leaves open.** A `UNIQUE` or foreign-key error, or timing, can show that another tenant has a value. `verify --strict` lists the keys that leave out the tenant column.
+- **It does not hide every side channel that RLS leaves open.** A `UNIQUE` or foreign-key error (with writes), or timing, can show that another tenant has a value. `verify --strict` lists the keys that leave out the tenant column. `EXPLAIN` is refused for this reason.
 - **It does not keep the tenant's own data from the model.** Every row the tenant can see can reach the model, and the model's provider.
 
 ## As a library
@@ -89,6 +90,6 @@ const server = createServer(opts, "acme"); // an McpServer bound to tenant acme:
 - read only by default;
 - one statement per call;
 - writes only inside the tenant;
-- the row cap;
+- the row and byte caps, also for a 20 MB row;
 - refusal to start as a superuser or without the key;
-- the HTTP token checks.
+- the HTTP token checks, `POST` only, and the required issuer and audience.

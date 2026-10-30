@@ -21,6 +21,8 @@ export interface ServerOptions {
   maxRows?: number;
   /** statement_timeout for each call, in milliseconds (default 5000). */
   statementTimeoutMs?: number;
+  /** Bytes of row JSON a query returns at most (default 1000000). A row larger than this comes back as its size only. */
+  maxBytes?: number;
 }
 
 /** Check once at start-up: the key is set and the role cannot skip RLS. */
@@ -32,12 +34,39 @@ export async function checkSetup(opts: ServerOptions): Promise<void> {
   await assertSafeRole(opts.pool);
 }
 
-// The first keyword, after spaces and comments: SELECT-like statements go
-// through a cursor, so a big result is never read whole.
-const READS = new Set(["select", "with", "values", "table"]);
-function firstWord(sql: string): string {
-  const s = sql.replace(/^(?:\s+|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*/, "");
-  return (s.match(/^[a-z]+/i)?.[0] ?? "").toLowerCase();
+// The model's SQL runs in two steps.
+//  1. Alone, as a check: DECLARE CURSOR takes exactly one SELECT, WITH, VALUES
+//     or TABLE statement; with writes allowed, PREPARE also takes INSERT,
+//     UPDATE, DELETE and MERGE. Both refuse EXPLAIN (its plans and row counts
+//     show other tenants' rows), SET, COMMIT, COPY, LISTEN and the like. A
+//     statement that passes is complete on its own, so it cannot close the
+//     wrapper of step 2.
+//  2. Wrapped: PostgreSQL turns each row into JSON text, replaces a row larger
+//     than maxBytes with its size, and stops at maxRows and maxBytes. So a
+//     huge result never reaches this process.
+const READ_KINDS = "read only: one SELECT, WITH, VALUES or TABLE statement";
+const WRITE_KINDS = "one SELECT, WITH, VALUES, TABLE, INSERT, UPDATE, DELETE or MERGE statement " +
+  "(MERGE needs PostgreSQL 17)";
+
+/** The rows of `from` (alias `alias`) as JSON text, within the limits, plus one row past them if any. */
+function capped(from: string, alias: string, maxRows: number, maxBytes: number, total: boolean): string {
+  return `SELECT j, n, run${total ? ", total" : ""} FROM (
+    SELECT CASE WHEN n <= ${maxBytes} THEN j END AS j, n,
+           sum(least(n, ${maxBytes})) OVER (ROWS UNBOUNDED PRECEDING) AS run${total ? ", count(*) OVER () AS total" : ""}
+    FROM (SELECT j, octet_length(j) AS n FROM (SELECT row_to_json(${alias})::text AS j FROM ${from}) AS _s0) AS _s1) AS _s2
+  WHERE run - least(n, ${maxBytes}) <= ${maxBytes} LIMIT ${maxRows + 1}`;
+}
+
+/** The JSON of a result, built from the rows' own JSON text (big numbers keep their digits). */
+function result(rows: { j: string | null; n: string; run: string }[], maxRows: number, maxBytes: number,
+                extra = ""): string {
+  const out: string[] = [];
+  let truncated = false;
+  for (const r of rows) {
+    if (out.length === maxRows || Number(r.run) > maxBytes) { truncated = true; break; }
+    out.push(r.j ?? JSON.stringify({ _dbfw_row_too_large_bytes: Number(r.n) }));
+  }
+  return `{${extra}"rows":[${out.join(",")}],"truncated":${truncated}}`;
 }
 
 function text(value: unknown, isError = false) {
@@ -50,8 +79,10 @@ export function createServer(opts: ServerOptions, tenantId: string): McpServer {
   const tenant = validateTenantId(tenantId);
   const maxRows = opts.maxRows ?? 100;
   const timeout = opts.statementTimeoutMs ?? 5000;
+  const maxBytes = opts.maxBytes ?? 1_000_000;
   if (!Number.isInteger(maxRows) || maxRows < 1) throw new RangeError("maxRows must be a positive integer");
   if (!Number.isInteger(timeout) || timeout < 1) throw new RangeError("statementTimeoutMs must be a positive integer");
+  if (!Number.isInteger(maxBytes) || maxBytes < 1) throw new RangeError("maxBytes must be a positive integer");
 
   // One transaction as the tenant: a time limit, and read only unless writes
   // are allowed. Both are set after withTenant's own query, which PostgreSQL
@@ -87,20 +118,42 @@ export function createServer(opts: ServerOptions, tenantId: string): McpServer {
 
   server.registerTool("query", {
     description: "Run one SQL statement and get its rows as JSON. Only the current tenant's rows are visible" +
-      (opts.allowWrites ? "; writes are allowed for this tenant only." : "; the transaction is read only.") +
-      ` At most ${maxRows} rows come back.`,
+      (opts.allowWrites ? "; INSERT, UPDATE, DELETE and MERGE are allowed for this tenant only."
+                        : "; the transaction is read only (SELECT, WITH, VALUES, TABLE).") +
+      ` At most ${maxRows} rows and ${maxBytes} bytes come back. EXPLAIN is not available.`,
     inputSchema: { sql: z.string().min(1).max(100_000) },
     annotations: { readOnlyHint: !opts.allowWrites },
   }, ({ sql }) => safely(async () => text(await run(async (c) => {
     // queryMode "extended": PostgreSQL refuses a string with more than one statement.
-    if (READS.has(firstWord(sql))) {
-      await c.query({ text: `DECLARE _dbfw_mcp NO SCROLL CURSOR FOR ${sql}`, queryMode: "extended" } as any);
-      const r = await c.query(`FETCH ${maxRows + 1} FROM _dbfw_mcp`);
-      return { rows: r.rows.slice(0, maxRows), truncated: r.rows.length > maxRows };
+    const ext = (t: string): Promise<any> => c.query({ text: t, queryMode: "extended" } as any);
+    const q = sql.replace(/;\s*$/, "");
+    await c.query("SAVEPOINT _dbfw_mcp");
+    try {
+      await ext(`DECLARE _dbfw_mcp NO SCROLL CURSOR FOR\n${q}\n`);
+    } catch (e) {
+      await c.query("ROLLBACK TO SAVEPOINT _dbfw_mcp");
+      if (!opts.allowWrites) throw new Error(`${(e as Error).message} (${READ_KINDS})`);
+      try {
+        await ext(`PREPARE _dbfw_mcp AS\n${q}\n`);
+      } catch (e2) {
+        throw new Error(`${(e2 as Error).message} (${WRITE_KINDS})`);
+      }
+      await c.query("DEALLOCATE _dbfw_mcp");
+      await c.query("SAVEPOINT _dbfw_mcp_w");
+      try {
+        const r = await ext(`WITH _w AS (\n${q}\n) ${capped("_w", "_w", maxRows, maxBytes, true)}`);
+        return result(r.rows, maxRows, maxBytes, `"rowCount":${Number(r.rows[0]?.total ?? 0)},`);
+      } catch (e3: any) {
+        // INSERT, UPDATE, DELETE or MERGE without RETURNING: it returns no rows.
+        if (e3?.code !== "0A000" || !/RETURNING clause/.test(e3?.message ?? "")) throw e3;
+        await c.query("ROLLBACK TO SAVEPOINT _dbfw_mcp_w");
+        const r = await ext(q);
+        return JSON.stringify({ command: r.command, rowCount: r.rowCount });
+      }
     }
-    const r: any = await c.query({ text: sql, queryMode: "extended" } as any);
-    return { command: r.command, rowCount: r.rowCount, rows: (r.rows ?? []).slice(0, maxRows),
-             truncated: (r.rows?.length ?? 0) > maxRows };
+    await c.query("CLOSE _dbfw_mcp");
+    const r = await ext(capped(`(\n${q}\n) AS _q`, "_q", maxRows, maxBytes, false));
+    return result(r.rows, maxRows, maxBytes);
   }))));
 
   return server;

@@ -70,13 +70,19 @@ describe("db-firewall-mcp", live, () => {
   it("stdio: read only by default; one statement per call; the transaction stays read only", async () => {
     const c = await stdio(["--tenant", "A"]);
     try {
-      for (const [sql, msg] of [["INSERT INTO docs VALUES (9, 'A', 'x')", /read-only/],
+      for (const [sql, msg] of [["INSERT INTO docs VALUES (9, 'A', 'x')", /read only/],
                                 ["SELECT 1; DELETE FROM docs", /multiple commands/],
-                                ["SET TRANSACTION READ WRITE", /before any query/]]) {
+                                ["SET TRANSACTION READ WRITE", /read only/],
+                                ["WITH d AS (DELETE FROM docs RETURNING *) SELECT * FROM d", /data-modifying/],
+                                ["COMMIT", /read only/],
+                                ["EXPLAIN ANALYZE SELECT * FROM docs WHERE body = 'b-secret'", /read only/]]) {
         const r = await c.callTool({ name: "query", arguments: { sql } });
         assert.equal(r.isError, true, sql);
         assert.match(r.content[0].text, msg, sql);
       }
+      // PostgreSQL nests block comments: this is one comment, then SELECT 1 (PostgreSQL decides, not a regex)
+      const nested = json(await c.callTool({ name: "query", arguments: { sql: "/* /* */ commit */ SELECT 1 AS one" } }));
+      assert.deepEqual(nested.rows, [{ one: 1 }]);
     } finally { await c.close(); }
     assert.equal((await admin(`SELECT count(*)::int AS n FROM ${S}.docs`)).rows[0].n, 2);
   });
@@ -91,6 +97,15 @@ describe("db-firewall-mcp", live, () => {
       assert.match(bad.content[0].text, /row-level security/);
       const upd = json(await c.callTool({ name: "query", arguments: { sql: "UPDATE docs SET body = 'x' WHERE id = 2" } }));
       assert.equal(upd.rowCount, 0);                                   // B's row is not there for A
+      const mine = json(await c.callTool({ name: "query", arguments: { sql: "UPDATE docs SET body = 'y' WHERE id = 3" } }));
+      assert.deepEqual(mine, { command: "UPDATE", rowCount: 1 });
+      const ret = json(await c.callTool({ name: "query", arguments: { sql: "DELETE FROM docs WHERE id = 3 RETURNING id, body" } }));
+      assert.deepEqual(ret, { rowCount: 1, rows: [{ id: 3, body: "y" }], truncated: false });
+      for (const sql of ["EXPLAIN ANALYZE SELECT * FROM docs WHERE body = 'b-secret'", "SET ROLE postgres",
+                         "COPY docs TO STDOUT", "COMMIT"]) {
+        const r = await c.callTool({ name: "query", arguments: { sql } });
+        assert.equal(r.isError, true, sql);
+      }
     } finally { await c.close(); await admin(`DELETE FROM ${S}.docs WHERE id > 2`); }
   });
 
@@ -98,8 +113,29 @@ describe("db-firewall-mcp", live, () => {
     const c = await stdio(["--tenant", "A", "--max-rows", "2"]);
     try {
       const q = json(await c.callTool({ name: "query", arguments: { sql: "SELECT g FROM generate_series(1, 10) g" } }));
-      assert.equal(q.rows.length, 2);
+      assert.deepEqual(q.rows, [{ g: 1 }, { g: 2 }]);
       assert.equal(q.truncated, true);
+      const all = json(await c.callTool({ name: "query", arguments: { sql: "VALUES (1), (2);" } }));
+      assert.deepEqual(all, { rows: [{ column1: 1 }, { column1: 2 }], truncated: false });
+      const big = json(await c.callTool({ name: "query", arguments: { sql: "SELECT 12345678901234567890::numeric AS n" } }));
+      assert.equal(JSON.stringify(big.rows), '[{"n":12345678901234567000}]');   // JSON numbers, as PostgreSQL writes them
+    } finally { await c.close(); }
+  });
+
+  it("caps the bytes in PostgreSQL: a huge row or result never reaches the server", async () => {
+    const c = await stdio(["--tenant", "A", "--max-bytes", "1000"]);
+    try {
+      const one = json(await c.callTool({ name: "query", arguments: { sql: "SELECT repeat('x', 20000000) AS x" } }));
+      assert.deepEqual(one, { rows: [{ _dbfw_row_too_large_bytes: 20000008 }], truncated: false });
+      const many = json(await c.callTool({ name: "query", arguments: {
+        sql: "SELECT repeat('y', 300) AS y FROM generate_series(1, 50)" } }));
+      assert.equal(many.truncated, true);
+      assert.ok(JSON.stringify(many.rows).length <= 1000 + 400, String(JSON.stringify(many.rows).length));
+      // a comment at the end, and a wrapper the SQL tries to close, stay inside
+      const cmt = await c.callTool({ name: "query", arguments: { sql: "SELECT 1 AS a -- the end" } });
+      assert.deepEqual(json(cmt).rows, [{ a: 1 }]);
+      const out = await c.callTool({ name: "query", arguments: { sql: "SELECT 1) AS _q) s, (SELECT repeat('z', 5000)) z --" } });
+      assert.equal(out.isError, true);
     } finally { await c.close(); }
   });
 
@@ -141,6 +177,25 @@ describe("db-firewall-mcp", live, () => {
           assert.deepEqual(q.rows, [{ body }]);
         } finally { await c.close(); }
       }
+    });
+
+    it("answers only POST: GET (a stream) and DELETE get 405", async () => {
+      for (const method of ["GET", "DELETE"]) {
+        const r = await fetch(url, { method, headers: { authorization: `Bearer ${await token({ tenant_id: "A" })}`,
+                                                       accept: "text/event-stream" } });
+        assert.equal(r.status, 405, method);
+        await r.body?.cancel();
+      }
+    });
+
+    it("needs the issuer and the audience", async () => {
+      const { startHttp } = await import("../dist/http.js");
+      const pool = new pg.Pool({ connectionString: appUrl() });
+      try {
+        for (const o of [{ issuer: "starter" }, { audience: "db-firewall-mcp" }, {}]) {
+          await assert.rejects(startHttp({ pool, schema: S, port: 0, jwtSecret: SECRET, ...o }), /issuer and the audience/);
+        }
+      } finally { await pool.end(); }
     });
 
     it("refuses a missing, forged, expired or tenant-less token with 401", async () => {

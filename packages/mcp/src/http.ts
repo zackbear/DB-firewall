@@ -1,7 +1,8 @@
-// Streamable HTTP, stateless: each request carries a bearer token (a JWT),
-// and the tenant comes from a claim in it after the signature, expiry,
+// Streamable HTTP, stateless: each request is a POST with a bearer token (a
+// JWT), and the tenant comes from a claim in it after the signature, expiry,
 // issuer and audience check out. A new server, bound to that tenant, serves
-// that one request. No token, or a bad one: 401, and nothing runs.
+// that one request. No token, or a bad one: 401, and nothing runs. GET and
+// DELETE (a stream, a session) have no use without sessions: 405.
 import http from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from "jose";
@@ -14,8 +15,9 @@ export interface HttpOptions extends ServerOptions {
   /** HS256 secret (at least 32 bytes), or the JWKS URL of an identity provider. One of the two. */
   jwtSecret?: string;
   jwksUrl?: string;
-  issuer?: string;
-  audience?: string;
+  /** The iss and aud tokens must carry. Both required: without them, any token from a shared identity provider would do. */
+  issuer: string;
+  audience: string;
   /** The claim that holds the tenant (default tenant_id). */
   tenantClaim?: string;
 }
@@ -24,6 +26,9 @@ const MAX_BODY = 1 << 20;
 
 function verifier(opts: HttpOptions): (token: string) => Promise<string> {
   if (!!opts.jwtSecret === !!opts.jwksUrl) throw new Error("DB Firewall MCP: give a JWT secret or a JWKS URL (one)");
+  if (!opts.issuer || !opts.audience) {
+    throw new Error("DB Firewall MCP: give the issuer and the audience the tokens must carry (--issuer, --audience)");
+  }
   if (opts.jwtSecret && Buffer.byteLength(opts.jwtSecret) < 32) {
     throw new Error("DB Firewall MCP: the JWT secret must be at least 32 bytes");
   }
@@ -68,6 +73,7 @@ export async function startHttp(opts: HttpOptions): Promise<http.Server> {
   const verify = verifier(opts);
   const server = http.createServer(async (req, res) => {
     if (new URL(req.url ?? "/", "http://x").pathname !== "/mcp") return fail(res, 404, "not found");
+    if (req.method !== "POST") { res.setHeader("allow", "POST"); return fail(res, 405, "method not allowed: POST only"); }
     const auth = req.headers.authorization ?? "";
     let tenant: string;
     try {
@@ -77,7 +83,7 @@ export async function startHttp(opts: HttpOptions): Promise<http.Server> {
       return fail(res, 401, "DB Firewall MCP: a valid bearer token is required");   // no detail: no oracle
     }
     try {
-      const body = req.method === "POST" ? await readBody(req) : undefined;
+      const body = await readBody(req);
       const mcp = createServer(opts, tenant);
       const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
       res.on("close", () => { transport.close().catch(() => {}); mcp.close().catch(() => {}); });
