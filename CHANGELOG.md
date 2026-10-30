@@ -21,7 +21,11 @@
   without `DB_FIREWALL_TENANT_KEY`, or while sessions of the role can read
   each other's SQL text (`migrate --harden` revokes it; `--allow-query-text`
   when one tenant uses the role). Error messages are cut to 2,000
-  characters.
+  characters. It also refuses a role that can run `pg_notify()`, which sends
+  any payload to every listener in the database.
+- **`migrate --harden`** also revokes `pg_notify(text, text)` from `PUBLIC`.
+  The `NOTIFY` statement needs no grant; give `pg_notify` back to roles that
+  call it.
 - **`examples/nextjs-agent`:** a starter app. Next.js, Claude through the AI
   SDK, two demo tenants with tenant-scoped keys, and the MCP server over
   HTTP with a short-lived token per chat request. Its test drives the agent

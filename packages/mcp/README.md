@@ -13,7 +13,7 @@ An MCP server for PostgreSQL where every tool call runs as one tenant. PostgreSQ
    npx db-firewall migrate --url "$ADMIN_URL" --schema app --harden --app-role app_user
    ```
 
-   `--harden` matters here. All tenants share the app role, and sessions of one role can read each other's SQL text, literal values included, in `pg_stat_activity`. The server refuses to start while the role can do that. `--allow-query-text` overrides this, but use it only when one tenant uses the role.
+   `--harden` matters here. All tenants share the app role, and sessions of one role can read each other's SQL text, literal values included, in `pg_stat_activity`. The server refuses to start while the role can do that, or while it can run `pg_notify()` (a read-only tenant could send any payload to every listener in the database); `--harden` revokes both. `--allow-query-text` overrides this, but use it only when one tenant uses the role.
 
 2. Give the server its own app role: a normal login role, not a superuser, without `BYPASSRLS`, with only the grants the agent needs (`SELECT` alone for a read-only agent). The server refuses to start as a role that can skip RLS.
 3. Check isolation as that role: `npx db-firewall verify --url "$APP_URL" --schema app --tenant acme`.
@@ -70,6 +70,7 @@ Each call is one transaction:
 ## What it does not do
 
 - **It does not limit what SQL the role may run.** The database role and its grants do that. Grant only what the agent needs.
+- **It does not hide activity metadata.** Tenants share the role, so one can see that others are busy: their locks in `pg_locks`, a backend's start time and wait event, table row totals in `pg_stat_user_tables`, and advisory locks (a channel two tenants can agree on). None of these shows another tenant's rows.
 - **It does not hide every side channel that RLS leaves open.** A `UNIQUE` or foreign-key error (with writes), or timing, can show that another tenant has a value. `verify --strict` lists the keys that leave out the tenant column. `EXPLAIN` is refused for this reason.
 - **It does not keep the tenant's own data from the model.** Every row the tenant can see can reach the model, and the model's provider.
 

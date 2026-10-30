@@ -41,11 +41,13 @@ describe("db-firewall-mcp", live, () => {
       CREATE TABLE ${S}.docs (id int PRIMARY KEY, tenant_id text NOT NULL, body text);
       INSERT INTO ${S}.docs VALUES (1, 'A', 'a-doc'), (2, 'B', 'b-secret');
       GRANT USAGE ON SCHEMA ${S} TO ${ROLE}; GRANT SELECT, INSERT, UPDATE, DELETE ON ${S}.docs TO ${ROLE};
-      SELECT set_config('dbfw.schema', '${S}', false), set_config('dbfw.tenant_key', '${KEY}', false);`);
+      SELECT set_config('dbfw.schema', '${S}', false), set_config('dbfw.tenant_key', '${KEY}', false);
+      REVOKE EXECUTE ON FUNCTION pg_catalog.pg_notify(text, text) FROM PUBLIC;`);
     await admin(readFileSync(new URL("../../../migrations/001_postgresql.sql", import.meta.url), "utf8")
       .replace("BEGIN;", `BEGIN; SET LOCAL dbfw.schema = '${S}'; SET LOCAL dbfw.tenant_key = '${KEY}';`));
   });
-  after(async () => { await admin(`DROP SCHEMA IF EXISTS ${S} CASCADE`); });
+  after(async () => { await admin(`DROP SCHEMA IF EXISTS ${S} CASCADE;
+    GRANT EXECUTE ON FUNCTION pg_catalog.pg_notify(text, text) TO PUBLIC`); });
 
   it("stdio: no tool takes a tenant, and each sees tenant A only", async () => {
     const c = await stdio(["--tenant", "A"]);
@@ -132,6 +134,8 @@ describe("db-firewall-mcp", live, () => {
       assert.equal(many.truncated, true);
       assert.ok(JSON.stringify(many.rows).length <= 1000 + 400, String(JSON.stringify(many.rows).length));
       // a comment at the end, and a wrapper the SQL tries to close, stay inside
+      const named = json(await c.callTool({ name: "query", arguments: { sql: "SELECT 1 AS _q0, 2 AS _q, 3 AS _w" } }));
+      assert.deepEqual(named.rows, [{ _q0: 1, _q: 2, _w: 3 }]);   // columns named like the wrapper's aliases
       const cmt = await c.callTool({ name: "query", arguments: { sql: "SELECT 1 AS a -- the end" } });
       assert.deepEqual(json(cmt).rows, [{ a: 1 }]);
       const out = await c.callTool({ name: "query", arguments: { sql: "SELECT 1) AS _q) s, (SELECT repeat('z', 5000)) z --" } });
@@ -153,6 +157,19 @@ describe("db-firewall-mcp", live, () => {
       assert.doesNotMatch(ok.stderr, /read each other's SQL text/);
     } finally {
       await admin(`GRANT SELECT ON pg_catalog.pg_stat_activity TO PUBLIC; GRANT EXECUTE ON FUNCTION ${fns} TO PUBLIC`);
+    }
+  });
+
+  it("refuses a role that can run pg_notify (messages to every listener in the database)", async () => {
+    const { spawnSync } = await import("node:child_process");
+    await admin("GRANT EXECUTE ON FUNCTION pg_catalog.pg_notify(text, text) TO PUBLIC");
+    try {
+      const r = spawnSync("node", [CLI, "--url", appUrl(), "--schema", S, "--tenant", "A", "--allow-query-text"],
+                          { env: process.env, encoding: "utf8", input: "", timeout: 10000 });
+      assert.equal(r.status, 2);
+      assert.match(r.stderr, /pg_notify/);
+    } finally {
+      await admin("REVOKE EXECUTE ON FUNCTION pg_catalog.pg_notify(text, text) FROM PUBLIC");
     }
   });
 

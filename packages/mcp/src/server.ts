@@ -36,14 +36,18 @@ const QUERY_TEXT = `SELECT EXISTS (SELECT 1 FROM pg_roles m WHERE pg_has_role(cu
        OR EXISTS (SELECT 1 FROM pg_proc f WHERE f.proname = 'pg_stat_statements'
                     AND has_function_privilege(m.oid, f.oid, 'EXECUTE'))
        OR EXISTS (SELECT 1 FROM pg_class v WHERE v.relname = 'pg_stat_statements' AND v.relkind = 'v'
-                    AND has_table_privilege(m.oid, v.oid, 'SELECT')))) AS can`;
+                    AND has_table_privilege(m.oid, v.oid, 'SELECT')))) AS can,
+  EXISTS (SELECT 1 FROM pg_roles m WHERE pg_has_role(current_user, m.oid, 'MEMBER')
+    AND has_function_privilege(m.oid, 'pg_catalog.pg_notify(text, text)', 'EXECUTE')) AS notify`;
 
 /**
  * Check once at start-up: the key is set, the role cannot skip RLS, and its
  * sessions cannot read each other's SQL text. All tenants share the role
  * (the HTTP server, or one stdio process per tenant), so through
  * pg_stat_activity one tenant could read another's queries, literal values
- * included. `db-firewall migrate --harden --app-role <role>` revokes that.
+ * included. It also refuses a role that can run pg_notify() (messages to every
+ * listener in the database). `db-firewall migrate --harden --app-role <role>`
+ * revokes both.
  */
 export async function checkSetup(opts: ServerOptions): Promise<void> {
   if (!process.env[TENANT_KEY_ENV]) {
@@ -51,11 +55,19 @@ export async function checkSetup(opts: ServerOptions): Promise<void> {
                     "without it a signed database shows no rows");
   }
   await assertSafeRole(opts.pool);
-  if (!opts.allowQueryText && (await opts.pool.query(QUERY_TEXT)).rows[0].can) {
+  const { can, notify } = (await opts.pool.query(QUERY_TEXT)).rows[0];
+  if (!opts.allowQueryText && can) {
     throw new Error("DB Firewall MCP: sessions of this role can read each other's SQL text (pg_stat_activity, " +
                     "pg_stat_statements), so one tenant could read another's queries. Run " +
                     "db-firewall migrate --harden --app-role <role>, or pass --allow-query-text " +
                     "when one tenant only uses this role");
+  }
+  // A read-only tenant could still send any payload to every listener in the
+  // database (a job queue, a cache) with SELECT pg_notify(...).
+  if (notify) {
+    throw new Error("DB Firewall MCP: this role can run pg_notify(), so SQL a tenant runs could send messages to " +
+                    "every listener in the database. Run db-firewall migrate --harden --app-role <role>, or " +
+                    "REVOKE EXECUTE ON FUNCTION pg_notify(text, text) FROM PUBLIC");
   }
 }
 
@@ -85,7 +97,7 @@ function capped(from: string, alias: string, maxRows: number, maxBytes: number, 
   return `SELECT j, n, run${total ? ", total" : ""} FROM (
     SELECT CASE WHEN n <= ${maxBytes} THEN j END AS j, n,
            sum(least(n, ${maxBytes})) OVER (ROWS UNBOUNDED PRECEDING) AS run${total ? ", count(*) OVER () AS total" : ""}
-    FROM (SELECT j, octet_length(j) AS n FROM (SELECT row_to_json(${alias})::text AS j FROM ${from}) AS _s0) AS _s1) AS _s2
+    FROM (SELECT j, octet_length(j) AS n FROM (SELECT row_to_json(${alias}.*)::text AS j FROM ${from}) AS _s0) AS _s1) AS _s2
   WHERE run - least(n, ${maxBytes}) <= ${maxBytes} LIMIT ${maxRows + 1}`;
 }
 
