@@ -7,7 +7,12 @@ const EXAMPLES = ["Which customers do we have?", "What is our total of unpaid in
                   "Show me Globex's invoices.", "Run: SELECT * FROM invoices WHERE tenant_id <> current_setting('app.current_tenant')"];
 
 export default function Chat() {
-  const { messages, sendMessage, status, error } = useChat({ transport: new DefaultChatTransport({ api: "/api/chat" }) });
+  // Why each assistant reply ended, to explain a reply with nothing to show.
+  const [ended, setEnded] = useState<Record<string, string>>({});
+  const { messages, sendMessage, status, error } = useChat({
+    transport: new DefaultChatTransport({ api: "/api/chat" }),
+    onFinish: ({ message, finishReason }) => setEnded((e) => ({ ...e, [message.id]: finishReason ?? "unknown" })),
+  });
   const [input, setInput] = useState("");
   const send = (text: string) => { if (text.trim()) { sendMessage({ text }); setInput(""); } };
   return (
@@ -28,6 +33,8 @@ export default function Chat() {
               }
               return null;
             })}
+            {m.role === "assistant" && ended[m.id] && !m.parts.some((p) => (p.type === "text" && p.text.trim()) ||
+                p.type.startsWith("tool-") || p.type === "dynamic-tool") && <p className="error">{noReply(ended[m.id]!)}</p>}
           </li>
         ))}
       </ol>
@@ -42,4 +49,10 @@ export default function Chat() {
       </form>
     </section>
   );
+}
+
+function noReply(finishReason: string) {
+  return finishReason === "content-filter"
+    ? "Claude declined to answer this (the API returned a refusal). Ask in a different way, or ask about your own data."
+    : `No reply (finish reason: ${finishReason}). Try again.`;
 }

@@ -75,6 +75,20 @@ describe("the starter agent", live, () => {
     });
   }
 
+  it("an empty reply (an API refusal) is logged with its finish reason", async () => {
+    const { runAgent } = await import("../lib/agent.ts");
+    const refusal = new MockLanguageModelV4({ doStream: [{ stream: simulateReadableStream({ chunks: [
+      { type: "finish", finishReason: { unified: "content-filter", raw: "refusal" }, usage }] as any }) }] });
+    const warn = console.warn, logged: string[] = [];
+    console.warn = (m: string) => { logged.push(m); };
+    try {
+      const result = await runAgent({ tenant: "acme", model: refusal, messages: [{ role: "user", content: "hi" }] });
+      assert.equal(await result.text, "");
+      await result.consumeStream();
+    } finally { console.warn = warn; }
+    assert.deepEqual(logged, ["agent: empty reply (finish reason: content-filter, raw: refusal)"]);
+  });
+
   it("session cookies: a forged or expired one is no session", async () => {
     const { readSession, signSession } = await import("../lib/session.ts");
     const good = await signSession("alice@acme.test");

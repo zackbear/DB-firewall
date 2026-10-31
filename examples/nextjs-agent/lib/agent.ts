@@ -23,7 +23,11 @@ export async function runAgent({ tenant, messages, model }: {
       messages,
       tools: await mcp.tools(),
       stopWhen: isStepCount(6),
-      onFinish: () => mcp.close(),
+      onFinish: ({ text, toolCalls, finishReason, rawFinishReason }) => {
+        // A reply with no text and no tool call shows as an empty bubble: say why in the server log.
+        if (!text && !toolCalls.length) console.warn(`agent: empty reply (finish reason: ${finishReason}, raw: ${rawFinishReason})`);
+        return mcp.close();
+      },
       onError: () => mcp.close(),
       onAbort: () => mcp.close(),
     });
