@@ -1,7 +1,5 @@
 # @db-firewall/mcp
 
-> Not on npm yet: until it is, build it from this repo (`npm ci && npm run build` in `packages/ts`, then here) and run `node dist/cli.js` where the examples say `npx @db-firewall/mcp`.
-
 An MCP server for PostgreSQL where every tool call runs as one tenant. PostgreSQL row-level security, installed by the DB Firewall migration, decides which rows the call can see or change. The tenant comes from the server: a command-line flag (stdio), or a verified JWT on each request (HTTP). It never comes from the model, and no tool has a tenant argument.
 
 ## Before you start

@@ -146,7 +146,8 @@ jobs:
         run: npm ci && npm test
       - name: MCP server (@db-firewall/mcp)
         working-directory: packages/mcp
-        run: npm ci && npm test
+        # npm ci installs the published @db-firewall/pg; the overlay tests against this repo's packages/ts
+        run: npm ci && npm install --no-save ../ts && npm test
       - name: Agent starter (examples/nextjs-agent)
         working-directory: examples/nextjs-agent
         env:

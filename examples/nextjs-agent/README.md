@@ -30,6 +30,11 @@ npm run dev                                # http://localhost:3000
 
 Make each secret with `openssl rand -hex 32`.
 
+If a step fails:
+- **`tsc: not found` or a missing package.** Your shell has `NODE_ENV=production`, so npm skips dev dependencies. Use `npm ci --include=dev` in each folder.
+- **Port 3000 is in use.** Run `npm run dev -- -p 3010` and open http://localhost:3010.
+- **Windows, npm scripts fail in Git Bash.** If your npm `script-shell` is bash, add `--script-shell=cmd.exe` to the `npm` command.
+
 Sign in as Alice (Acme) and ask "Which customers do we have?". Then ask for Globex's invoices, or click the example that tries SQL with `tenant_id <> ...`: the rows of the other company never come back. Sign out, sign in as Bob (Globex), and you see Globex's data.
 
 ## Make it yours
