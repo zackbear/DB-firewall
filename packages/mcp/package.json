@@ -5,7 +5,7 @@
   "license": "MIT",
   "publishConfig": { "access": "public" },
   "type": "module",
-  "bin": { "db-firewall-mcp": "./dist/cli.js" },
+  "bin": { "db-firewall-mcp": "dist/cli.js" },
   "main": "./dist/server.js",
   "types": "./dist/server.d.ts",
   "exports": {
@@ -20,7 +20,7 @@
     "prepack": "npm run build"
   },
   "dependencies": {
-    "@db-firewall/pg": "file:../ts",
+    "@db-firewall/pg": "0.1.0",
     "@modelcontextprotocol/sdk": "1.32.1",
     "jose": "6.2.12",
     "pg": "8.23.1",

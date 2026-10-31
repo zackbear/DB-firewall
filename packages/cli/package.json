@@ -5,7 +5,7 @@
   "license": "MIT",
   "type": "module",
   "bin": {
-    "db-firewall": "./dist/cli.js"
+    "db-firewall": "dist/cli.js"
   },
   "files": ["dist", "sql", "README.md"],
   "engines": {
